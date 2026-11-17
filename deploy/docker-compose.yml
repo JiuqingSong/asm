@@ -1,0 +1,37 @@
+# AsmPerfect 86 on the family server, built from this repo (~/asmperfect).
+# One container: the web app itself (port 8075). It keeps no data on the server.
+# setup-server.sh writes .env next to this file (user ids); update-server.sh passes the version.
+name: asmperfect
+
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+        APP_COMMIT: ${APP_COMMIT:-}
+    image: asmperfect-web
+    container_name: asmperfect-web
+    restart: unless-stopped
+    # The family backup service and front page find family services by these labels.
+    labels:
+      family.backup.name: AsmPerfect 86
+      family.backup.port: "8075"
+      family.backup.key: asmperfect
+    user: "${ASMPERFECT_UID:-1000}:${ASMPERFECT_GID:-1000}"
+    environment:
+      PORT: "8075"
+    ports:
+      - "8075:8075"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8075/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

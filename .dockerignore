@@ -1,0 +1,8 @@
+# Only what the image needs (deploy/Dockerfile): the app's sources and the page server.
+*
+!package.json
+!package-lock.json
+!index.html
+!tsconfig.json
+!src/
+!deploy/server.py

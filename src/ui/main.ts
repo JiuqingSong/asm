@@ -843,3 +843,6 @@ function statusName(st: string): string {
 
 const app = new App();
 if (import.meta.env.DEV) (window as unknown as { __app: App }).__app = app;
+
+const brand = document.querySelector('.brand') as HTMLElement;
+brand.title = `AsmPerfect 86 版本 ${import.meta.env.VITE_APP_VERSION ?? '开发版'}`;
