@@ -88,6 +88,16 @@ class App {
         cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(),
       };
       s.screen.onKey = e => this.key(s, e);
+      s.screen.onMouse = (fx, fy, buttons) => {
+        if (!s.program || (s.dirty && !s.binary)) return;
+        s.m.mouse.moveTo(fx * 640, fy * 200);
+        s.m.mouse.queueButtons(buttons, s.m.clock);
+        if (this.run === 'idle') {
+          const mem = s.m.mem, bda = 0x400;
+          s.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), s.m.video, s.m.mouse);
+        }
+        this.afterKey(s); // 等键盘的程序可能要处理鼠标回调
+      };
       s.m.events = {
         log: msg => this.addMessage('warning', msg, s.i),
         bell: () => this.beep(),
@@ -902,7 +912,7 @@ class App {
     this.stack.render(m, s.snap);
     for (const x of this.live) {
       const mem = x.m.mem, bda = 0x400;
-      x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video);
+      x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video, x.m.mouse);
     }
     if (full || this.run === 'animate') {
       for (const x of this.live) {

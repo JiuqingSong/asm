@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { assemble } from '../src/asm/assembler.ts';
 import { Machine } from '../src/machine/machine.ts';
 import { scanForChar } from '../src/machine/devices.ts';
-import { AX, BX, CX, SP } from '../src/cpu/cpu.ts';
+import { AX, BX, CX, DX, SP, SI, DI, BP } from '../src/cpu/cpu.ts';
 
 function load(src: string): Machine {
   const p = assemble(src);
@@ -358,7 +358,7 @@ describe('示例程序', () => {
     it(ex.title, () => {
       const p = assemble(ex.source);
       expect(p.diagnostics.filter(d => d.severity === 'error')).toEqual([]);
-      if (ex.id.startsWith('blank') || ex.pair) return; // 双机示例在 serial.test.ts 中测试
+      if (ex.id.startsWith('blank') || ex.pair || ex.id === 'mouse') return; // 双机示例在 serial.test.ts 中测试，鼠标示例有专门的测试
       const m = new Machine();
       m.load(p);
       const input = ex.input ?? (ex.id === 'keyboard' ? 'ab\x1b' : '');
@@ -547,5 +547,110 @@ end start`);
     expect(row0).toEqual([0, 0, 15, 15, 15, 0, 0, 0]);
     const row4 = Array.from(m.mem.subarray(0xa0000 + 4 * 320, 0xa0000 + 4 * 320 + 8));
     expect(row4).toEqual([0, 15, 15, 15, 15, 15, 0, 0]); // 横杠 11111
+  });
+});
+
+describe('鼠标（INT 33h）', () => {
+  it('检测驱动、读位置和按键、按下次数', () => {
+    const m = load(`
+.model small
+.stack 100h
+.code
+start:  mov ax, 0
+        int 33h             ; AX=FFFFh 表示有驱动
+        mov si, ax
+        mov ax, 3
+        int 33h             ; 复位后在屏幕中央
+        mov di, cx
+        mov bp, dx
+w:      mov ax, 5
+        mov bx, 0
+        int 33h             ; 左键按下了几次
+        or bx, bx
+        jz w
+        mov ah, 4ch
+        int 21h
+end start`);
+    m.run(10_000);
+    expect(m.cpu.r[SI]).toBe(0xffff);
+    expect([m.cpu.r[DI], m.cpu.r[BP]]).toEqual([320, 100]);
+    m.mouse.moveTo(100, 50);
+    m.mouse.setButtons(1);
+    m.mouse.setButtons(0);
+    runToEnd(m);
+    expect(m.cpu.r[CX]).toBe(100);              // 按下时的位置
+    expect(m.cpu.r[DX]).toBe(50);
+  });
+
+  it('事件回调：鼠标移动和按键时调用程序登记的处理程序', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+clicks  dw 0
+lastx   dw 0
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov ax, 0
+        int 33h
+        mov ax, 0Ch             ; 登记处理程序：左键按下时调用
+        mov cx, 2
+        push cs
+        pop es
+        mov dx, offset handler
+        int 33h
+        mov ah, 0               ; 等键盘（等待期间鼠标事件照样会调用处理程序）
+        int 16h
+        mov ah, 4ch
+        mov al, byte ptr clicks
+        int 21h
+handler proc far
+        push ds
+        push ax
+        mov ax, @data
+        mov ds, ax
+        inc clicks
+        mov lastx, cx
+        pop ax
+        pop ds
+        retf
+handler endp
+end start`);
+    m.run(10_000);
+    expect(m.status).toBe('waiting');
+    for (const x of [10, 20, 30]) {
+      m.mouse.moveTo(x, 5);
+      m.mouse.setButtons(1);
+      m.run(10_000);
+      m.mouse.setButtons(0);
+      m.run(10_000);
+    }
+    m.typeText('q', scanForChar);
+    runToEnd(m);
+    expect(m.exitCode).toBe(3);
+    const lastx = m.program!.symbols.find(s => s.name === 'lastx')!;
+    expect(m.cpu.rw(lastx.segment, lastx.offset)).toBe(30);
+  });
+});
+
+describe('鼠标画图示例', () => {
+  it('按住左键拖动会画出点，右键换颜色', () => {
+    const m = new Machine();
+    m.load(assemble(EXAMPLES.find(e => e.id === 'mouse')!.source));
+    m.run(200_000);
+    expect(m.mouse.visible).toBe(0);
+    const at = (x: number, y: number) => m.mem[0xa0000 + y * 320 + x];
+    m.mouse.moveTo(100, 50); m.mouse.setButtons(1); m.run(50_000);
+    m.mouse.moveTo(120, 50); m.run(50_000);
+    m.mouse.setButtons(0); m.run(50_000);
+    expect(at(50, 50)).toBe(40);
+    expect(at(60, 50)).toBe(40);
+    m.mouse.setButtons(2); m.run(50_000); m.mouse.setButtons(0); m.run(50_000);
+    m.mouse.moveTo(200, 80); m.mouse.setButtons(1); m.run(50_000); m.mouse.setButtons(0);
+    expect(at(100, 80)).toBe(49);
+    m.typeText('x', scanForChar);
+    runToEnd(m);
+    expect(m.mem[0x449]).toBe(3);
   });
 });

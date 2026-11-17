@@ -462,6 +462,7 @@ export class CPU {
     this.irqTaken = false;
     if (!this.inhibitIrq && this.flags & IF && this.irq && this.irq.pending()) {
       this.irqTaken = true;
+      this.waiting = false; // 等待中的陷阱被中断打断：返回后会重新执行陷阱
       this.interrupt(this.irq.ack());
       this.steps++;
       return;

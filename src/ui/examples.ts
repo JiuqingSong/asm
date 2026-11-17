@@ -832,6 +832,89 @@ end start
 `,
   },
   {
+    id: 'mouse',
+    title: '鼠标画图（INT 33h）',
+    source: `; 用鼠标画图：按住左键画，点右键换颜色，按任意键退出
+; INT 33h 是鼠标驱动：AX=0 检测/复位，AX=1 显示光标，AX=2 隐藏光标，AX=3 读位置和按键
+; 鼠标的坐标范围是 0~639、0~199；320 像素宽的 13h 模式里，x 要除以 2 才是像素
+
+.model small
+.stack 200h
+
+.data
+nomouse db  'No mouse driver!$'
+color   db  40
+oldbtn  dw  0
+
+.code
+start:
+        mov ax, @data
+        mov ds, ax
+        mov ax, 0               ; 检测鼠标驱动
+        int 33h
+        cmp ax, 0FFFFh
+        je ok
+        mov dx, offset nomouse
+        mov ah, 9
+        int 21h
+        jmp quit
+ok:
+        mov ax, 0013h           ; 320x200 256 色
+        int 10h
+        mov ax, 1               ; 显示鼠标光标
+        int 33h
+
+mainloop:
+        mov ah, 1               ; 有按键就退出
+        int 16h
+        jnz done
+        mov ax, 3               ; BX = 按键，CX = x，DX = y
+        int 33h
+        test bx, 2              ; 右键：刚按下时换颜色
+        jz noright
+        test oldbtn, 2
+        jnz noright
+        add color, 9
+noright:
+        mov oldbtn, bx
+        test bx, 1              ; 左键按着：画一个 2x2 的点
+        jz mainloop
+        shr cx, 1               ; 虚拟坐标 -> 像素
+        mov ax, 2               ; 画之前先隐藏光标，免得画到光标上
+        int 33h
+        call dot
+        inc cx
+        call dot
+        inc dx
+        call dot
+        dec cx
+        call dot
+        mov ax, 1               ; 再显示光标
+        int 33h
+        jmp mainloop
+
+done:
+        mov ah, 0
+        int 16h
+        mov ax, 0003h           ; 回到文本模式
+        int 10h
+quit:
+        mov ax, 4c00h
+        int 21h
+
+; 在 (CX, DX) 画一个点
+dot     proc
+        mov ah, 0Ch
+        mov al, color
+        mov bh, 0
+        int 10h
+        ret
+dot     endp
+
+end start
+`,
+  },
+  {
     id: 'chat',
     title: '串口聊天（双机）',
     pair: true,

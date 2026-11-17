@@ -31,7 +31,7 @@ export class DualMachine {
 
   /** 等待键盘的机器只有在有按键或有中断要处理时才需要执行 */
   private wakeable(m: Machine): boolean {
-    return m.status === 'waiting' && (m.kbd.queue.length > 0 || (m.pic.pending() && (m.cpu.flags & IF) !== 0));
+    return m.status === 'waiting' && (m.kbd.queue.length > 0 || (m.cpu.irq!.pending() && (m.cpu.flags & IF) !== 0));
   }
 
   /**

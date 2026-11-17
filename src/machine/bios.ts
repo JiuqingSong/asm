@@ -5,6 +5,7 @@
 // 返回 false 表示需要等待（例如键盘缓冲区为空），CPU 会停在陷阱处，等有按键后重试。
 import { AX, BX, CX, DX, SI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
+import { MOUSE_STUB } from './mouse.ts';
 import { PIT_HZ } from './uart.ts';
 import { modeInfo, SUPPORTED_MODES, type ModeInfo } from './video.ts';
 
@@ -90,7 +91,14 @@ export class Hle {
       case 0x1c: return true;
       case 0x20: this.m.exit(0); return true;
       case 0x21: return this.dos();
-      case 0x33: this.cpu.r[AX] = 0; return true; // 没有鼠标
+      case 0x33:
+        if (!this.m.mouse.int33(this.cpu, this.mode)) this.warnOnce(`INT 33h（鼠标）功能 ${hex(this.cpu.r[AX] & 0xff)}h 暂未实现`);
+        return true;
+      case 0x74: case 0x75:
+        // 鼠标回调桩代码里的两个陷阱（只认桩代码里的位置，程序自己执行 INT 74h 时不做任何事）
+        if (this.cpu.ip === MOUSE_STUB + 11) this.m.mouse.enterCallback(this.cpu);
+        else if (this.cpu.ip === MOUSE_STUB + 27) this.m.mouse.inHandler = false;
+        return true;
     }
     this.warnOnce(`程序调用了 INT ${hex(n)}h，本模拟器暂未实现该中断（已忽略）`);
     return true;

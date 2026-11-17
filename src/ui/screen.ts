@@ -1,6 +1,7 @@
 // DOS 文本屏幕（80×25，B800:0000）的渲染与键盘输入
 import { SCAN, type KeyEvent } from '../machine/devices.ts';
 import { modeInfo, type Video } from '../machine/video.ts';
+import type { Mouse } from '../machine/mouse.ts';
 
 const LOW = ' ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼';
 const HIGH = 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
@@ -97,6 +98,10 @@ export class Screen {
   private cellW = 8;
   private cellH = 16;
   onKey: ((e: KeyEvent) => void) | null = null;
+  /** 鼠标：显示区域内的相对位置（0~1）和按键（位 0 左、位 1 右、位 2 中） */
+  onMouse: ((fx: number, fy: number, buttons: number) => void) | null = null;
+  private rows: HTMLElement[] = [];
+  private vramView = new Uint8Array(COLS * ROWS * 2);
   /** 中文显示：像 UCDOS 那样把 GBK 编码显示成汉字 */
   chinese = false;
   private snapshot = new Uint8Array(COLS * ROWS * 2);
@@ -128,6 +133,7 @@ export class Screen {
         this.cells.push(s);
       }
       el.appendChild(row);
+      this.rows.push(row);
     }
     this.cursor = document.createElement('div');
     this.cursor.className = 'cursor';
@@ -137,6 +143,17 @@ export class Screen {
     this.canvas.style.display = 'none';
     el.appendChild(this.canvas);
     this.ctx = this.canvas.getContext('2d');
+    const mouse = (e: MouseEvent) => {
+      if (!this.onMouse) return;
+      const r = this.displayRect();
+      const fx = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
+      const fy = Math.max(0, Math.min(0.9999, (e.clientY - r.top) / r.height));
+      this.onMouse(fx, fy, e.buttons & 7);
+    };
+    el.addEventListener('mousemove', mouse);
+    el.addEventListener('mousedown', e => { mouse(e); if (e.button !== 0) e.preventDefault(); });
+    el.addEventListener('mouseup', mouse);
+    el.addEventListener('contextmenu', e => { if (this.onMouse) e.preventDefault(); });
     el.addEventListener('keydown', e => this.key(e, false));
     el.addEventListener('keyup', e => this.key(e, true));
     const wrap = el.parentElement!;
@@ -162,13 +179,26 @@ export class Screen {
   }
 
   /** 从显存渲染 */
-  render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number, video?: Video): void {
+  render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number, video?: Video, mouse?: Mouse): void {
     const mode = mem[0x449];
     const info = modeInfo(mode);
-    if (info.graphics && video) { this.renderGraphics(mem, mode, video); return; }
+    const showMouse = !!mouse && mouse.used && mouse.visible >= 0;
+    this.el.style.cursor = showMouse ? 'none' : '';
+    this.el.style.userSelect = showMouse ? 'none' : '';
+    if (info.graphics && video) { this.renderGraphics(mem, mode, video, showMouse ? mouse : undefined); return; }
     if (this.graphicsMode >= 0) this.leaveGraphics();
-    const base = 0xb8000;
-    if (this.chinese && gbk) this.renderChinese(mem.subarray(base, base + COLS * ROWS * 2));
+    // 文本模式的鼠标光标：把光标所在格子的 (属性<<8 | 字符) 先和屏幕掩码"与"、再和光标掩码"异或"（只改显示，不改显存）
+    const vram = this.vramView;
+    vram.set(mem.subarray(0xb8000, 0xb8000 + COLS * ROWS * 2));
+    if (showMouse) {
+      const col = Math.min(COLS - 1, mouse!.x >> 3), row = Math.min(ROWS - 1, mouse!.y >> 3);
+      const i = (row * COLS + col) * 2;
+      const v = (((vram[i + 1] << 8) | vram[i]) & mouse!.textScreenMask) ^ mouse!.textCursorMask;
+      vram[i] = v & 0xff; vram[i + 1] = v >> 8;
+    }
+    const base = 0;
+    mem = vram;
+    if (this.chinese && gbk) this.renderChinese(vram);
     else for (let i = 0; i < COLS * ROWS; i++) {
       const ch = mem[base + i * 2], at = mem[base + i * 2 + 1];
       if (this.prev[i * 2] === ch && this.prev[i * 2 + 1] === at) continue;
@@ -222,7 +252,7 @@ export class Screen {
   }
 
   /** 图形模式：按显示模式把显存换算成像素 */
-  private renderGraphics(mem: Uint8Array, mode: number, video: Video): void {
+  private renderGraphics(mem: Uint8Array, mode: number, video: Video, mouse?: Mouse): void {
     const info = modeInfo(mode);
     if (mode !== this.graphicsMode) {
       this.graphicsMode = mode;
@@ -267,7 +297,43 @@ export class Screen {
         }
       }
     }
+    if (mouse) this.drawGfxCursor(px, mem, mode, mouse);
     this.ctx.putImageData(this.image, 0, 0);
+  }
+
+  /** 显示区域（文本的 80×25 格子，或者图形模式的画布）在页面上的位置 */
+  private displayRect(): { left: number; top: number; width: number; height: number } {
+    if (this.graphicsMode >= 0) return this.canvas.getBoundingClientRect();
+    const a = this.rows[0].getBoundingClientRect(), b = this.rows[ROWS - 1].getBoundingClientRect();
+    const first = this.cells[0].getBoundingClientRect();
+    return { left: first.left, top: a.top, width: this.cellW * COLS, height: b.bottom - a.top };
+  }
+
+  /** 在图形画面上叠加鼠标光标（16×16 的屏幕掩码和光标掩码） */
+  private drawGfxCursor(px: Uint32Array, mem: Uint8Array, mode: number, mouse: Mouse): void {
+    const { width, height } = modeInfo(mode);
+    const half = width === 320; // 320 像素宽的模式里，驱动的 x 坐标是像素的 2 倍
+    const cx = (half ? mouse.x >> 1 : mouse.x) - mouse.hotX, cy = mouse.y - mouse.hotY;
+    const white = mode === 0x13 ? 15 : mode === 0x06 ? 1 : 3;
+    for (let r = 0; r < 16; r++) {
+      const y = cy + r;
+      if (y < 0 || y >= height) continue;
+      for (let c = 0; c < 16; c++) {
+        const x = cx + c;
+        if (x < 0 || x >= width) continue;
+        const s = (mouse.gfxScreen[r] >> (15 - c)) & 1, k = (mouse.gfxCursor[r] >> (15 - c)) & 1;
+        if (s && !k) continue;
+        let idx: number;
+        if (mode === 0x13) idx = mem[0xa0000 + y * 320 + x];
+        else {
+          const ppb = mode === 0x06 ? 8 : 4, bits = mode === 0x06 ? 1 : 2;
+          const b = mem[0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb)];
+          idx = (b >> ((ppb - 1 - (x % ppb)) * bits)) & ((1 << bits) - 1);
+        }
+        idx = (s ? idx : 0) ^ (k ? white : 0);
+        px[y * width + x] = this.rgba[idx];
+      }
+    }
   }
 
   focus(): void { this.el.focus(); }

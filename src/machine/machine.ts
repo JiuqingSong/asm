@@ -6,6 +6,7 @@ import { Hle } from './bios.ts';
 import { UART, type NullModem } from './uart.ts';
 import { DosMemory, MEM_TOP } from './dosmem.ts';
 import { Video } from './video.ts';
+import { Mouse, MOUSE_STUB, MOUSE_PTR, MOUSE_VECTOR } from './mouse.ts';
 import { FONT_LO, FONT_HI } from './bios.ts';
 import { builtinFont } from './font8x8.ts';
 
@@ -133,6 +134,7 @@ export class Machine {
   hle = new Hle(this);
   dosmem = new DosMemory(this.cpu);
   video = new Video();
+  mouse = new Mouse();
   /** 8×8 字库（256 个字符 × 8 字节），装载程序时写进 BIOS ROM；默认是内置点阵，界面会用浏览器字体补全其余字符 */
   static font: Uint8Array | null = builtinFont();
   history = new History();
@@ -169,9 +171,19 @@ export class Machine {
     const cpu = this.cpu;
     cpu.io = this.makeBus();
     const pic = this.pic, kbd = this.kbd;
+    const mouse = this.mouse;
     cpu.irq = {
-      pending: () => pic.pending(),
+      pending: () => pic.pending() || mouse.wantsCallback(),
       ack: () => {
+        if (!pic.pending()) {
+          // 鼠标事件：桩代码会远调用登记的处理程序
+          this.mem[BIOS_SEG * 16 + MOUSE_PTR] = mouse.handlerOff & 0xff;
+          this.mem[BIOS_SEG * 16 + MOUSE_PTR + 1] = mouse.handlerOff >> 8;
+          this.mem[BIOS_SEG * 16 + MOUSE_PTR + 2] = mouse.handlerSeg & 0xff;
+          this.mem[BIOS_SEG * 16 + MOUSE_PTR + 3] = mouse.handlerSeg >> 8;
+          mouse.inHandler = true;
+          return MOUSE_VECTOR;
+        }
         const v = pic.ack();
         if (v === pic.vectorBase + 1) kbd.delivered();
         return v;
@@ -327,6 +339,11 @@ export class Machine {
     }
     // INT 8：时钟滴答 -> 调用 INT 1Ch -> EOI
     mem.set([TRAP_OPCODE, 0x08, 0xcd, 0x1c, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT8);
+    // 鼠标回调：保存寄存器 -> 陷阱（装入 AX~DI）-> CALL FAR CS:[0E20] -> 恢复寄存器 -> 陷阱（回调结束）-> IRET
+    mem.set([0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x1e, 0x06, TRAP_OPCODE, MOUSE_VECTOR, 0x2e, 0xff, 0x1e, MOUSE_PTR & 0xff, MOUSE_PTR >> 8,
+      0x07, 0x1f, 0x5d, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, TRAP_OPCODE, MOUSE_VECTOR + 1, 0xcf], bios + MOUSE_STUB);
+    mem[MOUSE_VECTOR * 4] = MOUSE_STUB & 0xff; mem[MOUSE_VECTOR * 4 + 1] = MOUSE_STUB >> 8;
+    mem[MOUSE_VECTOR * 4 + 2] = BIOS_SEG & 0xff; mem[MOUSE_VECTOR * 4 + 3] = BIOS_SEG >> 8;
     // INT 9：读键盘 -> 放入缓冲区 -> EOI
     mem.set([TRAP_OPCODE, 0x09, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     mem.set([0xea, 0x00, 0x00, 0x00, 0xf0], 0xffff0); // 复位向量（不会用到）
@@ -398,6 +415,7 @@ export class Machine {
     this.kbd.clear();
     this.clock = 0;
     this.video.reset();
+    this.mouse.powerOn();
     this.com1.reset();
     this.com2.reset();
     this.hle.reset();
@@ -470,6 +488,7 @@ export class Machine {
     this.pit.advance(dt);
     this.com1.tick(this.clock);
     this.com2.tick(this.clock);
+    this.mouse.tick(this.clock);
   }
 
   /** 机器空闲（等待键盘、已停止）时，让时间流逝到 t（双机运行时保持两台机器的时间同步） */
@@ -493,7 +512,7 @@ export class Machine {
   private checkStop(): StopReason | null {
     const cpu = this.cpu;
     if (this.status === 'exited') return 'exit';
-    if (cpu.waiting && !this.busy && !this.kbd.queue.length && !(this.pic.pending() && cpu.flags & IF)) {
+    if (cpu.waiting && !this.busy && !this.kbd.queue.length && !(cpu.irq!.pending() && cpu.flags & IF)) {
       this.status = 'waiting';
       this.message = '程序正在等待键盘输入（点击屏幕后直接打字）';
       return 'wait';
