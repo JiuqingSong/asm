@@ -45,6 +45,10 @@ node tools/serial-demo.ts send.asm recv.asm 286 buffered   # 双机串口文件�
 
 `test:cpu` 需要先把测试集下载到 `test-data/8088/`（约 730MB，见 https://github.com/SingleStepTests/8088 的 `v2` 目录）。
 
+## 开发计划
+
+下一步要做的功能、工作约定和验证方法见 [docs/ROADMAP.md](docs/ROADMAP.md)。
+
 ## 结构
 
 ```
