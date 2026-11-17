@@ -34,25 +34,37 @@ export class DualMachine {
     return m.status === 'waiting' && (m.kbd.queue.length > 0 || (m.pic.pending() && (m.cpu.flags & IF) !== 0));
   }
 
-  /** 两台机器一起连续运行，最多执行约 budget 条指令 */
-  run(budget: number): DualStop {
+  /**
+   * 两台机器一起连续运行，最多执行约 budget 条指令，或者都到达虚拟时间 untilClock。
+   * 指定了 untilClock（按原机速度运行）时，等键盘的机器的时间也照常流逝。
+   */
+  run(budget: number, untilClock = Infinity): DualStop {
     let used = 0;
+    const finished = (m: Machine) => m.status === 'exited' || m.status === 'error' || m.status === 'empty';
     while (used < budget) {
       const cand = [0, 1].filter(i => this.active(this.m[i]) || this.wakeable(this.m[i]));
       if (!cand.length) {
         // 都在等键盘或都结束了：如果线路上还有字节在传，让时间流逝到它到达
         const next = Math.min(...this.m.map(m => (m.status === 'waiting' ? m.nextSerialEvent() : Infinity)));
-        if (next !== Infinity) {
+        if (next !== Infinity && next <= untilClock) {
           for (const m of this.m) m.idleTo(next);
           continue;
         }
-        if (this.m.every(m => m.status === 'exited' || m.status === 'error' || m.status === 'empty')) return { reason: 'exit', who: -1 };
+        if (this.m.every(finished)) return { reason: 'exit', who: -1 };
+        if (untilClock !== Infinity) {
+          for (const m of this.m) m.idleTo(untilClock);
+          return { reason: 'budget', who: -1 };
+        }
         return { reason: 'wait', who: this.m.findIndex(m => m.status === 'waiting') };
+      }
+      if (cand.every(k => this.m[k].clock >= untilClock)) {
+        for (const m of this.m) if (!cand.includes(m === this.m[0] ? 0 : 1)) m.idleTo(untilClock);
+        return { reason: 'budget', who: -1 };
       }
       const i = cand.reduce((a, b) => (this.m[a].clock <= this.m[b].clock ? a : b));
       const me = this.m[i], other = this.m[1 - i];
       const otherActive = cand.includes(1 - i);
-      const target = otherActive ? other.clock + QUANTUM : me.clock + QUANTUM * 8;
+      const target = Math.min(untilClock, otherActive ? other.clock + QUANTUM : me.clock + QUANTUM * 8);
       const n = Math.max(1, Math.ceil((target - me.clock) / me.clocksPerInstr));
       const before = me.instructions;
       const r = me.run(n, target);

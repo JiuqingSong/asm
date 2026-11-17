@@ -22,6 +22,7 @@ await page.waitForSelector('.monaco-editor');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const status = () => page.$eval('#status', e => e.textContent);
 
+if (process.env.SPEED) await page.select('#speed', process.env.SPEED);
 await page.select('#examples', 'chat');
 await sleep(400);
 console.log('模式：', await page.$eval('#mode', e => e.value), '标签：', await page.$eval('#ed-tabs', e => e.innerText.replace(/\n/g, ' | ')));
@@ -57,7 +58,7 @@ if (sendPath && existsSync(sendPath)) {
     a.sessions[0].m.files.set('TEST.TXT', new TextEncoder().encode(text));
   }, send, recv);
   await page.click('#btn-run');
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 120; i++) {
     await sleep(500);
     const st = await status();
     if (!st.includes('运行中')) break;

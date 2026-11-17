@@ -92,6 +92,8 @@ export interface MachineEvents {
   log?(msg: string): void;
   bell?(): void;
   filesChanged?(): void;
+  /** PC 喇叭：频率（Hz），0 表示不响 */
+  speaker?(freq: number): void;
 }
 
 export class Machine {
@@ -144,6 +146,8 @@ export class Machine {
   private wildWarned = false;
   private pending: { kind: 'step' } | { kind: 'over'; cs: number; ip: number; sp: number } | { kind: 'run' } | null = null;
   private port61 = 0;
+  /** PC 喇叭当前的频率（Hz），0 表示不响 */
+  speakerFreq = 0;
   private crtcIndex = 0;
   private crtc = new Uint8Array(32);
   private cmosIndex = 0;
@@ -163,6 +167,7 @@ export class Machine {
       },
     };
     cpu.trap = (n) => this.hle.handle(n);
+    this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
     this.com1.onWarn = this.com2.onWarn = msg => this.log(msg);
   }
@@ -199,7 +204,7 @@ export class Machine {
             return;
           }
           case 0x40: case 0x41: case 0x42: case 0x43: this.pit.out8(port, v); return;
-          case 0x61: this.port61 = v; return;
+          case 0x61: this.port61 = v; this.updateSpeaker(); return;
           case 0x70: this.cmosIndex = v & 0x7f; return;
           case 0x3d4: this.crtcIndex = v; return;
           case 0x3d5: {
@@ -245,6 +250,16 @@ export class Machine {
   // ======================= 事件 =======================
 
   log(msg: string): void { this.events.log?.(msg); }
+
+  /** 端口 61h 的位 0（定时器 2 号通道门控）和位 1（喇叭数据）都为 1 时，喇叭按 2 号通道的频率发声 */
+  private updateSpeaker(): void {
+    const on = (this.port61 & 3) === 3;
+    const freq = on ? Math.round(1193182 / this.pit.reload[2]) : 0;
+    if (freq !== this.speakerFreq) {
+      this.speakerFreq = freq;
+      this.events.speaker?.(freq);
+    }
+  }
   bell(): void { this.events.bell?.(); }
   filesChanged(): void { this.events.filesChanged?.(); }
   consoleOut(ch: number): void {
@@ -346,6 +361,8 @@ export class Machine {
     this.pic.irr = 0; this.pic.isr = 0; this.pic.imr = 0xb8; this.pic.vectorBase = 8;
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
+    this.port61 = 0;
+    this.updateSpeaker();
     this.kbd.clear();
     this.clock = 0;
     this.com1.reset();

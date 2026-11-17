@@ -8,6 +8,7 @@ import { WIRING_DESC, MCR_DTR, MCR_RTS, MCR_OUT2, MSR_CTS, MSR_DSR, MSR_DCD, LSR
 import { AX } from '../cpu/cpu.ts';
 import { EditorView, monaco } from './editor.ts';
 import { Screen } from './screen.ts';
+import { Speaker } from './speaker.ts';
 import { RegisterPanel, StackPanel, VarsPanel, MemoryPanel, takeSnapshot, h2, h4, type Snapshot } from './panels.ts';
 import { EXAMPLES } from './examples.ts';
 import { INSTR_HELP, DIRECTIVE_HELP, DOS_FUNCS, BIOS_FUNCS } from './help.ts';
@@ -36,6 +37,7 @@ interface Session {
   box: HTMLElement;
   cmdline: HTMLInputElement;
   snap: Snapshot | null;
+  speaker: Speaker;
 }
 
 class App {
@@ -68,12 +70,13 @@ class App {
       const s: Session = {
         i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model: this.editor.createModel(''), program: null, dirty: true,
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
-        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null,
+        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(),
       };
       s.screen.onKey = e => this.key(s, e);
       s.m.events = {
         log: msg => this.addMessage('warning', msg, s.i),
         bell: () => this.beep(),
+        speaker: f => s.speaker.set(f),
         filesChanged: () => { if (this.tab === 'files') this.renderFiles(); },
       };
       box.addEventListener('mousedown', () => { s.screen.focus(); if (this.mode === 'dual' && this.active !== i) this.setActive(i); });
@@ -458,7 +461,12 @@ class App {
 
   // ======================= 执行控制 =======================
 
+  /** 0 全速，-1 原机速度，其他为每秒步数 */
   private speed(): number { return +$<HTMLSelectElement>('speed').value; }
+  /** 按原机速度运行时：开始时的真实时间和虚拟时间 */
+  private rtWall = 0;
+  private rtClock = 0;
+  private get liveClock(): number { return Math.max(...this.live.map(s => s.m.clock)); }
   private get finished(): boolean { return this.live.every(s => s.m.status === 'exited' || s.m.status === 'error' || s.m.status === 'empty'); }
 
   start(): void {
@@ -468,9 +476,12 @@ class App {
     if (done) this.loadAll();
     for (const s of this.live) { this.syncBreakpoints(s); s.snap = takeSnapshot(s.m); }
     const sp = this.speed();
-    if (sp === 0) {
+    for (const s of this.live) s.speaker.enable();
+    if (sp <= 0) {
       this.run = 'run';
-      this.setStatus('运行中…', 'running');
+      this.rtWall = performance.now();
+      this.rtClock = this.liveClock;
+      this.setStatus(this.runText(), 'running');
       this.tick();
     } else {
       this.run = 'animate';
@@ -480,17 +491,39 @@ class App {
     this.updateButtons();
   }
 
+  private runText(): string {
+    if (this.speed() !== -1) return '运行中…';
+    const cpu = CPU_SPEEDS.find(c => c.id === this.cur.m.cpuModel)!;
+    return `运行中（原机速度：${cpu.name}）…`;
+  }
+
   private tick = (): void => {
     if (this.run !== 'run') return;
     const t0 = performance.now();
     let r: StopReason, who = this.active;
+    // 按原机速度运行：让虚拟时间跟上真实时间（PIT 时钟 1.193182 MHz）；落后太多（主机太慢、页面在后台）就不再追赶
+    const realtime = this.speed() === -1;
+    let until = Infinity;
+    if (realtime) {
+      until = this.rtClock + (t0 - this.rtWall) * 1193.182;
+      if (until - this.liveClock > 1193.182 * 250) { this.rtClock = this.liveClock; this.rtWall = t0; until = this.rtClock; }
+    }
     if (this.mode === 'dual') {
       let d;
-      do { d = this.dual.run(20_000); } while (d.reason === 'budget' && performance.now() - t0 < 14);
+      do { d = this.dual.run(20_000, until); } while (d.reason === 'budget' && performance.now() - t0 < 14 && this.liveClock < until);
       r = d.reason;
       if (d.who >= 0) who = d.who;
     } else {
-      do { r = this.cur.m.run(20_000); } while (r === 'budget' && performance.now() - t0 < 14);
+      const m = this.cur.m;
+      do {
+        r = m.run(20_000, until);
+        if (r === 'wait' && realtime) { m.idleTo(until); r = 'budget'; break; } // 等键盘时时间照常流逝
+      } while (r === 'budget' && performance.now() - t0 < 14 && m.clock < until);
+    }
+    if (realtime && r === 'budget') {
+      const waiting = this.live.find(s => s.m.status === 'waiting');
+      if (waiting) this.setStatus(this.waitText(waiting), 'waiting');
+      else if ($('status').classList.contains('waiting')) this.setStatus(this.runText(), 'running');
     }
     if (r === 'budget') {
       if (performance.now() - this.lastRender > 60) { this.render(false); this.lastRender = performance.now(); }
@@ -585,6 +618,7 @@ class App {
 
   private stop(): void {
     this.run = 'idle';
+    for (const s of this.sessions) s.speaker.mute();
     clearInterval(this.animTimer);
     cancelAnimationFrame(this.raf);
     this.updateButtons();
@@ -597,6 +631,7 @@ class App {
   }
 
   private stopped(r: StopReason, who: number): void {
+    for (const x of this.sessions) x.speaker.mute();
     this.updateButtons();
     const s = this.sessions[who >= 0 ? who : this.active];
     const tag = this.mode === 'dual' ? `${s.tag} 机：` : '';
@@ -631,7 +666,7 @@ class App {
   private afterKey(s: Session): void {
     if (s.m.status !== 'waiting') return;
     if (this.run === 'run') {
-      this.setStatus('运行中…', 'running');
+      this.setStatus(this.runText(), 'running');
       cancelAnimationFrame(this.raf);
       this.raf = requestAnimationFrame(this.tick);
       return;

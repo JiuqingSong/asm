@@ -385,3 +385,21 @@ describe('示例程序', () => {
     expect(vals).toEqual([3, 5, 12, 28, 37, 50, 64, 91]);
   });
 });
+
+describe('PC 喇叭', () => {
+  it('两只老虎：频率序列与时长', () => {
+    const m = new Machine();
+    m.load(assemble(EXAMPLES.find(e => e.id === 'music')!.source));
+    const notes: { f: number; t: number }[] = [];
+    m.events.speaker = f => notes.push({ f, t: m.clock });
+    runToEnd(m);
+    const on = notes.filter(n => n.f > 0);
+    expect(on.slice(0, 4).map(n => n.f)).toEqual([262, 294, 330, 262]);
+    expect(on.length).toBe(32);
+    // 第一个音持续约 3 个时钟滴答（4 个减去 1 个停顿），每个滴答 65536 个 PIT 时钟
+    const dur = (notes[1].t - notes[0].t) / 65536;
+    expect(dur).toBeGreaterThan(2.5);
+    expect(dur).toBeLessThan(3.5);
+    expect(notes[notes.length - 1].f).toBe(0);
+  });
+});

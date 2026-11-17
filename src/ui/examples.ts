@@ -497,6 +497,89 @@ end start
 `,
   },
   {
+    id: 'music',
+    title: 'PC 喇叭：两只老虎',
+    source: `; 用 PC 喇叭演奏《两只老虎》
+; 请把速度选成"原机速度"再运行，否则会一闪而过
+;
+; 原理：8253 定时器的 2 号通道产生方波，频率 = 1193182 / 分频值；
+;       端口 61h 的位 0（打开 2 号通道）和位 1（接通喇叭）都为 1 时，喇叭就按这个频率响
+
+.model small
+.stack 100h
+
+.data
+msg     db  'Playing "Two Tigers" ...', 0dh, 0ah, '$'
+; 每个音符两个字：分频值（1193182 / 频率）、时长（时钟滴答数，每秒约 18.2 个）
+; C=4554(262Hz) D=4058 E=3616 F=3419 G=3044 A=2712 低音G=6088
+song    dw  4554,4, 4058,4, 3616,4, 4554,4      ; 两只老虎
+        dw  4554,4, 4058,4, 3616,4, 4554,4      ; 两只老虎
+        dw  3616,4, 3419,4, 3044,8              ; 跑得快
+        dw  3616,4, 3419,4, 3044,8              ; 跑得快
+        dw  3044,2, 2712,2, 3044,2, 3419,2, 3616,4, 4554,4  ; 一只没有眼睛
+        dw  3044,2, 2712,2, 3044,2, 3419,2, 3616,4, 4554,4  ; 一只没有尾巴
+        dw  4554,4, 6088,4, 4554,8              ; 真奇怪
+        dw  4554,4, 6088,4, 4554,8              ; 真奇怪
+        dw  0                                   ; 结束
+
+.code
+start:
+        mov ax, @data
+        mov ds, ax
+        mov dx, offset msg
+        mov ah, 9
+        int 21h
+
+        mov al, 0B6h            ; 2 号通道，先写低字节再写高字节，方式 3（方波）
+        out 43h, al
+        mov si, offset song
+next:
+        mov ax, [si]            ; 分频值
+        or ax, ax
+        jz done
+        out 42h, al             ; 低字节
+        mov al, ah
+        out 42h, al             ; 高字节
+
+        in al, 61h
+        or al, 3                ; 打开喇叭
+        out 61h, al
+        mov di, [si+2]
+        dec di                  ; 留一个滴答做音符之间的停顿
+        call delay
+
+        in al, 61h
+        and al, 0FCh            ; 关掉喇叭
+        out 61h, al
+        mov di, 1
+        call delay
+
+        add si, 4
+        jmp next
+done:
+        mov ax, 4c00h
+        int 21h
+
+; 等待 DI 个时钟滴答：反复用 INT 1Ah 读 BIOS 的滴答计数
+; （INT 1Ah 会改写 CX、DX，所以次数放在 DI 里）
+delay   proc
+        mov ah, 0
+        int 1Ah
+        mov bx, dx              ; 开始时的计数
+wait1:
+        mov ah, 0
+        int 1Ah
+        mov ax, dx
+        sub ax, bx
+        cmp ax, di
+        jb wait1
+        ret
+delay   endp
+
+end start
+`,
+  },
+  {
     id: 'chat',
     title: '串口聊天（双机）',
     pair: true,

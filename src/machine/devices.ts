@@ -78,6 +78,8 @@ export class PIT {
   private readLow = [true, true, true];
   private pendingLow = [0, 0, 0];
   private onTick: () => void;
+  /** 某个通道的计数值被重新设定（喇叭用 2 号通道） */
+  onReload: ((ch: number) => void) | null = null;
 
   constructor(onTick: () => void) {
     this.onTick = onTick;
@@ -128,6 +130,7 @@ export class PIT {
     const set = (val: number) => {
       this.reload[ch] = val === 0 ? 0x10000 : val;
       if (ch === 0) this.counter = this.reload[0];
+      this.onReload?.(ch);
     };
     if (this.access[ch] === 1) set(v);
     else if (this.access[ch] === 2) set(v << 8);
