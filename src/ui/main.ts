@@ -405,6 +405,7 @@ class App {
   private async uploadToDisk(input: HTMLInputElement): Promise<void> {
     for (const f of Array.from(input.files ?? [])) {
       this.cur.m.files.set(f.name.toUpperCase(), new Uint8Array(await f.arrayBuffer()));
+      this.cur.m.fileTimes.set(f.name.toUpperCase(), f.lastModified);
     }
     input.value = '';
     this.renderFiles();

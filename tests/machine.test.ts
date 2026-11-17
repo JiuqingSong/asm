@@ -747,3 +747,176 @@ end start`);
     expect([m.mouse.x, m.mouse.y]).toEqual([600, 470]);
   });
 });
+
+describe('查找文件（INT 21h 4Eh/4Fh、FCB 11h/12h）', () => {
+  const files = (m: Machine) => {
+    m.files.set('HELLO.ASM', new Uint8Array(100));
+    m.files.set('SUM.ASM', new Uint8Array(2000));
+    m.files.set('DATA.TXT', new Uint8Array(70000));
+    m.fileTimes.set('HELLO.ASM', new Date(1998, 9, 26, 13, 45, 30).getTime());
+  };
+
+  it('用 DTA 列出匹配的文件名、大小和日期', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+pat     db '*.ASM', 0
+dta     db 43 dup(0)
+crlf    db 13, 10, '$'
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov dx, offset dta
+        mov ah, 1Ah
+        int 21h
+        mov dx, offset pat
+        mov cx, 0
+        mov ah, 4Eh
+        int 21h
+next:   jc done
+        mov si, offset dta + 1Eh
+print:  lodsb
+        or al, al
+        jz endname
+        mov dl, al
+        mov ah, 2
+        int 21h
+        jmp print
+endname: mov dx, offset crlf
+        mov ah, 9
+        int 21h
+        mov ah, 4Fh
+        int 21h
+        jmp next
+done:   mov ah, 2Fh             ; 取 DTA，确认就是设置的那个
+        int 21h
+        cmp bx, offset dta
+        jne bad
+        mov ax, 4c00h
+        int 21h
+bad:    mov ax, 4c01h
+        int 21h
+end start`);
+    files(m);
+    runToEnd(m);
+    expect(m.exitCode).toBe(0);
+    expect(m.console.replace(/\r/g, '')).toBe('HELLO.ASM\nSUM.ASM\n');
+  });
+
+  it('DTA 里的属性、大小、日期和时间', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+pat     db '\DATA.*', 0
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov dx, offset pat
+        mov cx, 0
+        mov ah, 4Eh
+        int 21h
+        mov ax, 4c00h
+        adc al, 0
+        int 21h
+end start`);
+    files(m);
+    runToEnd(m);
+    expect(m.exitCode).toBe(0);
+    const dta = m.program!.pspSeg * 16 + 0x80;   // 默认 DTA 在 PSP:0080
+    expect(m.mem[dta + 0x15]).toBe(0x20);
+    expect(m.mem[dta + 0x1a] | (m.mem[dta + 0x1b] << 8) | (m.mem[dta + 0x1c] << 16)).toBe(70000);
+    expect(String.fromCharCode(...m.mem.subarray(dta + 0x1e, dta + 0x1e + 9))).toBe('DATA.TXT\0');
+  });
+
+  it('找不到时 CF=1、AX=12h；日期时间按 DOS 格式', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+pat     db 'HELLO.ASM', 0
+none    db '*.EXE', 0
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov dx, offset pat
+        mov cx, 0
+        mov ah, 4Eh
+        int 21h
+        mov dx, offset none
+        mov ah, 4Eh
+        int 21h
+        mov ah, 4ch
+        int 21h
+end start`);
+    files(m);
+    runToEnd(m);
+    expect(m.exitCode).toBe(0x12);
+  });
+
+  it('FCB：29h 分析文件名，11h/12h 查找', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+spec    db '*.ASM', 0
+fcb     db 37 dup(0)
+dta     db 128 dup(0)
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov es, ax
+        mov dx, offset dta
+        mov ah, 1Ah
+        int 21h
+        mov si, offset spec
+        mov di, offset fcb
+        mov ax, 2901h
+        int 21h
+        mov bl, al              ; 1 = 有通配符
+        mov dx, offset fcb
+        mov ah, 11h
+        int 21h
+        mov cx, 0
+again:  or al, al
+        jnz done
+        inc cx
+        mov ah, 12h
+        int 21h
+        jmp again
+done:   mov al, cl
+        add al, bl              ; 2 个文件 + 通配符标志 1
+        mov ah, 4ch
+        int 21h
+end start`);
+    files(m);
+    runToEnd(m);
+    expect(m.exitCode).toBe(3);
+  });
+
+  it('文件时间：57h 读出上传时记录的日期', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+nm      db 'HELLO.ASM', 0
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov dx, offset nm
+        mov ax, 3D00h
+        int 21h
+        mov bx, ax
+        mov ax, 5700h
+        int 21h
+        mov ax, dx
+        mov ah, 4ch             ; 退出码 = 日期的低字节
+        int 21h
+end start`);
+    files(m);
+    runToEnd(m);
+    const date = ((1998 - 1980) << 9) | (10 << 5) | 26;
+    expect(m.exitCode).toBe(date & 0xff);
+  });
+});

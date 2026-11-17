@@ -3,7 +3,7 @@
 // 每个中断向量默认指向 F000 段里的一小段桩代码，桩代码里的"陷阱"指令会调用这里的处理函数。
 // 处理函数通过修改寄存器返回结果；需要通过标志位返回的（CF、ZF）修改栈上保存的 FLAGS。
 // 返回 false 表示需要等待（例如键盘缓冲区为空），CPU 会停在陷阱处，等有按键后重试。
-import { AX, BX, CX, DX, SI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
+import { AX, BX, CX, DX, SI, DI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
 import { MOUSE_STUB } from './mouse.ts';
 import { PIT_HZ } from './uart.ts';
@@ -17,6 +17,32 @@ const BDA = 0x40;
 
 interface OpenFile { name: string; pos: number; data: number[]; write: boolean; dirty: boolean }
 
+/** 文件名换成 DOS 目录项里的 11 个字符（8 + 3，不足补空格）；* 展开成若干个 ?。不是合法的 8.3 名字时返回 null */
+export function to83(name: string): string | null {
+  if (name === '.' || name === '..') return name.padEnd(11, ' ');
+  const dot = name.lastIndexOf('.');
+  const base = dot < 0 ? name : name.slice(0, dot), ext = dot < 0 ? '' : name.slice(dot + 1);
+  const part = (s: string, n: number) => {
+    const star = s.indexOf('*');
+    if (star >= 0) s = s.slice(0, star).padEnd(n, '?');
+    return s.length > n || /[\s.\\/:]/.test(s) ? null : s.padEnd(n, ' ');
+  };
+  const b = part(base, 8), e = part(ext, 3);
+  return b === null || e === null || !base ? null : b + e;
+}
+
+/** 按 DOS 的规则比较：模板里的 ? 匹配任何字符（包括补的空格） */
+export function match83(template: string, name: string): boolean {
+  for (let i = 0; i < 11; i++) if (template[i] !== '?' && template[i] !== name[i]) return false;
+  return true;
+}
+
+/** 11 个字符的目录项名字换回 NAME.EXT */
+function from83(n: string): string {
+  const b = n.slice(0, 8).trimEnd(), e = n.slice(8).trimEnd();
+  return e ? b + '.' + e : b;
+}
+
 export class Hle {
   private m: Machine;
   private cpu: CPU;
@@ -26,6 +52,8 @@ export class Hle {
   private warned = new Set<string>();
   /** 正在进行的磁盘操作结束的虚拟时间（-1 表示没有） */
   private busyUntil = -1;
+  /** 磁盘传输区（DTA）：查找文件的结果写在这里；程序开始时在 PSP:0080 */
+  private dta = { seg: 0, off: 0x80 };
   /** 模拟 DOS 的磁盘缓冲区：最近读写过的扇区（文件名:扇区号），命中时几乎不花时间 */
   private sectorCache = new Map<string, true>();
 
@@ -40,6 +68,7 @@ export class Hle {
     this.sectorCache.clear();
     this.m.busy = false;
     this.handles.clear();
+    this.dta = { seg: this.m.program?.pspSeg ?? 0, off: 0x80 };
   }
 
   /**
@@ -641,7 +670,50 @@ export class Hle {
       case 0x36: // 磁盘剩余空间：AX 每簇扇区数，BX 空闲簇，CX 每扇区字节，DX 总簇数（约 16MB 的盘，剩一半）
         r[AX] = 8; r[BX] = 2000; r[CX] = 512; r[DX] = 4000;
         return true;
-      case 0x1a: return true;
+      case 0x1a: this.dta = { seg: cpu.s[DS], off: r[DX] }; return true;
+      case 0x2f: cpu.s[ES] = this.dta.seg; r[BX] = this.dta.off; return true;
+      case 0x4e: case 0x4f: if (!this.spin(ah === 0x4e ? 3 : 1)) return false; return this.findFile(ah === 0x4e);
+      case 0x11: case 0x12: if (!this.spin(ah === 0x11 ? 3 : 1)) return false; return this.fcbFind(ah === 0x11);
+      case 0x29: return this.parseFcbName();
+      case 0x56: { // 改名：DS:DX 旧名，ES:DI 新名
+        if (!this.spin(3)) return false;
+        const from = this.normName(this.readAsciiz(cpu.s[DS], r[DX]));
+        const to = this.normName(this.readAsciiz(cpu.s[ES], r[DI]));
+        const fs = this.m.files;
+        if (!fs.has(from)) { this.fail(2); return true; }
+        if (!to || /[*?]/.test(to)) { this.fail(3); return true; }
+        if (fs.has(to)) { this.fail(5); return true; }
+        fs.set(to, fs.get(from)!); fs.delete(from);
+        const t = this.m.fileTimes.get(from);
+        this.m.fileTimes.delete(from);
+        if (t !== undefined) this.m.fileTimes.set(to, t);
+        this.m.filesChanged();
+        this.ok();
+        return true;
+      }
+      case 0x57: { // 文件的日期和时间：AL=0 读，AL=1 设置
+        const f = this.handles.get(r[BX]);
+        if (!f) { this.fail(6); return true; }
+        if (this.al === 0) {
+          const { time, date } = this.dosTime(f.name);
+          r[CX] = time; r[DX] = date;
+        } else if (this.al === 1) {
+          const d = r[DX], t = r[CX];
+          this.m.fileTimes.set(f.name, new Date(1980 + (d >> 9), ((d >> 5) & 15) - 1, d & 31, t >> 11, (t >> 5) & 63, (t & 31) * 2).getTime());
+        }
+        this.ok();
+        return true;
+      }
+      case 0x3b: { // 改变当前目录：虚拟磁盘只有根目录
+        const p = this.normName(this.readAsciiz(cpu.s[DS], r[DX]));
+        if (p === '' || p === '.' || p === '\\') { this.ok(); return true; }
+        this.fail(3);
+        return true;
+      }
+      case 0x39: case 0x3a:
+        this.warnOnce('虚拟磁盘只有一个根目录，不能建立或删除子目录');
+        this.fail(ah === 0x39 ? 5 : 3);
+        return true;
       case 0x25: cpu.ww(0, this.al * 4, r[DX]); cpu.ww(0, this.al * 4 + 2, cpu.s[DS]); return true;
       case 0x2a: {
         const d = new Date();
@@ -761,6 +833,7 @@ export class Hle {
         if (!this.spin(3)) return false;
         const name = this.normName(this.readAsciiz(cpu.s[DS], r[DX]));
         if (!this.m.files.delete(name)) { this.fail(2); return true; }
+        this.m.fileTimes.delete(name);
         this.m.filesChanged();
         this.ok();
         return true;
@@ -788,8 +861,163 @@ export class Hle {
     return true;
   }
 
+  // ---------- 查找文件 ----------
+
+  /** 文件的修改时间，换成 DOS 的格式 */
+  private dosTime(name: string): { time: number; date: number } {
+    let t = this.m.fileTimes.get(name);
+    if (t === undefined) { t = Date.now(); this.m.fileTimes.set(name, t); }
+    const d = new Date(t);
+    const y = Math.max(0, Math.min(127, d.getFullYear() - 1980));
+    return {
+      time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
+      date: (y << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+    };
+  }
+
+  /** 虚拟磁盘上某个目录里的文件（目录名是空串表示根目录），按 8.3 名字列出 */
+  private dirEntries(dir: string): { key: string; n83: string }[] {
+    const out: { key: string; n83: string }[] = [];
+    for (const key of this.m.files.keys()) {
+      const k = key.lastIndexOf('\\');
+      if ((k < 0 ? '' : key.slice(0, k)) !== dir) continue;
+      const n83 = to83(k < 0 ? key : key.slice(k + 1));
+      if (n83 && !n83.includes('?')) out.push({ key, n83 });
+    }
+    return out;
+  }
+
+  /** INT 21h 4Eh/4Fh：查找第一个/下一个文件。查找的状态保存在 DTA 的保留区里，和真的 DOS 一样 */
+  private findFile(first: boolean): boolean {
+    const cpu = this.cpu, r = cpu.r, { seg, off } = this.dta;
+    let template: string, attr: number, index: number, dir: string;
+    if (first) {
+      const p = this.normName(this.readAsciiz(cpu.s[DS], r[DX]));
+      const k = p.lastIndexOf('\\');
+      dir = k < 0 ? '' : p.slice(0, k);
+      const t = to83(k < 0 ? p || '*.*' : p.slice(k + 1) || '*.*');
+      attr = r[CX] & 0xff;
+      if (!t) { this.fail(2); return true; }
+      if (dir && dir !== '.' && !this.dirEntries(dir).length) { this.fail(3); return true; }
+      if (dir === '.') dir = '';
+      template = t; index = 0;
+      // 保留区：0 驱动器号，1~11 模板，12 属性，13~14 下一个目录项的序号，15~20 目录名的长度和散列（这里只放长度）
+      cpu.wb(seg, off, 3);
+      for (let i = 0; i < 11; i++) cpu.wb(seg, off + 1 + i, template.charCodeAt(i));
+      cpu.wb(seg, off + 12, attr);
+      this.findDirs.set(seg * 16 + off, dir);
+      if (attr === 0x08) { // 只找卷标
+        this.writeFound(seg, off, 'ASM86', 0x08, 0, this.dosTime('').time, this.dosTime('').date);
+        cpu.ww(seg, off + 13, 0xffff);
+        this.ok();
+        return true;
+      }
+    } else {
+      template = '';
+      for (let i = 0; i < 11; i++) template += String.fromCharCode(cpu.rb(seg, off + 1 + i));
+      attr = cpu.rb(seg, off + 12);
+      index = cpu.rw(seg, off + 13);
+      dir = this.findDirs.get(seg * 16 + off) ?? '';
+      if (index === 0xffff) { this.fail(0x12); return true; }
+    }
+    const list = this.dirEntries(dir);
+    for (let i = index; i < list.length; i++) {
+      if (!match83(template, list[i].n83)) continue;
+      const { time, date } = this.dosTime(list[i].key);
+      this.writeFound(seg, off, from83(list[i].n83), 0x20, this.m.files.get(list[i].key)!.length, time, date);
+      cpu.ww(seg, off + 13, i + 1);
+      this.ok();
+      return true;
+    }
+    cpu.ww(seg, off + 13, 0xffff);
+    this.fail(0x12); // 没有更多文件
+    return true;
+  }
+  /** 4Eh 开始查找时的目录（按 DTA 的地址记录；虚拟磁盘一般只有根目录） */
+  private findDirs = new Map<number, string>();
+
+  /** 把找到的文件写进 DTA：15h 属性，16h 时间，18h 日期，1Ah 大小，1Eh 文件名（以 0 结尾） */
+  private writeFound(seg: number, off: number, name: string, attr: number, size: number, time: number, date: number): void {
+    const cpu = this.cpu;
+    cpu.wb(seg, off + 0x15, attr);
+    cpu.ww(seg, off + 0x16, time);
+    cpu.ww(seg, off + 0x18, date);
+    cpu.ww(seg, off + 0x1a, size & 0xffff);
+    cpu.ww(seg, off + 0x1c, (size >>> 16) & 0xffff);
+    for (let i = 0; i < 13; i++) cpu.wb(seg, off + 0x1e + i, i < name.length ? name.charCodeAt(i) : 0);
+  }
+
+  /**
+   * INT 21h 11h/12h：用 FCB 查找文件（DOS 1.0 的老方法）。DS:DX 是 FCB（可以是以 FFh 开头的扩展 FCB），
+   * 结果按"驱动器号 + 32 字节目录项"写进 DTA；查找的位置记在 FCB 的保留区（偏移 0Ch）里
+   */
+  private fcbFind(first: boolean): boolean {
+    const cpu = this.cpu, r = cpu.r, ds = cpu.s[DS];
+    let fcb = r[DX], attr = 0;
+    const ext = cpu.rb(ds, fcb) === 0xff;
+    if (ext) { attr = cpu.rb(ds, fcb + 6); fcb += 7; }
+    let template = '';
+    for (let i = 0; i < 11; i++) template += String.fromCharCode(cpu.rb(ds, fcb + 1 + i)).toUpperCase();
+    const index = first ? 0 : cpu.rw(ds, fcb + 0x0c);
+    const list = this.dirEntries('');
+    const { seg, off } = this.dta;
+    for (let i = index; i < list.length; i++) {
+      if (!match83(template, list[i].n83)) continue;
+      cpu.ww(ds, fcb + 0x0c, i + 1);
+      let o = off;
+      if (ext) { cpu.wb(seg, o, 0xff); for (let k = 1; k < 6; k++) cpu.wb(seg, o + k, 0); cpu.wb(seg, o + 6, attr); o += 7; }
+      cpu.wb(seg, o, cpu.rb(ds, fcb) || 3);
+      for (let k = 0; k < 11; k++) cpu.wb(seg, o + 1 + k, list[i].n83.charCodeAt(k));
+      cpu.wb(seg, o + 12, 0x20);
+      for (let k = 13; k < 23; k++) cpu.wb(seg, o + k, 0);
+      const { time, date } = this.dosTime(list[i].key), size = this.m.files.get(list[i].key)!.length;
+      cpu.ww(seg, o + 23, time); cpu.ww(seg, o + 25, date); cpu.ww(seg, o + 27, 0);
+      cpu.ww(seg, o + 29, size & 0xffff); cpu.ww(seg, o + 31, (size >>> 16) & 0xffff);
+      this.al = 0;
+      return true;
+    }
+    this.al = 0xff;
+    return true;
+  }
+
+  /** INT 21h 29h：把 DS:SI 处的文件名分析成 FCB（ES:DI）。AL 的位 0 跳过前导分隔符，位 1~3 没写驱动器/名字/扩展名时保留 FCB 原值 */
+  private parseFcbName(): boolean {
+    const cpu = this.cpu, r = cpu.r, ds = cpu.s[DS], es = cpu.s[ES], fcb = r[DI], flags = this.al;
+    let si = r[SI];
+    const ch = () => String.fromCharCode(cpu.rb(ds, si));
+    const SEP = ':.;,=+ \t';
+    if (flags & 1) while (SEP.includes(ch()) && ch() !== '.') si++;
+    else while (ch() === ' ' || ch() === '\t') si++;
+    let wild = false;
+    // 驱动器
+    const c0 = ch().toUpperCase();
+    if (/[A-Z]/.test(c0) && String.fromCharCode(cpu.rb(ds, si + 1)) === ':') {
+      cpu.wb(es, fcb, c0.charCodeAt(0) - 64); si += 2;
+    } else if (!(flags & 2)) cpu.wb(es, fcb, 0);
+    const field = (start: number, len: number, keep: boolean) => {
+      let s = '';
+      while (s.length < 32) {
+        const c = ch();
+        if (c === '\0' || c === '.' || c <= ' ' || '/\\"[]<>|:;,=+'.includes(c)) break;
+        s += c.toUpperCase(); si++;
+      }
+      if (!s) { if (!keep) for (let k = 0; k < len; k++) cpu.wb(es, fcb + start + k, 0x20); return; }
+      const star = s.indexOf('*');
+      if (star >= 0) s = s.slice(0, star).padEnd(len, '?');
+      if (s.includes('?')) wild = true;
+      s = s.slice(0, len).padEnd(len, ' ');
+      for (let k = 0; k < len; k++) cpu.wb(es, fcb + start + k, s.charCodeAt(k));
+    };
+    field(1, 8, (flags & 4) !== 0);
+    if (ch() === '.') { si++; field(9, 3, false); } else if (!(flags & 8)) for (let k = 0; k < 3; k++) cpu.wb(es, fcb + 9 + k, 0x20);
+    r[SI] = si;
+    this.al = wild ? 1 : 0;
+    return true;
+  }
+
   private flushFile(f: OpenFile): void {
     if (!f.dirty) return;
+    this.m.fileTimes.set(f.name, Date.now());
     this.m.files.set(f.name, Uint8Array.from(f.data));
     f.dirty = false;
     this.m.filesChanged();

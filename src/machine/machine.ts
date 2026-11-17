@@ -142,6 +142,8 @@ export class Machine {
   history = new History();
   /** 虚拟磁盘：文件名（大写）-> 内容 */
   files = new Map<string, Uint8Array>();
+  /** 虚拟磁盘上文件的修改时间（毫秒）；没有记录的在第一次被查询时取当前时间 */
+  fileTimes = new Map<string, number>();
 
   program: Program | null = null;
   status: MachineStatus = 'empty';
