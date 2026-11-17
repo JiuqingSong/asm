@@ -3,6 +3,7 @@ import { assemble } from '../asm/assembler.ts';
 import type { Diag, Program } from '../asm/types.ts';
 import { Machine, CPU_SPEEDS, type StopReason, type CpuSpeedId } from '../machine/machine.ts';
 import { DualMachine } from '../machine/dual.ts';
+import { loadExecutable } from '../machine/exe.ts';
 import { scanForChar, type KeyEvent } from '../machine/devices.ts';
 import { WIRING_DESC, MCR_DTR, MCR_RTS, MCR_OUT2, MSR_CTS, MSR_DSR, MSR_DCD, LSR_DR, LSR_THRE, type UART, type Wiring } from '../machine/uart.ts';
 import { AX } from '../cpu/cpu.ts';
@@ -38,6 +39,10 @@ interface Session {
   cmdline: HTMLInputElement;
   snap: Snapshot | null;
   speaker: Speaker;
+  /** 正在运行的可执行文件名（直接运行 EXE/COM 时；运行源程序时为 null） */
+  binary: string | null;
+  /** 可执行文件的说明页（只读） */
+  binModel: monaco.editor.ITextModel | null;
 }
 
 class App {
@@ -70,7 +75,7 @@ class App {
       const s: Session = {
         i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model: this.editor.createModel(''), program: null, dirty: true,
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
-        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(),
+        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null,
       };
       s.screen.onKey = e => this.key(s, e);
       s.m.events = {
@@ -101,7 +106,13 @@ class App {
   }
 
   get cur(): Session { return this.sessions[this.active]; }
-  private byModel(model: monaco.editor.ITextModel): Session { return this.sessions.find(s => s.model === model) ?? this.cur; }
+  private byModel(model: monaco.editor.ITextModel): Session { return this.sessions.find(s => s.model === model || s.binModel === model) ?? this.cur; }
+  /** 编辑器里显示的文档：源程序，或可执行文件的说明页 */
+  private shown(s: Session): monaco.editor.ITextModel { return s.binary && s.binModel ? s.binModel : s.model; }
+  private showDoc(s: Session): void {
+    this.editor.setModel(this.shown(s));
+    this.editor.editor.updateOptions({ readOnly: !!s.binary });
+  }
   /** 当前模式下参与运行的会话 */
   private get live(): Session[] { return this.mode === 'dual' ? this.sessions : [this.sessions[0]]; }
 
@@ -130,7 +141,7 @@ class App {
       s.fileName = src ? store.get('file' + key) || '未命名.asm' : ex.id + '.asm';
       s.cmdline.value = store.get('cmdline' + key) ?? '';
     }
-    this.editor.setModel(this.cur.model);
+    this.showDoc(this.cur);
     this.setMode(store.get('mode') === 'dual' ? 'dual' : 'single', false);
     for (const s of this.live) this.assemble(s, false);
     this.loadAll();
@@ -188,6 +199,15 @@ class App {
       }
     };
     for (const s of this.sessions) s.cmdline.onchange = () => store.set('cmdline' + (s.i ? '.b' : ''), s.cmdline.value);
+    const cn = document.querySelectorAll<HTMLInputElement>('.cn-toggle');
+    const setChinese = (on: boolean) => {
+      for (const c of cn) c.checked = on;
+      for (const s of this.sessions) s.screen.setChinese(on);
+      store.set('chinese', on ? '1' : '0');
+      this.render(false);
+    };
+    for (const c of cn) c.onchange = () => setChinese(c.checked);
+    if (store.get('chinese') === '1') setChinese(true);
 
     window.addEventListener('keydown', e => {
       const k = e.key;
@@ -251,7 +271,7 @@ class App {
 
   private setActive(i: number): void {
     this.active = i;
-    this.editor.setModel(this.cur.model);
+    this.showDoc(this.cur);
     for (const s of this.sessions) s.box.classList.toggle('active', this.mode === 'dual' && s.i === i);
     this.renderTabs();
     const p = this.cur.program;
@@ -265,7 +285,7 @@ class App {
     for (const s of this.live) {
       const b = document.createElement('button');
       b.className = s.i === this.active ? 'active' : '';
-      b.innerHTML = (this.mode === 'dual' ? `<span class="tag">${s.tag} 机</span>` : '') + esc(s.fileName) + (s.dirty && s.program ? ' <span class="mod">●</span>' : '');
+      b.innerHTML = (this.mode === 'dual' ? `<span class="tag">${s.tag} 机</span>` : '') + (s.binary ? esc(s.binary) + ' <span class="note">可执行文件</span>' : esc(s.fileName)) + (!s.binary && s.dirty && s.program ? ' <span class="mod">●</span>' : '');
       b.title = s.dirty ? '已修改，运行时会自动重新汇编' : s.fileName;
       b.onclick = () => this.setActive(s.i);
       el.appendChild(b);
@@ -298,6 +318,7 @@ class App {
     if (targets.some(s => s.model.getValue().trim()) && !confirm(`用示例"${ex.title}"替换${where}中的代码？`)) return;
     this.stop();
     for (const s of targets) {
+      s.binary = null;
       this.editor.setText(s.model, ex.source);
       s.fileName = ex.id + '.asm';
       s.dirty = true;
@@ -319,6 +340,8 @@ class App {
     catch { text = new TextDecoder('gbk').decode(buf); }
     this.stop();
     const s = this.cur;
+    s.binary = null;
+    this.showDoc(s);
     this.editor.setText(s.model, text.replace(/\x1a+$/, ''));
     s.fileName = f.name;
     s.dirty = true;
@@ -346,11 +369,54 @@ class App {
     this.renderFiles();
   }
 
+  /** 直接装载并运行虚拟磁盘上的 EXE/COM 文件（没有源码） */
+  private runBinary(s: Session, name: string): void {
+    const data = s.m.files.get(name);
+    if (!data) return;
+    let loaded;
+    try {
+      loaded = loadExecutable(data, name);
+    } catch (e) {
+      this.addMessage('error', (e as Error).message, s.i);
+      this.setTab('messages');
+      return;
+    }
+    const { program, info } = loaded;
+    this.stop();
+    const h4x = (v: number) => v.toString(16).toUpperCase().padStart(4, '0');
+    const text = [
+      `; ${name}：直接运行的 DOS 可执行文件（没有源码）`,
+      ';',
+      `; 格式：${info.format.toUpperCase()}，程序映像 ${info.imageSize} 字节` +
+        (info.format === 'exe' ? `，重定位 ${info.relocations} 项，另需内存 ${info.minAlloc * 16} 字节` : ''),
+      info.packer ? `; 用 ${info.packer} 压缩过：运行时先由开头的解压代码在内存里展开，再跳到真正的程序` : ';',
+      `; 入口 CS:IP = ${h4x(program.entry.cs)}:${h4x(program.entry.ip)}，堆栈 SS:SP = ${h4x(program.stack.ss)}:${h4x(program.stack.sp)}`,
+      ';',
+      '; 可以运行、暂停、单步，在右边查看寄存器、栈和内存。',
+      '; 没有源码，所以编辑器里不显示当前行（反汇编视图在开发计划里）。',
+      '; 显示中文的程序（为 UCDOS 等中文 DOS 编写）：勾选屏幕右上角的"中文"。',
+      ';',
+      '; 回到源程序：点"汇编"，或者从"示例程序"、"打开"载入源程序。',
+    ].join('\n');
+    if (!s.binModel) s.binModel = this.editor.createModel('');
+    this.editor.setText(s.binModel, text);
+    s.binary = name;
+    s.program = program;
+    s.dirty = false;
+    if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
+    this.renderTabs();
+    this.addMessage('ok', `装载 ${name}：${info.format.toUpperCase()}，${info.imageSize} 字节${info.packer ? `，${info.packer} 压缩` : ''}`, s.i);
+    this.loadAll();
+    this.start();
+    s.screen.focus();
+  }
+
   private fileAction(e: MouseEvent): void {
     const b = (e.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
     if (!b) return;
     const m = this.sessions[+b.dataset.who!].m;
     const name = b.dataset.name!;
+    if (b.dataset.act === 'run') { this.runBinary(this.sessions[+b.dataset.who!], name); return; }
     if (b.dataset.act === 'del') m.files.delete(name);
     else {
       const data = m.files.get(name);
@@ -374,6 +440,7 @@ class App {
       }
       for (const [n, d] of [...s.m.files.entries()].sort()) {
         parts.push(`<div class="file-row"><span class="fn">C:\\${esc(n)}</span><span class="note">${d.length} 字节</span>` +
+          (/.(exe|com)$/i.test(n) ? `<button data-act="run" data-who="${s.i}" data-name="${esc(n)}" title="装载并运行这个可执行文件">运行</button>` : '') +
           `<button data-act="get" data-who="${s.i}" data-name="${esc(n)}">下载</button><button data-act="del" data-who="${s.i}" data-name="${esc(n)}">删除</button></div>`);
       }
     }
@@ -394,6 +461,7 @@ class App {
 
   /** 汇编一个会话的源程序（不装载） */
   private assemble(s: Session, showMessages: boolean): boolean {
+    if (s.binary) { s.binary = null; if (s === this.cur) this.showDoc(s); }
     let p: Program;
     try {
       p = assemble(s.model.getValue());
@@ -438,7 +506,7 @@ class App {
   private loadAll(): void {
     for (const s of this.live) {
       if (!s.program) continue;
-      s.m.load(s.program, s.cmdline.value);
+      s.m.load(s.program, s.cmdline.value, s.binary ?? 'PROGRAM.EXE');
       s.snap = null;
       this.syncBreakpoints(s);
     }
@@ -452,7 +520,7 @@ class App {
   }
 
   private ensureReady(): boolean {
-    if (this.live.some(s => s.dirty || !s.program)) return this.assembleAll(true);
+    if (this.live.some(s => !s.binary && (s.dirty || !s.program))) return this.assembleAll(true);
     return true;
   }
 
@@ -635,7 +703,7 @@ class App {
 
   restart(): void {
     this.stop();
-    if (this.live.some(s => s.dirty || !s.program)) { this.assembleAll(true); return; }
+    if (this.live.some(s => !s.binary && (s.dirty || !s.program))) { this.assembleAll(true); return; }
     this.loadAll();
   }
 

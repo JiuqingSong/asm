@@ -248,3 +248,5 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 .serial-hint { padding: 6px 10px; color: var(--muted); font-size: 12px; }
 
 #examples { width: 132px; }
+/* 中文显示：一个汉字占两个字符格 */
+.screen .row span.wide { display: inline-block; width: 2ch; text-align: center; overflow: hidden; vertical-align: top; height: 1.18em; }

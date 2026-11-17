@@ -20,7 +20,6 @@ export class Hle {
   private line: number[] | null = null;
   private handles = new Map<number, OpenFile>();
   private warned = new Set<string>();
-  private nextFreeSeg = 0;
   /** 正在进行的磁盘操作结束的虚拟时间（-1 表示没有） */
   private busyUntil = -1;
 
@@ -29,12 +28,11 @@ export class Hle {
     this.cpu = m.cpu;
   }
 
-  reset(memStartSeg: number): void {
+  reset(): void {
     this.line = null;
     this.busyUntil = -1;
     this.m.busy = false;
     this.handles.clear();
-    this.nextFreeSeg = memStartSeg;
   }
 
   /**
@@ -74,6 +72,7 @@ export class Hle {
       case 0x01: case 0x04: return true;
       case 0x03: this.m.requestBreak('遇到 INT 3 断点'); return true;
       case 0x05: return true;
+      case 0x2a: case 0x28: return true; // 网络、DOS 空闲：忽略
       case 0x08: return this.timerTick();
       case 0x09: return this.keyboardIrq();
       case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
@@ -314,7 +313,7 @@ export class Hle {
         if (!(mode & 1)) { row = save.row; col = save.col; this.setCursor(row, col); }
         return true;
       }
-      case 0x10: case 0x11: case 0x12: case 0x1a: return true;
+      case 0x10: case 0x11: case 0x12: case 0x1a: case 0x1b: case 0xef: case 0xfe: return true; // 调色板、字体、显卡信息等：按"不支持"处理
     }
     this.warnOnce(`INT 10h 功能 ${hex(this.ah)}h 暂未实现`);
     return true;
@@ -437,13 +436,28 @@ export class Hle {
       case 0x31: this.m.exit(this.al, '程序以驻留方式（TSR）结束；本模拟器把它当作普通退出处理'); return true;
       case 0x4c: this.m.exit(this.al); return true;
       case 0x4d: r[AX] = this.m.lastExitCode; return true;
-      case 0x48: {
-        const need = r[BX];
-        if (this.nextFreeSeg + need > 0xa000) { r[BX] = Math.max(0, 0xa000 - this.nextFreeSeg); this.fail(8); return true; }
-        r[AX] = this.nextFreeSeg; this.nextFreeSeg += need; this.ok();
+      case 0x48: { // 分配内存：BX=段落数
+        const res = this.m.dosmem.alloc(r[BX], this.m.program?.pspSeg ?? 8);
+        if (typeof res === 'number') { r[AX] = res; this.ok(); }
+        else { r[BX] = res.largest; this.fail(res.corrupt ? 7 : 8); }
         return true;
       }
-      case 0x49: case 0x4a: this.ok(); return true;
+      case 0x49: // 释放内存：ES=块的段地址
+        if (this.m.dosmem.free(cpu.s[ES])) this.ok(); else this.fail(9);
+        return true;
+      case 0x4a: { // 调整内存块：ES=块，BX=新的段落数
+        const res = this.m.dosmem.resize(cpu.s[ES], r[BX]);
+        if (res === true) this.ok();
+        else { r[BX] = res.largest; this.fail(res.bad ? 9 : 8); }
+        return true;
+      }
+      case 0x52: // 取 DOS 内部的"表的表"：ES:BX-2 处是第一个 MCB 的段地址
+        cpu.s[ES] = 0x0050; r[BX] = 0x0102;
+        return true;
+      case 0x33: // Ctrl-Break 检查开关等
+        if (this.al === 0 || this.al === 2) cpu.setR8(2, 0);
+        else if (this.al === 5) cpu.setR8(2, 3); // 从 C: 启动
+        return true;
       case 0x44:
         if (this.al === 0) {
           r[DX] = r[BX] <= 2 ? 0x80d3 : 0x0002;

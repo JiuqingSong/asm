@@ -24,6 +24,70 @@ const PALETTE = [
 
 const COLS = 80, ROWS = 25;
 
+// ---------- 中文显示（模拟 UCDOS 等中文 DOS）----------
+// 制表符（CP437 B3h~DAh）与 GBK 的编码范围重叠，例如 C9 CD 既是"╔═"又是"赏"。
+// 中文系统靠上下文识别制表符。这里的规则：只承认"强"连接——上下连接时至少一方是竖线（│║），
+// 左右连接时至少一方是横线（─═）；由强连接连成的一组制表符，既有上下连接又有左右连接，才当作表格线。
+// 这样上下对齐的汉字（例如两行都有"文件"，文 = CE C4 = ╬─）不会被误认成表格。
+const UP = new Set([0xb3, 0xb4, 0xb5, 0xb6, 0xb9, 0xba, 0xbc, 0xbd, 0xbe, 0xc0, 0xc1, 0xc3, 0xc5, 0xc6, 0xc7, 0xc8, 0xca, 0xcc, 0xce, 0xcf, 0xd0, 0xd3, 0xd4, 0xd7, 0xd8, 0xd9]);
+const DOWN = new Set([0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbf, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xcb, 0xcc, 0xce, 0xd1, 0xd2, 0xd5, 0xd6, 0xd7, 0xd8, 0xda]);
+const LEFT = new Set([0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xc1, 0xc2, 0xc4, 0xc5, 0xca, 0xcb, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd7, 0xd8, 0xd9]);
+const RIGHT = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf, 0xd0, 0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xda]);
+
+/** 每个字符格的显示方式：0 西文字符，1 汉字的前半（占两格），2 汉字的后半（不显示），3 制表符 */
+const VLINE = new Set([0xb3, 0xba]);
+const HLINE = new Set([0xc4, 0xcd]);
+
+export function layoutGbk(ch: Uint8Array): Int8Array {
+  const n = COLS * ROWS;
+  const kind = new Int8Array(n);
+  // 1. 找出相互连接的制表符，按连通块判断有没有上下方向的连接
+  const comp = new Int32Array(n).fill(-1);
+  const vertical: boolean[] = [];
+  const horizontal: boolean[] = [];
+  const isBox = (i: number) => ch[i] >= 0xb3 && ch[i] <= 0xda;
+  for (let i = 0; i < n; i++) {
+    if (!isBox(i) || comp[i] >= 0) continue;
+    const id = vertical.length;
+    vertical.push(false);
+    horizontal.push(false);
+    const stack = [i];
+    comp[i] = id;
+    while (stack.length) {
+      const k = stack.pop()!, r = Math.floor(k / COLS), c = k % COLS, b = ch[k];
+      const links: [number, boolean, boolean][] = [
+        [k - COLS, r > 0 && UP.has(b), true], [k + COLS, r < ROWS - 1 && DOWN.has(b), true],
+        [k - 1, c > 0 && LEFT.has(b), false], [k + 1, c < COLS - 1 && RIGHT.has(b), false],
+      ];
+      for (const [j, ok, vert] of links) {
+        if (!ok || !isBox(j)) continue;
+        const nb = ch[j];
+        const back = j === k - COLS ? DOWN.has(nb) : j === k + COLS ? UP.has(nb) : j === k - 1 ? RIGHT.has(nb) : LEFT.has(nb);
+        if (!back) continue;
+        const strong = vert ? VLINE.has(b) || VLINE.has(nb) : HLINE.has(b) || HLINE.has(nb);
+        if (!strong) continue;
+        if (vert) vertical[id] = true; else horizontal[id] = true;
+        if (comp[j] < 0) { comp[j] = id; stack.push(j); }
+      }
+    }
+  }
+  for (let i = 0; i < n; i++) if (comp[i] >= 0 && vertical[comp[i]] && horizontal[comp[i]]) kind[i] = 3;
+  // 2. 其余的高位字节两两组成汉字（每行从左到右配对）
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const i = r * COLS + c;
+      if (kind[i] === 3) continue;
+      const hi = ch[i], lo = ch[i + 1];
+      if (hi >= 0x81 && hi <= 0xfe && c < COLS - 1 && kind[i + 1] !== 3 && lo >= 0x40 && lo <= 0xfe && lo !== 0x7f) {
+        kind[i] = 1; kind[i + 1] = 2; c++;
+      }
+    }
+  }
+  return kind;
+}
+
+const gbk = (() => { try { return new TextDecoder('gbk'); } catch { return null; } })();
+
 export class Screen {
   private el: HTMLElement;
   private cells: HTMLSpanElement[] = [];
@@ -32,6 +96,17 @@ export class Screen {
   private cellW = 8;
   private cellH = 16;
   onKey: ((e: KeyEvent) => void) | null = null;
+  /** 中文显示：像 UCDOS 那样把 GBK 编码显示成汉字 */
+  chinese = false;
+  private snapshot = new Uint8Array(COLS * ROWS * 2);
+  private dirtyAll = true;
+
+  setChinese(on: boolean): void {
+    this.chinese = on;
+    this.dirtyAll = true;
+    this.prev.fill(-1);
+    for (const s of this.cells) { s.className = ''; s.style.display = ''; }
+  }
 
   constructor(el: HTMLElement) {
     this.el = el;
@@ -76,7 +151,8 @@ export class Screen {
   /** 从显存渲染 */
   render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number): void {
     const base = 0xb8000;
-    for (let i = 0; i < COLS * ROWS; i++) {
+    if (this.chinese && gbk) this.renderChinese(mem.subarray(base, base + COLS * ROWS * 2));
+    else for (let i = 0; i < COLS * ROWS; i++) {
       const ch = mem[base + i * 2], at = mem[base + i * 2 + 1];
       if (this.prev[i * 2] === ch && this.prev[i * 2 + 1] === at) continue;
       this.prev[i * 2] = ch; this.prev[i * 2 + 1] = at;
@@ -89,10 +165,34 @@ export class Screen {
     const hidden = (cursorShape & 0x2000) !== 0 || cursorRow >= ROWS || cursorCol >= COLS;
     this.cursor.style.display = hidden ? 'none' : '';
     if (!hidden) {
-      const cell = this.cells[cursorRow * COLS + cursorCol];
-      this.cursor.style.left = cell.offsetLeft + 'px';
+      let cell = this.cells[cursorRow * COLS + cursorCol];
+      let dx = 0;
+      if (cell.style.display === 'none' && cursorCol > 0) { cell = this.cells[cursorRow * COLS + cursorCol - 1]; dx = this.cellW; }
+      this.cursor.style.left = cell.offsetLeft + dx + 'px';
       this.cursor.style.top = (cell.offsetTop + this.cellH * 0.82) + 'px';
       this.cursor.style.width = (this.cellW || cell.offsetWidth) + 'px';
+    }
+  }
+
+  private renderChinese(vram: Uint8Array): void {
+    let changed = this.dirtyAll;
+    for (let k = 0; k < vram.length && !changed; k++) if (vram[k] !== this.snapshot[k]) changed = true;
+    if (!changed) return;
+    this.snapshot.set(vram);
+    this.dirtyAll = false;
+    const chars = new Uint8Array(COLS * ROWS);
+    for (let i = 0; i < chars.length; i++) chars[i] = vram[i * 2];
+    const kind = layoutGbk(chars);
+    for (let i = 0; i < chars.length; i++) {
+      const s = this.cells[i], at = vram[i * 2 + 1];
+      const k = kind[i];
+      s.style.display = k === 2 ? 'none' : '';
+      s.className = k === 1 ? 'wide' : '';
+      if (k === 1) s.textContent = gbk!.decode(chars.subarray(i, i + 2));
+      else if (k !== 2) s.textContent = CP437[chars[i]];
+      const fg = at & 15, bg = (at >> 4) & 7;
+      s.style.color = fg === 7 ? '' : PALETTE[fg];
+      s.style.background = bg === 0 ? '' : PALETTE[bg];
     }
   }
 

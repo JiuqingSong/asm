@@ -4,6 +4,7 @@ import type { Program } from '../asm/types.ts';
 import { PIC, PIT, Keyboard, type KeyEvent } from './devices.ts';
 import { Hle } from './bios.ts';
 import { UART, type NullModem } from './uart.ts';
+import { DosMemory, MEM_TOP } from './dosmem.ts';
 
 /** CPU 速度选项：每条指令平均消耗的 PIT 时钟数（PIT 为 1.193182 MHz） */
 export const CPU_SPEEDS = [
@@ -12,6 +13,9 @@ export const CPU_SPEEDS = [
   { id: '386', name: '386 33MHz', clocks: 0.25, is286: true },
 ] as const;
 export type CpuSpeedId = (typeof CPU_SPEEDS)[number]['id'];
+
+/** 环境变量块：若干个"名=值\0"，以空字符串结束；之后是字数 1 和程序的完整路径 */
+const ENV_TEMPLATE = 'PATH=C:\\\0COMSPEC=C:\\COMMAND.COM\0\0\x01\0C:\\%NAME%\0';
 
 export type MachineStatus = 'empty' | 'ready' | 'paused' | 'running' | 'waiting' | 'exited' | 'error';
 export type StopReason = 'step' | 'breakpoint' | 'exit' | 'wait' | 'budget' | 'error' | 'paused';
@@ -124,6 +128,7 @@ export class Machine {
   /** 连接到另一台机器的串口线 */
   link: NullModem | null = null;
   hle = new Hle(this);
+  dosmem = new DosMemory(this.cpu);
   history = new History();
   /** 虚拟磁盘：文件名（大写）-> 内容 */
   files = new Map<string, Uint8Array>();
@@ -296,7 +301,8 @@ export class Machine {
     this.breakpoints.clear();
   }
 
-  load(program: Program, cmdline = ''): void {
+  /** 装载程序；name 是程序文件名（写进环境变量块，程序可以由此知道自己的路径） */
+  load(program: Program, cmdline = '', name = 'PROGRAM.EXE'): void {
     const cpu = this.cpu, mem = this.mem;
     this.program = program;
     mem.fill(0);
@@ -334,7 +340,18 @@ export class Machine {
     // PSP
     const psp = program.pspSeg * 16;
     mem.set([0xcd, 0x20], psp);
-    w16(psp + 2, 0xa000);
+    w16(psp + 2, MEM_TOP);
+    // 环境变量块和内存控制块链：[环境 MCB][环境 256 字节][程序 MCB][PSP + 程序 … 到 640KB]
+    const pspSeg = program.pspSeg, envSeg = pspSeg - 0x11;
+    const env = ENV_TEMPLATE.replace('%NAME%', name.toUpperCase().slice(0, 64));
+    for (let k = 0; k < env.length; k++) mem[envSeg * 16 + k] = env.charCodeAt(k) & 0xff;
+    w16(psp + 0x2c, envSeg);
+    w16(psp + 0x16, pspSeg); // 父进程（就是自己，表示由"命令行"启动）
+    this.dosmem.first = envSeg - 1;
+    const base = name.replace(/.[^.]*$/, '').toUpperCase().slice(0, 8);
+    this.dosmem.write(envSeg - 1, false, pspSeg, 0x10, base);
+    this.dosmem.write(pspSeg - 1, true, pspSeg, MEM_TOP - pspSeg, base);
+    w16(0x500 + 0x100, envSeg - 1); // INT 21h 52h：0050:0100 处是第一个 MCB 的段地址
     const cmd = cmdline.slice(0, 126);
     mem[psp + 0x80] = cmd.length;
     for (let k = 0; k < cmd.length; k++) mem[psp + 0x81 + k] = cmd.charCodeAt(k) & 0xff;
@@ -367,7 +384,7 @@ export class Machine {
     this.clock = 0;
     this.com1.reset();
     this.com2.reset();
-    this.hle.reset(Math.ceil(program.imageEnd / 16) + 0x10);
+    this.hle.reset();
     this.hle.clearWarnings();
     this.unknownPorts.clear();
     this.history.clear();
@@ -377,7 +394,8 @@ export class Machine {
     this.message = '';
     this.exitCode = 0;
     this.breakRequest = '';
-    this.wildWarned = false;
+    // 没有源码的程序（直接装载的 EXE/COM）无法判断哪里是代码，不做"跑飞"检查
+    this.wildWarned = program.addrToLine.size === 0;
     this.pending = null;
     // 代码范围（用于发现"程序跑飞"）
     this.instrLen.clear();
