@@ -4,5 +4,6 @@
 !package-lock.json
 !index.html
 !tsconfig.json
+!vite.config.ts
 !src/
 !deploy/server.py

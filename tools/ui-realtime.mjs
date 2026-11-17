@@ -34,7 +34,8 @@ for (const [id, cpu, expect] of [['timer', '8088', '约 5 秒'], ['music', '8088
   }
   const sec = ((Date.now() - t0) / 1000).toFixed(1);
   const info = await page.evaluate(() => {
-    const m = window.__app.cur.m;
+    const m = window.__app?.cur.m;
+    if (!m) return "（正式版没有调试对象，只测用时）";
     return `${m.instructions.toLocaleString()} 条指令，虚拟时间 ${(m.clock / 1193182).toFixed(2)} 秒`;
   });
   console.log(`${id} / ${cpu}：用时 ${sec} 秒（应为${expect}），${info}；运行中显示"${during}"，结束后"${await status()}"`);
