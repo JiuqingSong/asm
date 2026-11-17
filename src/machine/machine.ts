@@ -5,6 +5,9 @@ import { PIC, PIT, Keyboard, type KeyEvent } from './devices.ts';
 import { Hle } from './bios.ts';
 import { UART, type NullModem } from './uart.ts';
 import { DosMemory, MEM_TOP } from './dosmem.ts';
+import { Video } from './video.ts';
+import { FONT_LO, FONT_HI } from './bios.ts';
+import { builtinFont } from './font8x8.ts';
 
 /** CPU 速度选项：每条指令平均消耗的 PIT 时钟数（PIT 为 1.193182 MHz） */
 export const CPU_SPEEDS = [
@@ -129,6 +132,9 @@ export class Machine {
   link: NullModem | null = null;
   hle = new Hle(this);
   dosmem = new DosMemory(this.cpu);
+  video = new Video();
+  /** 8×8 字库（256 个字符 × 8 字节），装载程序时写进 BIOS ROM；默认是内置点阵，界面会用浏览器字体补全其余字符 */
+  static font: Uint8Array | null = builtinFont();
   history = new History();
   /** 虚拟磁盘：文件名（大写）-> 内容 */
   files = new Map<string, Uint8Array>();
@@ -194,6 +200,7 @@ export class Machine {
           case 0x3d4: return this.crtcIndex;
           case 0x3d5: return this.crtc[this.crtcIndex & 31];
           case 0x3da: this.retrace ^= 0x09; return this.retrace;
+          case 0x3c6: case 0x3c7: case 0x3c8: case 0x3c9: case 0x3d9: return this.video.in8(port);
         }
         this.unknownPort(port, '读');
         return 0xff;
@@ -220,7 +227,7 @@ export class Machine {
             }
             return;
           }
-          case 0x3d8: case 0x3d9: return;
+          default: if (this.video.out8(port, v)) return;
         }
         this.unknownPort(port, '写');
       },
@@ -323,6 +330,14 @@ export class Machine {
     // INT 9：读键盘 -> 放入缓冲区 -> EOI
     mem.set([TRAP_OPCODE, 0x09, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     mem.set([0xea, 0x00, 0x00, 0x00, 0xf0], 0xffff0); // 复位向量（不会用到）
+    // 8×8 字库：INT 43h 指向前 128 个字符，INT 1Fh 指向后 128 个
+    if (Machine.font) {
+      mem.set(Machine.font.subarray(0, 1024), bios + FONT_LO);
+      mem.set(Machine.font.subarray(1024, 2048), bios + FONT_HI);
+    }
+    for (const [vec, off] of [[0x43, FONT_LO], [0x1f, FONT_HI]] as const) {
+      mem[vec * 4] = off & 0xff; mem[vec * 4 + 1] = off >> 8; mem[vec * 4 + 2] = BIOS_SEG & 0xff; mem[vec * 4 + 3] = BIOS_SEG >> 8;
+    }
     // BIOS 数据区
     const bda = 0x400;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
@@ -382,6 +397,7 @@ export class Machine {
     this.updateSpeaker();
     this.kbd.clear();
     this.clock = 0;
+    this.video.reset();
     this.com1.reset();
     this.com2.reset();
     this.hle.reset();

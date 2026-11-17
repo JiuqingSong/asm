@@ -1,5 +1,5 @@
 // 反汇编面板：显示 CS:IP 前后的指令；点左侧设断点，双击一行运行到那里
-import { CS } from '../cpu/cpu.ts';
+import { CS, BIOS_SEG, TRAP_OPCODE } from '../cpu/cpu.ts';
 import { disassembleAround, disassemble, type Instruction } from '../cpu/disasm.ts';
 import type { Machine } from '../machine/machine.ts';
 import { h2, h4 } from './panels.ts';
@@ -33,7 +33,7 @@ export class DisasmPanel {
     if (!p) { this.el.innerHTML = '<div class="empty">尚未装载程序</div>'; return; }
     const cs = m.cpu.s[CS], ip = m.cpu.ip;
     const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
-    const list = disassembleAround(read, ip, 8, 30);
+    const list = disassembleAround(read, ip, 8, 30).map(i => trapAware(read, cs, i));
     // 标号和变量名：线性地址 -> 名字
     const names = new Map<number, string>();
     for (const s of p.symbols) if (s.kind !== 'const') names.set(s.segment * 16 + s.offset, s.name);
@@ -64,8 +64,17 @@ export class DisasmPanel {
   }
 }
 
+/** BIOS 桩代码里的陷阱指令（F1 nn）：显示成"INT nn 的模拟实现" */
+function trapAware(read: (o: number) => number, cs: number, ins: Instruction): Instruction {
+  if (cs !== BIOS_SEG || read(ins.offset) !== TRAP_OPCODE) return ins;
+  const n = read(ins.offset + 1);
+  const text = `[INT ${h2(n)}h 的功能由模拟器实现]`;
+  return { ...ins, length: 2, bytes: [TRAP_OPCODE, n], text, mnemonic: 'TRAP' };
+}
+
 /** 当前指令的文字（没有源码时显示在寄存器面板上方） */
 export function currentInstruction(m: Machine): Instruction {
   const cs = m.cpu.s[CS];
-  return disassemble(o => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff], m.cpu.ip);
+  const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
+  return trapAware(read, cs, disassemble(read, m.cpu.ip));
 }

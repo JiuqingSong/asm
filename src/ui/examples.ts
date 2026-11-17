@@ -580,6 +580,258 @@ end start
 `,
   },
   {
+    id: 'vga',
+    title: 'VGA 256 色（13h 模式）',
+    input: 'xx',
+    source: `; VGA 的 13h 模式：320×200 像素，256 种颜色，每个像素占一个字节
+; 显存从 A000:0000 开始，第 y 行第 x 列的像素在偏移 y*320+x 处
+; 先画出 256 种颜色的色块，按一个键后让调色板"转"起来，再按一个键退出
+
+.model small
+.stack 200h
+
+.data
+title1  db  'VGA 256 colors, press a key$'
+
+.code
+start:
+        mov ax, @data
+        mov ds, ax
+        mov ax, 0013h           ; 切换到 320x200 256 色模式
+        int 10h
+        mov ax, 0A000h
+        mov es, ax              ; ES 指向显存
+        cld
+
+; 画 16×16 个色块：颜色 n 的色块在第 n/16 行、第 n mod 16 列
+        xor bx, bx              ; BX = 颜色号
+block:
+        mov ax, bx
+        and ax, 0Fh
+        mov cl, 20
+        mul cl                  ; x = 列 × 20
+        mov di, ax
+        mov ax, bx
+        mov cl, 4
+        shr ax, cl
+        mov cl, 11
+        mul cl
+        add ax, 16              ; y = 行 × 11 + 16（上面留出标题的位置）
+        mov dx, 320
+        mul dx                  ; AX = y × 320
+        add di, ax              ; DI = 色块左上角
+        mov dx, 10              ; 色块高 10 像素
+row:
+        mov cx, 19              ; 宽 19 像素
+        mov al, bl
+        rep stosb               ; 一次画一行
+        add di, 320 - 19
+        dec dx
+        jnz row
+        inc bx
+        cmp bx, 256
+        jb block
+
+        mov dx, offset title1   ; 图形模式下 BIOS 也能显示文字
+        mov ah, 9
+        int 21h
+        mov ah, 0               ; 等待按键
+        int 16h
+
+; 调色板轮转：把 32~247 号颜色依次往前挪一个位置
+; 端口 3C7h 设"读"的起始颜色号，3C8h 设"写"的起始颜色号，3C9h 依次读写红、绿、蓝（各 0~63）
+rotate:
+        mov al, 32              ; 先保存 32 号颜色
+        mov dx, 3C7h
+        out dx, al
+        mov dx, 3C9h
+        in al, dx
+        mov bl, al
+        in al, dx
+        mov bh, al
+        in al, dx
+        mov ah, al
+        push ax
+        push bx
+
+        mov cx, 215             ; 33~247 号依次往前挪：i+1 -> i
+        mov si, 32
+shift:
+        mov ax, si
+        inc ax
+        mov dx, 3C7h
+        out dx, al              ; 读 i+1 号
+        mov dx, 3C9h
+        in al, dx
+        mov bl, al
+        in al, dx
+        mov bh, al
+        in al, dx
+        mov ah, al
+        push ax
+        mov ax, si
+        mov dx, 3C8h
+        out dx, al              ; 写 i 号
+        pop ax
+        mov dx, 3C9h
+        mov al, bl
+        out dx, al
+        mov al, bh
+        out dx, al
+        mov al, ah
+        out dx, al
+        inc si
+        loop shift
+
+        mov al, 247             ; 原来的 32 号放到 247 号
+        mov dx, 3C8h
+        out dx, al
+        pop bx
+        pop ax
+        mov dx, 3C9h
+        mov al, bl
+        out dx, al
+        mov al, bh
+        out dx, al
+        mov al, ah
+        out dx, al
+
+        mov ah, 0               ; 等一个时钟滴答（约 1/18 秒）
+        int 1Ah
+        mov bx, dx
+tick:
+        mov ah, 0
+        int 1Ah
+        cmp dx, bx
+        je tick
+
+        mov ah, 1               ; 有按键就退出
+        int 16h
+        jz rotate
+        mov ah, 0
+        int 16h
+
+        mov ax, 0003h           ; 回到文本模式
+        int 10h
+        mov ax, 4c00h
+        int 21h
+end start
+`,
+  },
+  {
+    id: 'lines',
+    title: '画线（Bresenham 算法）',
+    input: 'x',
+    source: `; 从屏幕中心向四周画线：Bresenham 直线算法，只用整数加减法
+; 每个点用 BIOS 的写像素功能 INT 10h AH=0Ch 画出（CX=x，DX=y，AL=颜色）
+; 选"原机速度"运行，可以看到线一条一条画出来；按一个键退出
+
+.model small
+.stack 200h
+
+.data
+x0      dw  160             ; 起点：屏幕中心
+y0      dw  100
+x1      dw  ?               ; 终点
+y1      dw  ?
+ddx     dw  ?               ; |x1 - x0|
+ddy     dw  ?               ; -|y1 - y0|
+sx      dw  ?               ; x 方向的步长：+1 或 -1
+sy      dw  ?
+err     dw  ?
+color   db  32
+
+.code
+start:
+        mov ax, @data
+        mov ds, ax
+        mov ax, 0013h           ; 320x200 256 色
+        int 10h
+
+        mov x1, 0               ; 上下两条边上的终点
+edges1:
+        mov y1, 0
+        call line
+        mov y1, 199
+        call line
+        add x1, 8
+        cmp x1, 320
+        jb edges1
+
+        mov y1, 0               ; 左右两条边上的终点
+edges2:
+        mov x1, 0
+        call line
+        mov x1, 319
+        call line
+        add y1, 8
+        cmp y1, 200
+        jb edges2
+
+        mov ah, 0               ; 等待按键
+        int 16h
+        mov ax, 0003h           ; 回到文本模式
+        int 10h
+        mov ax, 4c00h
+        int 21h
+
+; 从 (x0,y0) 画到 (x1,y1)；每画一条换一种颜色
+line    proc
+        mov ax, x1
+        sub ax, x0
+        mov sx, 1
+        jge l1
+        neg ax
+        mov sx, -1
+l1:     mov ddx, ax             ; ddx = |x1-x0|
+        mov ax, y1
+        sub ax, y0
+        mov sy, 1
+        jge l2
+        neg ax
+        mov sy, -1
+l2:     neg ax
+        mov ddy, ax             ; ddy = -|y1-y0|
+        add ax, ddx
+        mov err, ax             ; err = ddx + ddy
+        mov cx, x0
+        mov dx, y0
+plot:
+        mov al, color
+        mov ah, 0Ch             ; 写像素
+        mov bh, 0
+        int 10h
+        cmp cx, x1
+        jne step
+        cmp dx, y1
+        je done
+step:
+        mov ax, err
+        shl ax, 1               ; e2 = 2*err
+        cmp ax, ddy
+        jl nox                  ; e2 >= ddy 时：x 走一步
+        mov bx, ddy
+        add err, bx
+        add cx, sx
+nox:
+        cmp ax, ddx
+        jg plot                 ; e2 <= ddx 时：y 走一步
+        mov bx, ddx
+        add err, bx
+        add dx, sy
+        jmp plot
+done:
+        inc color               ; 下一条线换个颜色（在 32~103 的色环里循环）
+        cmp color, 104
+        jb ok
+        mov color, 32
+ok:     ret
+line    endp
+
+end start
+`,
+  },
+  {
     id: 'chat',
     title: '串口聊天（双机）',
     pair: true,

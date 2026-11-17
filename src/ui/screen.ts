@@ -1,5 +1,6 @@
 // DOS 文本屏幕（80×25，B800:0000）的渲染与键盘输入
 import { SCAN, type KeyEvent } from '../machine/devices.ts';
+import { modeInfo, type Video } from '../machine/video.ts';
 
 const LOW = ' ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼';
 const HIGH = 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
@@ -100,6 +101,13 @@ export class Screen {
   chinese = false;
   private snapshot = new Uint8Array(COLS * ROWS * 2);
   private dirtyAll = true;
+  // 图形模式：用 canvas 画像素
+  private canvas: HTMLCanvasElement;
+  private ctx: CanvasRenderingContext2D | null;
+  private image: ImageData | null = null;
+  private graphicsMode = -1;
+  private paletteVersion = -1;
+  private rgba = new Uint32Array(256);
 
   setChinese(on: boolean): void {
     this.chinese = on;
@@ -124,6 +132,11 @@ export class Screen {
     this.cursor = document.createElement('div');
     this.cursor.className = 'cursor';
     el.appendChild(this.cursor);
+    this.canvas = document.createElement('canvas');
+    this.canvas.className = 'gfx';
+    this.canvas.style.display = 'none';
+    el.appendChild(this.canvas);
+    this.ctx = this.canvas.getContext('2d');
     el.addEventListener('keydown', e => this.key(e, false));
     el.addEventListener('keyup', e => this.key(e, true));
     const wrap = el.parentElement!;
@@ -149,7 +162,11 @@ export class Screen {
   }
 
   /** 从显存渲染 */
-  render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number): void {
+  render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number, video?: Video): void {
+    const mode = mem[0x449];
+    const info = modeInfo(mode);
+    if (info.graphics && video) { this.renderGraphics(mem, mode, video); return; }
+    if (this.graphicsMode >= 0) this.leaveGraphics();
     const base = 0xb8000;
     if (this.chinese && gbk) this.renderChinese(mem.subarray(base, base + COLS * ROWS * 2));
     else for (let i = 0; i < COLS * ROWS; i++) {
@@ -194,6 +211,63 @@ export class Screen {
       s.style.color = fg === 7 ? '' : PALETTE[fg];
       s.style.background = bg === 0 ? '' : PALETTE[bg];
     }
+  }
+
+  private leaveGraphics(): void {
+    this.graphicsMode = -1;
+    this.canvas.style.display = 'none';
+    this.el.classList.remove('graphics');
+    this.prev.fill(-1);
+    this.dirtyAll = true;
+  }
+
+  /** 图形模式：按显示模式把显存换算成像素 */
+  private renderGraphics(mem: Uint8Array, mode: number, video: Video): void {
+    const info = modeInfo(mode);
+    if (mode !== this.graphicsMode) {
+      this.graphicsMode = mode;
+      this.canvas.width = info.width;
+      this.canvas.height = info.height;
+      this.image = this.ctx?.createImageData(info.width, info.height) ?? null;
+      this.canvas.style.display = '';
+      this.el.classList.add('graphics');
+      this.cursor.style.display = 'none';
+      this.paletteVersion = -1;
+    }
+    if (!this.ctx || !this.image) return;
+    // 调色板：6 位分量换算成 8 位，按小端写成 RGBA
+    if (video.version !== this.paletteVersion) {
+      this.paletteVersion = video.version;
+      const c8 = (v: number) => ((v & 63) << 2) | ((v & 63) >> 4);
+      const pack = (r: number, g: number, b: number) => (255 << 24) | (c8(b) << 16) | (c8(g) << 8) | c8(r);
+      if (mode === 0x13) {
+        for (let i = 0; i < 256; i++) {
+          const k = (i & video.pelMask) * 3;
+          this.rgba[i] = pack(video.dac[k], video.dac[k + 1], video.dac[k + 2]);
+        }
+      } else if (mode === 0x06) {
+        this.rgba[0] = pack(0, 0, 0); this.rgba[1] = pack(63, 63, 63);
+      } else {
+        video.cgaColors(mode).forEach(([r, g, b], i) => { this.rgba[i] = pack(r, g, b); });
+      }
+    }
+    const px = new Uint32Array(this.image.data.buffer);
+    const { width, height } = info;
+    if (mode === 0x13) {
+      const base = 0xa0000;
+      for (let i = 0; i < 64000; i++) px[i] = this.rgba[mem[base + i]];
+    } else {
+      const base = 0xb8000;
+      const ppb = mode === 0x06 ? 8 : 4, bits = mode === 0x06 ? 1 : 2, mask = (1 << bits) - 1;
+      for (let y = 0; y < height; y++) {
+        const row = base + (y & 1) * 0x2000 + (y >> 1) * 80;
+        for (let x = 0; x < width; x++) {
+          const b = mem[row + Math.floor(x / ppb)];
+          px[y * width + x] = this.rgba[(b >> ((ppb - 1 - (x % ppb)) * bits)) & mask];
+        }
+      }
+    }
+    this.ctx.putImageData(this.image, 0, 0);
   }
 
   focus(): void { this.el.focus(); }

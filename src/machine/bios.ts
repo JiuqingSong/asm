@@ -6,10 +6,14 @@
 import { AX, BX, CX, DX, SI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
 import { PIT_HZ } from './uart.ts';
+import { modeInfo, SUPPORTED_MODES, type ModeInfo } from './video.ts';
+
+/** ROM 里 8×8 字库的位置：前 128 个字符在 F000:FA6E（与 IBM PC 相同），后 128 个在 F000:0A00 */
+export const FONT_LO = 0xfa6e, FONT_HI = 0x0a00;
 
 const BDA = 0x40;
-const VIDEO_SEG = 0xb800;
-const COLS = 80, ROWS = 25;
+
+const ROWS = 25;
 
 interface OpenFile { name: string; pos: number; data: number[]; write: boolean; dirty: boolean }
 
@@ -198,6 +202,10 @@ export class Hle {
   }
 
   // ---------- 显示 ----------
+  private get mode(): number { return this.cpu.rb(BDA, 0x49); }
+  private get vinfo(): ModeInfo { return modeInfo(this.mode); }
+  private get cols(): number { return this.vinfo.cols; }
+
   getCursor(): { row: number; col: number } {
     return { col: this.cpu.rb(BDA, 0x50), row: this.cpu.rb(BDA, 0x51) };
   }
@@ -206,14 +214,80 @@ export class Hle {
     this.cpu.wb(BDA, 0x51, row);
   }
 
-  private cellOff(row: number, col: number): number { return (row * COLS + col) * 2; }
+  private cellOff(row: number, col: number): number { return (row * this.cols + col) * 2; }
+  private get textSeg(): number { return this.vinfo.seg; }
 
+  // ----- 图形模式的像素 -----
+
+  /** 像素所在的字节偏移和位移（CGA 模式偶数行在 B800:0000，奇数行在 B800:2000） */
+  private pixelAt(x: number, y: number): { off: number; shift: number; mask: number } {
+    const m = this.mode;
+    if (m === 0x13) return { off: y * 320 + x, shift: 0, mask: 0xff };
+    const bank = (y & 1) * 0x2000 + (y >> 1) * 80;
+    if (m === 0x06) return { off: bank + (x >> 3), shift: 7 - (x & 7), mask: 1 };
+    return { off: bank + (x >> 2), shift: (3 - (x & 3)) * 2, mask: 3 };
+  }
+
+  putPixel(x: number, y: number, color: number, xor = false): void {
+    const vi = this.vinfo;
+    if (!vi.graphics || x < 0 || y < 0 || x >= vi.width || y >= vi.height) return;
+    const { off, shift, mask } = this.pixelAt(x, y);
+    const old = this.cpu.rb(vi.seg, off);
+    const c = (color & mask) << shift;
+    const v = xor ? old ^ c : (old & ~(mask << shift)) | c;
+    this.cpu.wb(vi.seg, off, v);
+  }
+
+  getPixel(x: number, y: number): number {
+    const vi = this.vinfo;
+    if (!vi.graphics || x < 0 || y < 0 || x >= vi.width || y >= vi.height) return 0;
+    const { off, shift, mask } = this.pixelAt(x, y);
+    return (this.cpu.rb(vi.seg, off) >> shift) & mask;
+  }
+
+  /** 在图形模式下画一个 8×8 字符（字形取自 ROM 字库：INT 43h、INT 1Fh 指向的表） */
+  private drawGlyph(row: number, col: number, ch: number, color: number): void {
+    const xor = this.mode !== 0x13 && (color & 0x80) !== 0;
+    const vecNo = ch < 128 ? 0x43 : 0x1f;
+    const tOff = this.cpu.rw(0, vecNo * 4), tSeg = this.cpu.rw(0, vecNo * 4 + 2);
+    const base = (ch & 0x7f) * 8;
+    for (let gy = 0; gy < 8; gy++) {
+      const bits = this.cpu.rb(tSeg, tOff + base + gy);
+      for (let gx = 0; gx < 8; gx++) {
+        const on = (bits >> (7 - gx)) & 1;
+        if (xor) { if (on) this.putPixel(col * 8 + gx, row * 8 + gy, color & 0x7f, true); }
+        else this.putPixel(col * 8 + gx, row * 8 + gy, on ? color : 0);
+      }
+    }
+  }
+
+  /** 卷动一个窗口（文字坐标）；图形模式下按 8 像素一行卷动像素 */
   scroll(up: boolean, n: number, attr: number, r1: number, c1: number, r2: number, c2: number): void {
-    const cpu = this.cpu;
-    r2 = Math.min(r2, ROWS - 1); c2 = Math.min(c2, COLS - 1);
+    const cpu = this.cpu, vi = this.vinfo, cols = this.cols;
+    r2 = Math.min(r2, ROWS - 1); c2 = Math.min(c2, cols - 1);
     if (r1 > r2 || c1 > c2) return;
     const h = r2 - r1 + 1;
     if (n === 0 || n > h) n = h;
+    if (vi.graphics) {
+      const y1 = r1 * 8, y2 = r2 * 8 + 7, x1 = c1 * 8, x2 = c2 * 8 + 7, dy = n * 8;
+      const fill = vi.bpp === 8 ? attr : 0;
+      if (this.mode === 0x13 && x1 === 0 && x2 >= 319) {
+        // 整行卷动：按字节整块搬移，快得多
+        const rows = up ? range(y1, y2) : range(y1, y2).reverse();
+        for (const y of rows) {
+          const src = up ? y + dy : y - dy;
+          for (let x = 0; x < 320; x++) cpu.wb(0xa000, y * 320 + x, src >= y1 && src <= y2 ? cpu.rb(0xa000, src * 320 + x) : fill);
+        }
+        return;
+      }
+      const rows = up ? range(y1, y2) : range(y1, y2).reverse();
+      for (const y of rows) {
+        const src = up ? y + dy : y - dy;
+        for (let x = x1; x <= Math.min(x2, vi.width - 1); x++) this.putPixel(x, y, src >= y1 && src <= y2 ? this.getPixel(x, src) : fill);
+      }
+      return;
+    }
+    const seg = this.textSeg;
     const rows = up ? range(r1, r2) : range(r1, r2).reverse();
     for (const r of rows) {
       const src = up ? r + n : r - n;
@@ -221,33 +295,37 @@ export class Hle {
         const o = this.cellOff(r, c);
         if (src >= r1 && src <= r2) {
           const so = this.cellOff(src, c);
-          cpu.wb(VIDEO_SEG, o, cpu.rb(VIDEO_SEG, so));
-          cpu.wb(VIDEO_SEG, o + 1, cpu.rb(VIDEO_SEG, so + 1));
+          cpu.wb(seg, o, cpu.rb(seg, so));
+          cpu.wb(seg, o + 1, cpu.rb(seg, so + 1));
         } else {
-          cpu.wb(VIDEO_SEG, o, 0x20);
-          cpu.wb(VIDEO_SEG, o + 1, attr);
+          cpu.wb(seg, o, 0x20);
+          cpu.wb(seg, o + 1, attr);
         }
       }
     }
   }
 
-  /** 电传方式输出一个字符（处理回车、换行、退格、响铃，到底部自动滚屏） */
+  /** 电传方式输出一个字符（处理回车、换行、退格、响铃，到底部自动滚屏）；图形模式下 attr 是颜色 */
   teletype(ch: number, attr = -1): void {
     let { row, col } = this.getCursor();
+    const cols = this.cols, graphics = this.vinfo.graphics;
     switch (ch) {
       case 0x07: this.m.bell(); break;
       case 0x08: if (col > 0) col--; break;
       case 0x0a: row++; break;
       case 0x0d: col = 0; break;
       default: {
-        const o = this.cellOff(row, col);
-        this.cpu.wb(VIDEO_SEG, o, ch);
-        if (attr >= 0) this.cpu.wb(VIDEO_SEG, o + 1, attr);
+        if (graphics) this.drawGlyph(row, col, ch, attr >= 0 ? attr : this.mode === 0x13 ? 15 : 3);
+        else {
+          const o = this.cellOff(row, col);
+          this.cpu.wb(this.textSeg, o, ch);
+          if (attr >= 0) this.cpu.wb(this.textSeg, o + 1, attr);
+        }
         col++;
-        if (col >= COLS) { col = 0; row++; }
+        if (col >= cols) { col = 0; row++; }
       }
     }
-    if (row >= ROWS) { this.scroll(true, 1, 0x07, 0, 0, ROWS - 1, COLS - 1); row = ROWS - 1; }
+    if (row >= ROWS) { this.scroll(true, 1, graphics ? 0 : 0x07, 0, 0, ROWS - 1, cols - 1); row = ROWS - 1; }
     this.setCursor(row, col);
     this.m.consoleOut(ch);
   }
@@ -257,24 +335,44 @@ export class Hle {
   }
 
   clearScreen(): void {
-    for (let o = 0; o < COLS * ROWS * 2; o += 2) {
-      this.cpu.wb(VIDEO_SEG, o, 0x20);
-      this.cpu.wb(VIDEO_SEG, o + 1, 0x07);
+    const vi = this.vinfo;
+    if (vi.graphics) {
+      const size = this.mode === 0x13 ? 64000 : 0x4000;
+      for (let o = 0; o < size; o++) this.cpu.wb(vi.seg, o, 0);
+    } else {
+      for (let o = 0; o < vi.cols * ROWS * 2; o += 2) {
+        this.cpu.wb(vi.seg, o, 0x20);
+        this.cpu.wb(vi.seg, o + 1, 0x07);
+      }
     }
     this.setCursor(0, 0);
+  }
+
+  private setMode(al: number): void {
+    const cpu = this.cpu;
+    const mode = al & 0x7f;
+    if (!SUPPORTED_MODES.has(mode)) {
+      this.warnOnce(`程序要切换到显示模式 ${hex(mode)}h，本模拟器暂不支持（支持文本模式和图形模式 04h、05h、06h、13h），仍保持原来的模式`);
+      return;
+    }
+    const vi = modeInfo(mode);
+    cpu.wb(BDA, 0x49, mode);
+    cpu.ww(BDA, 0x4a, vi.cols);
+    cpu.ww(BDA, 0x4c, vi.graphics ? (mode === 0x13 ? 0xfa00 : 0x4000) : vi.cols * ROWS * 2);
+    const video = this.m.video;
+    if (mode === 0x13) video.reset();
+    else if (mode === 0x04 || mode === 0x05) video.cgaColor = 0x30;
+    else if (mode === 0x06) video.cgaColor = 0x3f;
+    video.version++;
+    if (!(al & 0x80)) this.clearScreen(); else this.setCursor(0, 0);
   }
 
   private video(): boolean {
     const cpu = this.cpu, r = cpu.r;
     const bl = r[BX] & 0xff;
+    const graphics = this.vinfo.graphics;
     switch (this.ah) {
-      case 0x00: {
-        const mode = this.al & 0x7f;
-        if (mode > 3 && mode !== 7) this.warnOnce(`程序切换到了显示模式 ${hex(mode)}h，本模拟器目前只支持文本模式`);
-        cpu.wb(BDA, 0x49, mode);
-        if (!(this.al & 0x80)) this.clearScreen(); else this.setCursor(0, 0);
-        return true;
-      }
+      case 0x00: this.setMode(this.al); return true;
       case 0x01: cpu.ww(BDA, 0x60, r[CX]); return true;
       case 0x02: this.setCursor(r[DX] >> 8, r[DX] & 0xff); return true;
       case 0x03: { const c = this.getCursor(); r[DX] = (c.row << 8) | c.col; r[CX] = cpu.rw(BDA, 0x60); return true; }
@@ -283,21 +381,46 @@ export class Hle {
         this.scroll(this.ah === 0x06, this.al, r[BX] >> 8, r[CX] >> 8, r[CX] & 0xff, r[DX] >> 8, r[DX] & 0xff);
         return true;
       case 0x08: {
+        if (graphics) { r[AX] = 0; return true; }
         const c = this.getCursor(), o = this.cellOff(c.row, c.col);
-        r[AX] = (cpu.rb(VIDEO_SEG, o + 1) << 8) | cpu.rb(VIDEO_SEG, o);
+        r[AX] = (cpu.rb(this.textSeg, o + 1) << 8) | cpu.rb(this.textSeg, o);
         return true;
       }
       case 0x09: case 0x0a: {
         const c = this.getCursor();
+        if (graphics) {
+          for (let k = 0; k < r[CX] && c.col + k < this.cols; k++) this.drawGlyph(c.row, c.col + k, this.al, bl);
+          return true;
+        }
         let o = this.cellOff(c.row, c.col);
-        for (let k = 0; k < r[CX] && o < COLS * ROWS * 2; k++, o += 2) {
-          cpu.wb(VIDEO_SEG, o, this.al);
-          if (this.ah === 0x09) cpu.wb(VIDEO_SEG, o + 1, bl);
+        for (let k = 0; k < r[CX] && o < this.cols * ROWS * 2; k++, o += 2) {
+          cpu.wb(this.textSeg, o, this.al);
+          if (this.ah === 0x09) cpu.wb(this.textSeg, o + 1, bl);
         }
         return true;
       }
-      case 0x0e: this.teletype(this.al); return true;
-      case 0x0f: r[AX] = (COLS << 8) | cpu.rb(BDA, 0x49); cpu.setR8(7, 0); return true;
+      case 0x0b: { // CGA 调色板：BH=0 设背景色，BH=1 选调色板
+        const v = this.m.video;
+        if (r[BX] >> 8 === 0) v.cgaColor = (v.cgaColor & 0x20) | (bl & 0x1f);
+        else v.cgaColor = (v.cgaColor & 0x1f) | ((bl & 1) << 5);
+        v.version++;
+        return true;
+      }
+      case 0x0c: this.putPixel(r[CX], r[DX], this.al, this.mode !== 0x13 && (this.al & 0x80) !== 0); return true;
+      case 0x0d: this.al = this.getPixel(r[CX], r[DX]); return true;
+      case 0x0e: this.teletype(this.al, graphics ? (bl || (this.mode === 0x13 ? 15 : 3)) : -1); return true;
+      case 0x0f: r[AX] = (this.cols << 8) | this.mode; cpu.setR8(7, 0); return true;
+      case 0x10: return this.palette();
+      case 0x11:
+        if (this.al === 0x30) { // 取字库信息：ES:BP 指向 8×8 字库
+          const upper = r[BX] >> 8 === 4;
+          cpu.s[ES] = 0xf000; r[BP] = upper ? FONT_HI : FONT_LO;
+          r[CX] = 8; cpu.setR8(2, ROWS - 1);
+        }
+        return true;
+      case 0x12:
+        if (bl === 0x10) { r[BX] = 0x0003; r[CX] = 0x0009; } // EGA/VGA 信息：彩色，256KB
+        return true;
       case 0x13: {
         const mode = this.al;
         let row = r[DX] >> 8, col = r[DX] & 0xff;
@@ -313,9 +436,40 @@ export class Hle {
         if (!(mode & 1)) { row = save.row; col = save.col; this.setCursor(row, col); }
         return true;
       }
-      case 0x10: case 0x11: case 0x12: case 0x1a: case 0x1b: case 0xef: case 0xfe: return true; // 调色板、字体、显卡信息等：按"不支持"处理
+      case 0x1a:
+        if (this.al === 0) { this.al = 0x1a; r[BX] = 0x0008; } // 显示组合：VGA 彩色
+        return true;
+      case 0x1b: case 0xef: case 0xfe: return true; // 功能信息等：按"不支持"处理
     }
     this.warnOnce(`INT 10h 功能 ${hex(this.ah)}h 暂未实现`);
+    return true;
+  }
+
+  /** INT 10h AH=10h：调色板 */
+  private palette(): boolean {
+    const cpu = this.cpu, r = cpu.r, v = this.m.video;
+    switch (this.al) {
+      case 0x10: v.setColor(r[BX] & 0xff, r[DX] >> 8, r[CX] >> 8, r[CX] & 0xff); return true;
+      case 0x12: {
+        let p = r[DX];
+        for (let k = 0; k < r[CX]; k++, p += 3) {
+          v.setColor((r[BX] + k) & 0xff, cpu.rb(cpu.s[ES], p), cpu.rb(cpu.s[ES], p + 1), cpu.rb(cpu.s[ES], p + 2));
+        }
+        return true;
+      }
+      case 0x15: {
+        const i = (r[BX] & 0xff) * 3;
+        cpu.setR8(6, v.dac[i]); cpu.setR8(5, v.dac[i + 1]); cpu.setR8(1, v.dac[i + 2]);
+        return true;
+      }
+      case 0x17: {
+        let p = r[DX];
+        for (let k = 0; k < r[CX] * 3; k++) cpu.wb(cpu.s[ES], p++, v.dac[(((r[BX] + Math.floor(k / 3)) & 0xff) * 3) + (k % 3)]);
+        return true;
+      }
+      case 0x00: case 0x01: case 0x02: case 0x03: case 0x07: case 0x08: case 0x09: case 0x13: case 0x1a: return true;
+    }
+    this.warnOnce(`INT 10h AX=10${hex(this.al)}h 暂未实现`);
     return true;
   }
 
@@ -418,6 +572,9 @@ export class Hle {
       case 0x0d: return true;
       case 0x0e: this.al = 3; return true;
       case 0x19: this.al = 2; return true;
+      case 0x36: // 磁盘剩余空间：AX 每簇扇区数，BX 空闲簇，CX 每扇区字节，DX 总簇数（约 16MB 的盘，剩一半）
+        r[AX] = 8; r[BX] = 2000; r[CX] = 512; r[DX] = 4000;
+        return true;
       case 0x1a: return true;
       case 0x25: cpu.ww(0, this.al * 4, r[DX]); cpu.ww(0, this.al * 4 + 2, cpu.s[DS]); return true;
       case 0x2a: {

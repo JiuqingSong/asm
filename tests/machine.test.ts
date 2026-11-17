@@ -462,3 +462,90 @@ end start`;
     expect(m.cpu.r[AX]).toBe(1);
   });
 });
+
+describe('图形模式', () => {
+  const run = (id: string, keys: string) => {
+    const m = new Machine();
+    m.load(assemble(EXAMPLES.find(e => e.id === id)!.source));
+    const snaps: Uint8Array[] = [];
+    for (const [n, k] of [...keys].entries()) {
+      // 第一个键：运行到程序等待按键；之后（程序在循环里查询键盘）只运行一小段
+      for (let i = 0; i < (n === 0 ? 400 : 20) && m.run(100_000) === 'budget'; i++) { /* */ }
+      snaps.push(m.mem.slice(0xa0000, 0xa0000 + 64000));
+      m.typeText(k, scanForChar);
+    }
+    runToEnd(m);
+    return { m, snaps };
+  };
+
+  it('VGA 256 色：色块位置正确，调色板轮转，最后回到文本模式', () => {
+    const { m, snaps } = run('vga', 'xx');
+    const px = (x: number, y: number) => snaps[0][y * 320 + x];
+    expect(px(5, 20)).toBe(0);                  // 第 0 号色块
+    expect(px(25, 20)).toBe(1);                 // 第 1 号
+    expect(px(5 + 20 * 15, 16 + 11 * 15 + 3)).toBe(255);
+    expect(m.mem[0x449]).toBe(3);               // 退出前回到了文本模式
+    // 轮转后 32 号颜色不再是默认的纯蓝 (0,0,63)
+    const d = m.video.dac;
+    expect([d[96], d[97], d[98]]).not.toEqual([0, 0, 63]);
+  });
+
+  it('Bresenham 画线：线从中心画到四条边', () => {
+    const { snaps } = run('lines', 'x');
+    const s = snaps[0];
+    const lit = s.reduce((n, v) => n + (v ? 1 : 0), 0);
+    expect(lit).toBeGreaterThan(15000);
+    expect(s[0]).not.toBe(0);                   // 左上角 (0,0)
+    expect(s[199 * 320 + 312]).not.toBe(0);     // 下边最后一条线的终点 (312,199)
+    expect(s[100 * 320 + 160]).not.toBe(0);     // 中心
+  });
+
+  it('CGA 模式和 BIOS 写点、读点', () => {
+    const m = load(`
+.model small
+.stack 100h
+.code
+start:  mov ax, 0004h
+        int 10h
+        mov ah, 0Ch
+        mov al, 3
+        mov cx, 10
+        mov dx, 1           ; 奇数行在 B800:2000
+        int 10h
+        mov ah, 0Dh
+        int 10h
+        mov ah, 4ch
+        int 21h
+end start`);
+    runToEnd(m);
+    expect(m.exitCode).toBe(3);                 // 读回的颜色
+    expect(m.mem[0xb8000 + 0x2000 + (10 >> 2)]).toBe(0b00001100); // x=10 是这个字节的第 3 个像素（位 3、2）
+  });
+});
+
+describe('图形模式下的文字', () => {
+  it('BIOS 用 8×8 字库把字画进显存', () => {
+    const m = load(`
+.model small
+.stack 100h
+.data
+msg db 'A$'
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov ax, 13h
+        int 10h
+        mov dx, offset msg
+        mov ah, 9
+        int 21h
+        mov ah, 4ch
+        int 21h
+end start`);
+    runToEnd(m);
+    // "A" 的点阵第 0 行是 01110（放在第 1~5 列），颜色 15
+    const row0 = Array.from(m.mem.subarray(0xa0000, 0xa0000 + 8));
+    expect(row0).toEqual([0, 0, 15, 15, 15, 0, 0, 0]);
+    const row4 = Array.from(m.mem.subarray(0xa0000 + 4 * 320, 0xa0000 + 4 * 320 + 8));
+    expect(row4).toEqual([0, 15, 15, 15, 15, 15, 0, 0]); // 横杠 11111
+  });
+});

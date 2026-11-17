@@ -271,3 +271,7 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 #regs .cell, #regs .reg, #flags .flag { cursor: pointer; }
 .reg-edit { position: absolute; inset: 0; width: 100%; height: 100%; font: 15px var(--mono); text-align: center; border: 2px solid var(--accent); border-radius: 5px; background: var(--panel); color: var(--text); padding: 0; }
 #regs .reg { position: relative; }
+
+/* 图形模式：保持 4:3，像素放大时不模糊 */
+.screen canvas.gfx { position: absolute; top: 0; bottom: 0; left: 50%; height: 100%; aspect-ratio: 4 / 3; transform: translateX(-50%); image-rendering: pixelated; background: #000; }
+.screen.graphics .row { visibility: hidden; }

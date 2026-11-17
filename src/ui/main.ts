@@ -10,6 +10,10 @@ import { AX } from '../cpu/cpu.ts';
 import { EditorView, monaco } from './editor.ts';
 import { Screen } from './screen.ts';
 import { Speaker } from './speaker.ts';
+import { generateFont } from './font.ts';
+
+// 8×8 字库：图形模式下显示文字用（写进虚拟 BIOS 的 ROM）
+Machine.font = generateFont();
 import { DisasmPanel, currentInstruction } from './disasm-panel.ts';
 import { RegisterPanel, StackPanel, VarsPanel, MemoryPanel, takeSnapshot, h2, h4, type Snapshot } from './panels.ts';
 import { EXAMPLES } from './examples.ts';
@@ -658,6 +662,7 @@ class App {
     this.fastSpeakerHint = false;
     if (sp <= 0) {
       this.run = 'run';
+      for (const x of this.live) this.editor.setCurrentLine(x.model, null, false); // 全速运行时不显示当前行
       this.rtWall = performance.now();
       this.rtClock = this.liveClock;
       this.setStatus(this.runText(), 'running');
@@ -897,7 +902,7 @@ class App {
     this.stack.render(m, s.snap);
     for (const x of this.live) {
       const mem = x.m.mem, bda = 0x400;
-      x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8));
+      x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video);
     }
     if (full || this.run === 'animate') {
       for (const x of this.live) {
