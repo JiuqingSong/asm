@@ -76,7 +76,13 @@ class App {
       s.m.events = {
         log: msg => this.addMessage('warning', msg, s.i),
         bell: () => this.beep(),
-        speaker: f => s.speaker.set(f),
+        speaker: f => {
+          s.speaker.set(f);
+          if (f > 0 && this.run === 'run' && this.speed() === 0 && !this.fastSpeakerHint) {
+            this.fastSpeakerHint = true;
+            this.addMessage('info', '程序打开了 PC 喇叭。全速运行时虚拟时间比真实时间快得多，声音会一闪而过；把速度选成"原机速度"才能听到正常的节奏。', s.i);
+          }
+        },
         filesChanged: () => { if (this.tab === 'files') this.renderFiles(); },
       };
       box.addEventListener('mousedown', () => { s.screen.focus(); if (this.mode === 'dual' && this.active !== i) this.setActive(i); });
@@ -465,6 +471,8 @@ class App {
   private speed(): number { return +$<HTMLSelectElement>('speed').value; }
   /** 按原机速度运行时：开始时的真实时间和虚拟时间 */
   private rtWall = 0;
+  /** 本次全速运行中程序用到了喇叭（结束时提示改用原机速度） */
+  private fastSpeakerHint = false;
   private rtClock = 0;
   private get liveClock(): number { return Math.max(...this.live.map(s => s.m.clock)); }
   private get finished(): boolean { return this.live.every(s => s.m.status === 'exited' || s.m.status === 'error' || s.m.status === 'empty'); }
@@ -477,6 +485,7 @@ class App {
     for (const s of this.live) { this.syncBreakpoints(s); s.snap = takeSnapshot(s.m); }
     const sp = this.speed();
     for (const s of this.live) s.speaker.enable();
+    this.fastSpeakerHint = false;
     if (sp <= 0) {
       this.run = 'run';
       this.rtWall = performance.now();
@@ -653,6 +662,10 @@ class App {
       case 'wait': this.setStatus(this.waitText(s), 'waiting'); s.screen.focus(); break;
       case 'error': this.setStatus(tag + m.message, 'error'); this.addMessage('error', m.message, s.i); break;
       default: this.setStatus(tag + (m.message || '已暂停'), '');
+    }
+    if (this.fastSpeakerHint && r === 'exit') {
+      $('status').textContent += '。程序用到了 PC 喇叭，请把速度选成"原机速度"再运行';
+      $('status').title = $('status').textContent ?? '';
     }
     this.render(true);
   }
