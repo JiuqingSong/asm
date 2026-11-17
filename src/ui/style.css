@@ -88,16 +88,35 @@ input { cursor: text; }
 .status.error { color: var(--err); }
 
 /* ---------- 布局 ---------- */
-.layout {
-  flex: 1; min-height: 0; display: grid; gap: 6px; padding: 6px;
-  grid-template-columns: minmax(0, 1fr) 400px;
-  grid-template-rows: minmax(0, 1fr) auto;
-  grid-template-areas: "editor cpu" "screen info";
-}
-.editor-pane { grid-area: editor; }
-.screen-pane { grid-area: screen; }
-.cpu-pane { grid-area: cpu; overflow: auto; }
-.info-pane { grid-area: info; min-height: 0; height: var(--screen-h, 360px); }
+.layout { flex: 1; min-height: 0; display: flex; padding: 6px; }
+.col { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.col-left { flex: 1; }
+.col-right { flex: none; width: var(--right-w, 400px); }
+.editor-pane { flex: 1; }
+.screen-pane { flex: none; }
+.screen-pane.sized { height: var(--screen-set-h); }
+.cpu-pane { flex: 1; overflow: auto; }
+.info-pane { flex: none; min-height: 0; height: var(--info-h, var(--screen-h, 360px)); }
+
+/* 分隔条：拖动调整相邻窗口的大小 */
+.splitter { flex: none; position: relative; z-index: 2; }
+.splitter.v { width: 6px; cursor: col-resize; }
+.splitter.h { height: 6px; cursor: row-resize; }
+.splitter::after { content: ""; position: absolute; border-radius: 2px; background: transparent; transition: background 0.15s; }
+.splitter.v::after { left: 2px; width: 2px; top: 30%; bottom: 30%; }
+.splitter.h::after { top: 2px; height: 2px; left: 30%; right: 30%; }
+.splitter:hover::after, .splitter.dragging::after { background: var(--accent); }
+body.resizing { user-select: none; }
+body.resizing.v { cursor: col-resize; }
+body.resizing.h { cursor: row-resize; }
+
+/* 最大化：只显示一个窗口，占满整个工作区 */
+.max-btn { border: none; background: none; color: var(--muted); padding: 0 4px; height: 22px; font-size: 14px; line-height: 1; cursor: pointer; flex: none; }
+.max-btn:hover { color: var(--accent); background: var(--panel-2); }
+.layout.has-max > .splitter, .layout.has-max .col > .splitter, .layout.has-max .col > .pane:not(.maxed) { display: none; }
+.layout.has-max > .col:not(.holds-max) { display: none; }
+.layout.has-max > .col.holds-max { flex: 1; width: auto; }
+.layout.has-max .pane.maxed { flex: 1; height: auto; }
 .pane { background: var(--panel); border: 1px solid var(--border); border-radius: 7px; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
 .pane-head { display: flex; align-items: center; gap: 8px; padding: 5px 10px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 12.5px; min-height: 31px; }
 .pane-head.sub { border-top: 1px solid var(--border); }
@@ -107,6 +126,8 @@ input { cursor: text; }
 
 /* ---------- 屏幕 ---------- */
 .screen-wrap { padding: 8px; background: #0b0b0b; border-radius: 0 0 7px 7px; display: flex; justify-content: center; }
+.screen-pane.sized .screen-wrap, .screen-pane.maxed .screen-wrap { flex: 1; min-height: 0; overflow: hidden; align-items: center; }
+.screen-pane.sized .screens, .screen-pane.maxed .screens { min-height: 0; }
 .screen { box-shadow: 0 0 0 1px #2a2a2a; }
 .screen {
   position: relative; font-family: var(--mono); line-height: 1.18; white-space: pre; color: #aaa; background: #000;
@@ -207,7 +228,12 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 .asm-bytes { color: var(--muted) !important; opacity: 0.75; font-style: normal; }
 
 @media (max-width: 1100px) {
-  .layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: 55vh auto auto auto; grid-template-areas: "editor" "screen" "cpu" "info"; overflow: auto; }
+  .layout { flex-direction: column; gap: 6px; overflow: auto; }
+  .col { display: contents; }
+  .splitter { display: none; }
+  .editor-pane { flex: none; height: 55vh; }
+  .screen-pane.sized { height: auto; }
+  .cpu-pane { flex: none; }
   body { overflow: auto; }
   #app { height: auto; min-height: 100vh; }
   .info-pane { height: 340px; }

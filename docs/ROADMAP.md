@@ -108,6 +108,7 @@ tools/                  测试和检查脚本（见下）
 | `node tools/ui-debug.mjs <截图目录> [EXE]` | 改了调试功能（跳出、运行到光标处、反汇编、改寄存器） |
 | `node tools/ui-gfx.mjs <截图目录>` | 改了图形模式 |
 | `node tools/ui-mouse.mjs <截图目录>` | 改了鼠标 |
+| `node tools/ui-layout.mjs <截图目录>` | 改了窗口布局（分隔条、最大化，src/ui/layout.ts） |
 | `node tools/disasm-check.ts` | 改了反汇编器（需要 test-data/8088/） |
 | `node tools/run-exe.ts <EXE> [命令行] [条数] [截图.png]` | 看一个 DOS 程序用到了哪些中断、端口和没实现的功能；同目录的文件放进虚拟磁盘，图形模式可存截图 |
 | `node tools/ui-bgi.mjs <截图目录> <EXE> [x,y ...]` | 改了平面模式：在浏览器里运行 BGI 图形程序并单击（用户的 D:OLDgraphdmoGRAPHDMO.EXE，不提交） |

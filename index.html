@@ -52,13 +52,16 @@
     </header>
 
     <main class="layout">
+      <div class="col col-left">
       <section class="pane editor-pane">
         <div class="pane-head ed-head">
           <div id="ed-tabs" class="ed-tabs"></div>
           <span id="dirty-note" class="note"></span>
+          <button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button>
         </div>
         <div id="editor"></div>
       </section>
+      <div class="splitter h" data-split="screen" title="拖动调整大小，双击恢复"></div>
 
       <section class="pane screen-pane">
         <div class="screens">
@@ -69,6 +72,7 @@
               <span class="spacer"></span>
               <label class="check" title="像 UCDOS 等中文 DOS 那样，把 GBK 编码显示成汉字"><input type="checkbox" class="cn-toggle" /> 中文</label>
               <input class="cmdline" placeholder="命令行参数" title="程序的命令行参数（PSP:81h）" />
+              <button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button>
             </div>
             <div class="screen-wrap"><div class="screen" tabindex="0"></div></div>
           </div>
@@ -78,19 +82,25 @@
               <span class="spacer"></span>
               <label class="check" title="像 UCDOS 等中文 DOS 那样，把 GBK 编码显示成汉字"><input type="checkbox" class="cn-toggle" /> 中文</label>
               <input class="cmdline" placeholder="命令行参数" title="程序的命令行参数（PSP:81h）" />
+              <button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button>
             </div>
             <div class="screen-wrap"><div class="screen" tabindex="0"></div></div>
           </div>
         </div>
       </section>
+      </div>
 
+      <div class="splitter v" data-split="right" title="拖动调整大小，双击恢复"></div>
+
+      <div class="col col-right">
       <section class="pane cpu-pane">
-        <div class="pane-head"><span id="cpu-title">寄存器</span><span class="spacer"></span><span id="cs-ip" class="mono note"></span></div>
+        <div class="pane-head"><span id="cpu-title">寄存器</span><span class="spacer"></span><span id="cs-ip" class="mono note"></span><button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button></div>
         <div id="regs"></div>
         <div id="flags"></div>
         <div class="pane-head sub"><span>栈</span><span class="spacer"></span><span id="stack-note" class="mono note"></span></div>
         <div id="stack"></div>
       </section>
+      <div class="splitter h" data-split="info" title="拖动调整大小，双击恢复"></div>
 
       <section class="pane info-pane">
         <div class="tabs">
@@ -100,6 +110,8 @@
           <button data-tab="serial">串口</button>
           <button data-tab="messages">消息 <span id="msg-count"></span></button>
           <button data-tab="files">虚拟磁盘</button>
+          <span class="spacer"></span>
+          <button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button>
         </div>
         <div class="tab-body" id="tab-vars"></div>
         <div class="tab-body hidden" id="tab-memory">
@@ -133,6 +145,7 @@
           <div id="files"></div>
         </div>
       </section>
+      </div>
     </main>
   </div>
   <input type="file" id="file-input" accept=".asm,.inc,.txt" hidden />

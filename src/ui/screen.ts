@@ -162,11 +162,15 @@ export class Screen {
   }
 
   private fit(wrap: HTMLElement): void {
+    if (!wrap.clientWidth) return; // 窗口被隐藏（别的窗口最大化）时不调整
     const w = wrap.clientWidth - 16;
-    // 等宽字体中一个字符约 0.6em 宽，行高 1.18em；屏幕高度不超过窗口的 40%
+    // 等宽字体中一个字符约 0.6em 宽，行高 1.18em。
+    // 窗口被拖动调整过大小或最大化时，按窗口的高度放大；否则屏幕高度不超过浏览器窗口的 40%
+    const pane = wrap.closest('.screen-pane');
+    const sized = !!pane && (pane.classList.contains('sized') || pane.classList.contains('maxed'));
     const byWidth = w / COLS / 0.6;
-    const byHeight = (window.innerHeight * 0.4) / ROWS / 1.18;
-    const size = Math.max(8, Math.min(15, Math.floor(Math.min(byWidth, byHeight) * 10) / 10));
+    const byHeight = sized ? (wrap.clientHeight - 16) / ROWS / 1.18 : (window.innerHeight * 0.4) / ROWS / 1.18;
+    const size = Math.max(6, Math.min(sized ? 48 : 15, Math.floor(Math.min(byWidth, byHeight) * 10) / 10));
     this.el.style.fontSize = size + 'px';
     requestAnimationFrame(() => this.measure());
   }

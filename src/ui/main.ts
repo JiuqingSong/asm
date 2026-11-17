@@ -1,4 +1,5 @@
 import './style.css';
+import { setupLayout } from './layout.ts';
 import { assemble } from '../asm/assembler.ts';
 import type { Diag, Program } from '../asm/types.ts';
 import { Machine, CPU_SPEEDS, type StopReason, type CpuSpeedId } from '../machine/machine.ts';
@@ -210,7 +211,7 @@ class App {
       store.set('showBytes', on ? '1' : '0');
       for (const s of this.sessions) this.editor.showBytes(s.model, s.dirty ? null : s.program, on);
     };
-    for (const b of document.querySelectorAll<HTMLButtonElement>('.tabs button')) b.onclick = () => this.setTab(b.dataset.tab!);
+    for (const b of document.querySelectorAll<HTMLButtonElement>('.tabs button[data-tab]')) b.onclick = () => this.setTab(b.dataset.tab!);
     const memAddr = $<HTMLInputElement>('mem-addr');
     memAddr.onchange = () => { this.memory.expr = memAddr.value; this.renderTab(); };
     memAddr.onkeydown = e => { if (e.key === 'Enter') { this.memory.expr = memAddr.value; this.renderTab(); } };
@@ -263,6 +264,7 @@ class App {
       if (handled) { e.preventDefault(); e.stopPropagation(); }
     }, true);
 
+    setupLayout(() => window.dispatchEvent(new Event('resize')));
     const screenPane = document.querySelector('.screen-pane') as HTMLElement;
     new ResizeObserver(() => {
       document.documentElement.style.setProperty('--screen-h', screenPane.offsetHeight + 'px');
@@ -334,7 +336,7 @@ class App {
 
   private setTab(t: string): void {
     this.tab = t;
-    for (const b of document.querySelectorAll<HTMLButtonElement>('.tabs button')) b.classList.toggle('active', b.dataset.tab === t);
+    for (const b of document.querySelectorAll<HTMLButtonElement>('.tabs button[data-tab]')) b.classList.toggle('active', b.dataset.tab === t);
     for (const id of ['vars', 'memory', 'disasm', 'serial', 'messages', 'files']) $('tab-' + id).classList.toggle('hidden', id !== t);
     this.renderTab();
   }
