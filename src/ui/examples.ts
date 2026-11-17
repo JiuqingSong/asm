@@ -1,6 +1,6 @@
 // 示例程序
 
-export interface Example { id: string; title: string; source: string; input?: string }
+export interface Example { id: string; title: string; source: string; input?: string; /** 双机示例：两台机器装载同一个程序 */ pair?: boolean }
 
 export const EXAMPLES: Example[] = [
   {
@@ -492,6 +492,104 @@ kbd:
         pop ds
         pop ax
         iret
+
+end start
+`,
+  },
+  {
+    id: 'chat',
+    title: '串口聊天（双机）',
+    pair: true,
+    source: `; 串口聊天：两台机器运行同一个程序，用串口线连接
+; 在一台机器的屏幕上打字，字会出现在另一台机器的屏幕上；按 Esc 退出
+; 用查询方式操作 8250：发送前等 THRE（发送保持寄存器空），有 DR（收到数据）才读
+
+.model small
+.stack 100h
+
+COM1    equ 3F8h            ; COM1 的基地址
+LSR     equ COM1 + 5        ; 线路状态寄存器
+LCR     equ COM1 + 3        ; 线路控制寄存器
+MCR     equ COM1 + 4        ; 调制解调器控制寄存器
+
+.data
+hello   db  'Serial chat (9600 bps, 8N1). Type here, Esc to quit.', 0dh, 0ah, '$'
+
+.code
+start:
+        mov ax, @data
+        mov ds, ax
+        mov dx, offset hello
+        mov ah, 9
+        int 21h
+
+        ; 初始化 8250：9600 bps，8 位数据，无校验，1 位停止
+        mov dx, LCR
+        mov al, 80h             ; DLAB=1，接下来写除数
+        out dx, al
+        mov dx, COM1
+        mov al, 12              ; 115200 / 9600 = 12
+        out dx, al
+        inc dx
+        mov al, 0
+        out dx, al
+        mov dx, LCR
+        mov al, 03h             ; DLAB=0，8N1
+        out dx, al
+        mov dx, MCR
+        mov al, 03h             ; DTR=1，RTS=1
+        out dx, al
+
+mainloop:
+        ; 1. 收到数据了吗？
+        mov dx, LSR
+        in al, dx
+        test al, 01h            ; DR 位
+        jz checkkey
+        mov dx, COM1
+        in al, dx               ; 读出收到的字符
+        call show
+
+checkkey:
+        ; 2. 键盘上有按键吗？
+        mov ah, 1
+        int 16h
+        jz mainloop             ; ZF=1 表示没有按键
+        mov ah, 0
+        int 16h                 ; 取出按键，AL = ASCII
+        cmp al, 27              ; Esc
+        je quit
+        push ax
+        call show               ; 本机也显示一下
+        pop ax
+
+        ; 3. 发送：等发送保持寄存器空了再写
+        mov ah, al
+        mov dx, LSR
+waitthr:
+        in al, dx
+        test al, 20h            ; THRE 位
+        jz waitthr
+        mov al, ah
+        mov dx, COM1
+        out dx, al
+        jmp mainloop
+
+quit:
+        mov ax, 4c00h
+        int 21h
+
+; 显示 AL 中的字符，回车后自动换行
+show    proc
+        mov ah, 0eh
+        int 10h
+        cmp al, 0dh
+        jne done
+        mov al, 0ah
+        int 10h
+done:
+        ret
+show    endp
 
 end start
 `,

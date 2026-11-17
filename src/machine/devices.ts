@@ -70,8 +70,6 @@ export class PIC implements IrqSource {
 
 /** 8253 可编程定时器（只模拟 0 号通道产生 IRQ0 和 2 号通道的频率设置） */
 export class PIT {
-  /** 每执行一条指令，定时器前进的时钟数（PIT 输入 1.193MHz，CPU 4.77MHz） */
-  static readonly CLOCKS_PER_INSTR = 4;
   reload = [0x10000, 0x10000, 0x10000];
   private counter = 0x10000;
   private latch = [-1, -1, -1];
@@ -93,9 +91,9 @@ export class PIT {
     }
   }
 
-  /** 距离下一次 IRQ0 还有多少条指令 */
-  instrsToNextTick(): number {
-    return Math.ceil(this.counter / PIT.CLOCKS_PER_INSTR);
+  /** 距离下一次 IRQ0 还有多少个时钟 */
+  clocksToNextTick(): number {
+    return Math.max(0, this.counter);
   }
 
   in8(port: number): number {

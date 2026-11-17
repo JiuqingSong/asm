@@ -85,27 +85,31 @@ monaco.editor.defineTheme('asm-dark', {
 });
 
 export interface EditorHooks {
-  onChange(): void;
-  onBreakpointsChanged(): void;
-  hover(word: string, line: number, lineText: string): string[] | null;
+  onChange(model: monaco.editor.ITextModel): void;
+  onBreakpointsChanged(model: monaco.editor.ITextModel): void;
+  hover(model: monaco.editor.ITextModel, word: string, line: number, lineText: string): string[] | null;
+}
+
+/** 每个文档各自的断点、当前行、机器码（切换标签页时保留） */
+interface DocState {
+  bp: string[];
+  cur: string[];
+  codeLines: Set<number>;
+  bytesByLine: Map<number, string>;
 }
 
 export class EditorView {
   editor: monaco.editor.IStandaloneCodeEditor;
-  private bp: monaco.editor.IEditorDecorationsCollection;
-  private cur: monaco.editor.IEditorDecorationsCollection;
-  private bytesByLine = new Map<number, string>();
+  private docs = new Map<monaco.editor.ITextModel, DocState>();
   private bytesChanged = new monaco.Emitter<void>();
   private hooks: EditorHooks;
-  private codeLines = new Set<number>();
   private suppressChange = false;
 
   constructor(el: HTMLElement, hooks: EditorHooks) {
     this.hooks = hooks;
     const dark = matchMedia('(prefers-color-scheme: dark)');
     this.editor = monaco.editor.create(el, {
-      value: '',
-      language: 'asm86',
+      model: null,
       theme: dark.matches ? 'asm-dark' : 'asm-light',
       fontFamily: 'Cascadia Mono, Consolas, Menlo, monospace',
       fontSize: 14,
@@ -123,36 +127,33 @@ export class EditorView {
       unicodeHighlight: { ambiguousCharacters: false, invisibleCharacters: false },
     });
     dark.addEventListener('change', e => monaco.editor.setTheme(e.matches ? 'asm-dark' : 'asm-light'));
-    this.bp = this.editor.createDecorationsCollection();
-    this.cur = this.editor.createDecorationsCollection();
     monaco.languages.registerInlayHintsProvider('asm86', {
       onDidChangeInlayHints: this.bytesChanged.event,
       provideInlayHints: (model, range) => {
         const hints: monaco.languages.InlayHint[] = [];
-        for (let l = range.startLineNumber; l <= range.endLineNumber; l++) {
-          const t = this.bytesByLine.get(l);
-          if (!t) continue;
-          hints.push({ label: t, position: { lineNumber: l, column: model.getLineMaxColumn(l) }, paddingLeft: true });
+        const bytes = this.docs.get(model)?.bytesByLine;
+        if (bytes) {
+          for (let l = range.startLineNumber; l <= range.endLineNumber; l++) {
+            const t = bytes.get(l);
+            if (t) hints.push({ label: t, position: { lineNumber: l, column: model.getLineMaxColumn(l) }, paddingLeft: true });
+          }
         }
         return { hints, dispose() {} };
       },
     });
-
     this.editor.onMouseDown(e => {
       const t = e.target.type;
       if (t === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN || t === monaco.editor.MouseTargetType.GUTTER_LINE_DECORATIONS) {
         const line = e.target.position?.lineNumber;
-        if (line) this.toggleBreakpoint(line);
+        const model = this.editor.getModel();
+        if (line && model) this.toggleBreakpoint(model, line);
       }
-    });
-    this.editor.onDidChangeModelContent(() => {
-      if (!this.suppressChange) this.hooks.onChange();
     });
     monaco.languages.registerHoverProvider('asm86', {
       provideHover: (model, pos) => {
         const w = model.getWordAtPosition(pos);
         if (!w) return null;
-        const res = this.hooks.hover(w.word, pos.lineNumber, model.getLineContent(pos.lineNumber));
+        const res = this.hooks.hover(model, w.word, pos.lineNumber, model.getLineContent(pos.lineNumber));
         if (!res || !res.length) return null;
         return {
           range: new monaco.Range(pos.lineNumber, w.startColumn, pos.lineNumber, w.endColumn),
@@ -162,54 +163,77 @@ export class EditorView {
     });
   }
 
-  get value(): string { return this.editor.getValue(); }
-  set value(v: string) {
+  createModel(text: string): monaco.editor.ITextModel {
+    const model = monaco.editor.createModel(text, 'asm86');
+    this.docs.set(model, { bp: [], cur: [], codeLines: new Set(), bytesByLine: new Map() });
+    model.onDidChangeContent(() => { if (!this.suppressChange) this.hooks.onChange(model); });
+    return model;
+  }
+
+  private doc(model: monaco.editor.ITextModel): DocState { return this.docs.get(model)!; }
+
+  get model(): monaco.editor.ITextModel | null { return this.editor.getModel(); }
+
+  setModel(model: monaco.editor.ITextModel): void {
+    if (this.editor.getModel() !== model) this.editor.setModel(model);
+  }
+
+  /** 替换文档内容（清除断点和当前行） */
+  setText(model: monaco.editor.ITextModel, text: string): void {
     this.suppressChange = true;
-    this.editor.setValue(v);
+    model.setValue(text);
     this.suppressChange = false;
-    this.bp.clear();
-    this.cur.clear();
-    this.showBytes(null, false);
+    const d = this.doc(model);
+    d.bp = model.deltaDecorations(d.bp, []);
+    d.cur = model.deltaDecorations(d.cur, []);
+    d.codeLines.clear();
+    d.bytesByLine.clear();
+    this.bytesChanged.fire();
   }
 
   // ---------- 断点 ----------
-  breakpointLines(): number[] {
-    return this.bp.getRanges().map(r => r.startLineNumber).filter((v, i, a) => a.indexOf(v) === i);
+  breakpointLines(model: monaco.editor.ITextModel): number[] {
+    const d = this.doc(model);
+    const lines = d.bp.map(id => model.getDecorationRange(id)?.startLineNumber ?? 0).filter(l => l > 0);
+    return [...new Set(lines)];
   }
 
-  toggleBreakpoint(line: number): void {
-    const lines = new Set(this.breakpointLines());
+  toggleBreakpoint(model: monaco.editor.ITextModel, line: number): void {
+    const lines = new Set(this.breakpointLines(model));
     if (lines.has(line)) lines.delete(line); else lines.add(line);
-    this.setBreakpoints([...lines]);
-    this.hooks.onBreakpointsChanged();
+    this.setBreakpoints(model, [...lines]);
+    this.hooks.onBreakpointsChanged(model);
   }
 
-  setBreakpoints(lines: number[]): void {
-    this.bp.set(lines.map(l => ({
+  setBreakpoints(model: monaco.editor.ITextModel, lines: number[]): void {
+    const d = this.doc(model);
+    const ok = (l: number) => d.codeLines.size === 0 || d.codeLines.has(l);
+    d.bp = model.deltaDecorations(d.bp, lines.map(l => ({
       range: new monaco.Range(l, 1, l, 1),
       options: {
         isWholeLine: true,
         stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-        glyphMarginClassName: this.codeLines.size === 0 || this.codeLines.has(l) ? 'bp-glyph' : 'bp-glyph-off',
-        glyphMarginHoverMessage: { value: this.codeLines.size === 0 || this.codeLines.has(l) ? '断点（点击取消）' : '这一行没有生成代码，断点不起作用' },
+        glyphMarginClassName: ok(l) ? 'bp-glyph' : 'bp-glyph-off',
+        glyphMarginHoverMessage: { value: ok(l) ? '断点（点击取消）' : '这一行没有生成代码，断点不起作用' },
         overviewRuler: { color: '#d33a3a', position: monaco.editor.OverviewRulerLane.Left },
       },
     })));
   }
 
   // ---------- 当前执行行 ----------
-  setCurrentLine(line: number | null, reveal: boolean): void {
-    if (!line) { this.cur.clear(); return; }
-    this.cur.set([{
+  setCurrentLine(model: monaco.editor.ITextModel, line: number | null, reveal: boolean): void {
+    const d = this.doc(model);
+    d.cur = model.deltaDecorations(d.cur, line ? [{
       range: new monaco.Range(line, 1, line, 1),
       options: { isWholeLine: true, className: 'cur-line', glyphMarginClassName: 'cur-glyph', zIndex: 10 },
-    }]);
-    if (reveal) this.editor.revealLineInCenterIfOutsideViewport(line, monaco.editor.ScrollType.Smooth);
+    }] : []);
+    if (line && reveal && this.editor.getModel() === model) {
+      this.editor.revealLineInCenterIfOutsideViewport(line, monaco.editor.ScrollType.Smooth);
+    }
   }
 
   // ---------- 汇编结果 ----------
-  setProgram(p: Program | null, diags: Diag[], showBytes: boolean): void {
-    const model = this.editor.getModel()!;
+  setProgram(model: monaco.editor.ITextModel, p: Program | null, diags: Diag[], showBytes: boolean): void {
     monaco.editor.setModelMarkers(model, 'asm', diags.map(d => {
       const lineLen = d.line >= 1 && d.line <= model.getLineCount() ? model.getLineMaxColumn(d.line) : 1;
       return {
@@ -219,13 +243,14 @@ export class EditorView {
         startColumn: d.col >= 0 ? d.col + 1 : 1, endColumn: lineLen,
       };
     }));
-    this.codeLines = new Set(p ? [...p.lineToAddrs.keys()] : []);
-    this.setBreakpoints(this.breakpointLines());
-    this.showBytes(p, showBytes);
+    this.doc(model).codeLines = new Set(p ? [...p.lineToAddrs.keys()] : []);
+    this.setBreakpoints(model, this.breakpointLines(model));
+    this.showBytes(model, p, showBytes);
   }
 
-  showBytes(p: Program | null, on: boolean): void {
-    this.bytesByLine.clear();
+  showBytes(model: monaco.editor.ITextModel, p: Program | null, on: boolean): void {
+    const bytesByLine = this.doc(model).bytesByLine;
+    bytesByLine.clear();
     if (p && on) {
       const h = (v: number, w: number) => v.toString(16).toUpperCase().padStart(w, '0');
       const byLine = new Map<number, { seg: number; off: number; bytes: number[] }>();
@@ -236,20 +261,17 @@ export class EditorView {
       }
       for (const [line, e] of byLine) {
         const shown = e.bytes.slice(0, 8).map(b => (b < 0 ? '??' : h(b, 2))).join(' ') + (e.bytes.length > 8 ? ' …' : '');
-        this.bytesByLine.set(line, `${h(e.seg, 4)}:${h(e.off, 4)}  ${shown}`);
+        bytesByLine.set(line, `${h(e.seg, 4)}:${h(e.off, 4)}  ${shown}`);
       }
     }
     this.bytesChanged.fire();
   }
 
-  revealLine(line: number): void {
+  revealLine(model: monaco.editor.ITextModel, line: number): void {
+    this.setModel(model);
     this.editor.revealLineInCenter(line);
     this.editor.setPosition({ lineNumber: line, column: 1 });
     this.editor.focus();
-  }
-
-  addKey(keybinding: number, fn: () => void): void {
-    this.editor.addCommand(keybinding, fn);
   }
 }
 

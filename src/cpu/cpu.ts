@@ -58,6 +58,11 @@ export class CPU {
   onWrite: ((addr: number, old: number) => void) | null = null;
 
   halted = false;
+  /**
+   * 在 80286 及以后的 CPU 上有区别的几处行为（只影响实模式下这几条指令，不增加新指令）：
+   * PUSH SP 压入减 2 之前的值；移位次数只取低 5 位。
+   */
+  is286 = false;
   /** 陷阱处理函数要求等待（如等待按键），CPU 停在陷阱处 */
   waiting = false;
   /** 上一步是一个尚未完成的 REP 串操作迭代 */
@@ -562,7 +567,8 @@ export class CPU {
         r[op & 7] = this.dec(r[op & 7], true); return;
       case 0x50: case 0x51: case 0x52: case 0x53: case 0x55: case 0x56: case 0x57:
         this.push(r[op & 7]); return;
-      case 0x54: // 8086 的 PUSH SP 压入的是减 2 之后的值
+      case 0x54: // 8086 的 PUSH SP 压入的是减 2 之后的值；286 起压入原来的值
+        if (this.is286) { this.push(r[SP]); return; }
         r[SP] -= 2; this.ww(s[SS], r[SP], r[SP]); return;
       case 0x58: case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
         r[op & 7] = this.pop(); return;
@@ -675,7 +681,7 @@ export class CPU {
       case 0xd0: case 0xd1: case 0xd2: case 0xd3: {
         const w = (op & 1) === 1;
         this.modrm();
-        const count = op & 2 ? r[CX] & 0xff : 1;
+        const count = op & 2 ? r[CX] & (this.is286 ? 0x1f : 0xff) : 1;
         this.setRM(w, this.shift(this.reg, this.getRM(w), count, w));
         return;
       }
@@ -772,7 +778,7 @@ export class CPU {
             return;
           }
           default: { // PUSH r/m16（/7 是别名）
-            if (this.mod === 3 && this.rm === SP) { r[SP] -= 2; this.ww(s[SS], r[SP], r[SP]); return; }
+            if (this.mod === 3 && this.rm === SP && !this.is286) { r[SP] -= 2; this.ww(s[SS], r[SP], r[SP]); return; }
             this.push(this.getRM16());
             return;
           }

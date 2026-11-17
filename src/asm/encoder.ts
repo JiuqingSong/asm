@@ -339,6 +339,11 @@ export class Encoder {
         }
         if (a.k === 'reg') {
           if (!a.w) err(`${mn.toUpperCase()} 只能操作 16 位数据`);
+          if (a.reg === 4) {
+            this.ctx.warn(isPush
+              ? 'PUSH SP 在 8086/8088 上压入的是减 2 之后的 SP，在 80286 以后压入的是原来的值；和 POP SP 配对使用时，在 8086/8088 上会让栈错开 2 个字节'
+              : 'POP SP 会直接改变栈指针；如果和 PUSH SP 配对，在 8086/8088 上会让栈错开 2 个字节（PUSH SP 在 8086 和 286 上行为不同）');
+          }
           return [(isPush ? 0x50 : 0x58) + a.reg];
         }
         const s = this.memSize(a);

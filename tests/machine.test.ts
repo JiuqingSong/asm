@@ -358,7 +358,7 @@ describe('示例程序', () => {
     it(ex.title, () => {
       const p = assemble(ex.source);
       expect(p.diagnostics.filter(d => d.severity === 'error')).toEqual([]);
-      if (ex.id.startsWith('blank')) return;
+      if (ex.id.startsWith('blank') || ex.pair) return; // 双机示例在 serial.test.ts 中测试
       const m = new Machine();
       m.load(p);
       const input = ex.input ?? (ex.id === 'keyboard' ? 'ab\x1b' : '');

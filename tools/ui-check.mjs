@@ -53,7 +53,7 @@ await new Promise(r => setTimeout(r, 300));
 await page.click('#btn-run');
 await new Promise(r => setTimeout(r, 500));
 console.log('输入示例：', await status());
-await page.focus('#screen');
+await page.focus('.screen');
 await page.keyboard.type('Hello asm');
 await page.keyboard.press('Enter');
 await new Promise(r => setTimeout(r, 600));

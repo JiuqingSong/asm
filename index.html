@@ -14,8 +14,15 @@
         <select id="examples" title="打开示例程序">
           <option value="">示例程序…</option>
         </select>
-        <button id="btn-open" title="打开 .asm 文件">打开</button>
-        <button id="btn-save" title="保存为 .asm 文件">保存</button>
+        <button id="btn-open" title="打开 .asm 文件到当前编辑器">打开</button>
+        <button id="btn-save" title="保存当前编辑器为 .asm 文件">保存</button>
+      </div>
+      <div class="group">
+        <select id="mode" title="单机，或者两台机器用串口线连接">
+          <option value="single">单机</option>
+          <option value="dual">双机（串口连接）</option>
+        </select>
+        <select id="cpu" title="CPU 型号：决定虚拟 CPU 的速度；286/386 下 PUSH SP 等少数指令的行为与 8086 不同"></select>
       </div>
       <div class="group">
         <button id="btn-assemble" title="汇编并装载 (F7)">汇编</button>
@@ -44,25 +51,37 @@
 
     <main class="layout">
       <section class="pane editor-pane">
-        <div class="pane-head">
-          <span id="file-name">未命名.asm</span>
+        <div class="pane-head ed-head">
+          <div id="ed-tabs" class="ed-tabs"></div>
           <span id="dirty-note" class="note"></span>
         </div>
         <div id="editor"></div>
       </section>
 
       <section class="pane screen-pane">
-        <div class="pane-head">
-          <span>DOS 屏幕</span>
-          <span class="note">点击屏幕后可以直接用键盘输入</span>
-          <span class="spacer"></span>
-          <input id="cmdline" placeholder="命令行参数" title="程序的命令行参数（PSP:81h）" />
+        <div class="screens">
+          <div class="screen-box" data-i="0">
+            <div class="pane-head">
+              <span class="screen-title">DOS 屏幕</span>
+              <span class="note screen-hint">点击屏幕后可以直接用键盘输入</span>
+              <span class="spacer"></span>
+              <input class="cmdline" placeholder="命令行参数" title="程序的命令行参数（PSP:81h）" />
+            </div>
+            <div class="screen-wrap"><div class="screen" tabindex="0"></div></div>
+          </div>
+          <div class="screen-box hidden" data-i="1">
+            <div class="pane-head">
+              <span class="screen-title">B 机屏幕</span>
+              <span class="spacer"></span>
+              <input class="cmdline" placeholder="命令行参数" title="程序的命令行参数（PSP:81h）" />
+            </div>
+            <div class="screen-wrap"><div class="screen" tabindex="0"></div></div>
+          </div>
         </div>
-        <div id="screen-wrap"><div id="screen" tabindex="0"></div></div>
       </section>
 
       <section class="pane cpu-pane">
-        <div class="pane-head"><span>寄存器</span><span class="spacer"></span><span id="cs-ip" class="mono note"></span></div>
+        <div class="pane-head"><span id="cpu-title">寄存器</span><span class="spacer"></span><span id="cs-ip" class="mono note"></span></div>
         <div id="regs"></div>
         <div id="flags"></div>
         <div class="pane-head sub"><span>栈</span><span class="spacer"></span><span id="stack-note" class="mono note"></span></div>
@@ -73,6 +92,7 @@
         <div class="tabs">
           <button data-tab="vars" class="active">变量</button>
           <button data-tab="memory">内存</button>
+          <button data-tab="serial">串口</button>
           <button data-tab="messages">消息 <span id="msg-count"></span></button>
           <button data-tab="files">虚拟磁盘</button>
         </div>
@@ -82,14 +102,27 @@
             <button id="mem-prev" title="上一页">◀</button>
             <input id="mem-addr" class="mono" value="DS:0000" title="地址：段:偏移，也可以写变量名或 ES:DI 之类的寄存器" />
             <button id="mem-next" title="下一页">▶</button>
-
           </div>
           <div id="memory" class="mono"></div>
+        </div>
+        <div class="tab-body hidden" id="tab-serial">
+          <div class="serial-settings">
+            <label>串口芯片
+              <select id="uart-mode">
+                <option value="real">真实 8250（写 THR 会覆盖未发出的字节）</option>
+                <option value="buffered">虚拟串口（发送缓冲 + 硬件流控）</option>
+              </select>
+            </label>
+            <label>接线方式 <select id="wiring"></select></label>
+            <label class="check"><input type="checkbox" id="disk-latency" checked /> DOS 文件操作消耗时间（模拟磁盘）</label>
+          </div>
+          <div id="serial"></div>
         </div>
         <div class="tab-body hidden" id="tab-messages"></div>
         <div class="tab-body hidden" id="tab-files">
           <div class="mem-bar">
             <button id="file-upload">上传文件到虚拟磁盘</button>
+            <span id="file-target" class="note"></span>
           </div>
           <div id="files"></div>
         </div>

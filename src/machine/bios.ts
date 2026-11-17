@@ -5,6 +5,7 @@
 // 返回 false 表示需要等待（例如键盘缓冲区为空），CPU 会停在陷阱处，等有按键后重试。
 import { AX, BX, CX, DX, SI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
+import { PIT_HZ } from './uart.ts';
 
 const BDA = 0x40;
 const VIDEO_SEG = 0xb800;
@@ -20,6 +21,8 @@ export class Hle {
   private handles = new Map<number, OpenFile>();
   private warned = new Set<string>();
   private nextFreeSeg = 0;
+  /** 正在进行的磁盘操作结束的虚拟时间（-1 表示没有） */
+  private busyUntil = -1;
 
   constructor(m: Machine) {
     this.m = m;
@@ -28,9 +31,25 @@ export class Hle {
 
   reset(memStartSeg: number): void {
     this.line = null;
+    this.busyUntil = -1;
+    this.m.busy = false;
     this.handles.clear();
     this.nextFreeSeg = memStartSeg;
   }
+
+  /**
+   * 模拟磁盘操作的耗时：在 ms 毫秒（虚拟时间）内反复返回 false，CPU 停在陷阱处"忙等"，
+   * 期间中断保持开放（桩代码先执行了 STI），和真实的 DOS 等待磁盘时一样。
+   */
+  private spin(ms: number): boolean {
+    if (!this.m.diskLatency || ms <= 0) return true;
+    if (this.busyUntil < 0) this.busyUntil = this.m.clock + (ms * PIT_HZ) / 1000;
+    if (this.m.clock < this.busyUntil) { this.m.busy = true; return false; }
+    this.busyUntil = -1;
+    this.m.busy = false;
+    return true;
+  }
+  busyRemaining(): number { return this.busyUntil < 0 ? 0 : Math.max(0, this.busyUntil - this.m.clock); }
 
   private warnOnce(msg: string): void {
     if (this.warned.has(msg)) return;
@@ -163,7 +182,12 @@ export class Hle {
       }
       case 0x01: case 0x11: {
         const k = this.kbdRead(false);
-        if (k < 0) { this.retFlag(ZF, true); return true; }
+        if (k < 0) {
+          // 与 IBM PC BIOS 一致：缓冲区为空时 AX 也会被设成缓冲区头部那个旧的键值
+          this.cpu.r[AX] = this.cpu.rw(BDA, this.cpu.rw(BDA, 0x1a));
+          this.retFlag(ZF, true);
+          return true;
+        }
         this.cpu.r[AX] = k;
         this.retFlag(ZF, false);
         return true;
@@ -429,6 +453,7 @@ export class Hle {
         break;
       case 0x47: cpu.wb(cpu.s[DS], r[SI], 0); this.ok(); return true;
       case 0x3c: case 0x3d: case 0x5b: {
+        if (!this.spin(3)) return false;
         const name = this.normName(this.readAsciiz(cpu.s[DS], r[DX]));
         if (!name || /[*?<>|"]/.test(name)) { this.fail(3); return true; }
         const fs = this.m.files;
@@ -445,6 +470,7 @@ export class Hle {
         return true;
       }
       case 0x3e: {
+        if (r[BX] > 4 && !this.spin(2)) return false;
         const f = this.handles.get(r[BX]);
         if (r[BX] <= 4) { this.ok(); return true; }
         if (!f) { this.fail(6); return true; }
@@ -464,6 +490,7 @@ export class Hle {
           r[AX] = bytes.length; this.ok();
           return true;
         }
+        if (!this.spin(1 + n / 1000)) return false;
         const f = this.handles.get(h);
         if (!f) { this.fail(6); return true; }
         const cnt = Math.max(0, Math.min(n, f.data.length - f.pos));
@@ -480,6 +507,7 @@ export class Hle {
           return true;
         }
         if (h === 3 || h === 4) { r[AX] = n; this.ok(); return true; }
+        if (!this.spin(1 + n / 1000)) return false;
         const f = this.handles.get(h);
         if (!f) { this.fail(6); return true; }
         if (!f.write) { this.fail(5); return true; }
@@ -493,6 +521,7 @@ export class Hle {
         return true;
       }
       case 0x41: {
+        if (!this.spin(3)) return false;
         const name = this.normName(this.readAsciiz(cpu.s[DS], r[DX]));
         if (!this.m.files.delete(name)) { this.fail(2); return true; }
         this.m.filesChanged();

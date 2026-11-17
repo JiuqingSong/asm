@@ -3,6 +3,15 @@ import { CPU, CS, DS, ES, SS, SP, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, Keyboard, type KeyEvent } from './devices.ts';
 import { Hle } from './bios.ts';
+import { UART, type NullModem } from './uart.ts';
+
+/** CPU 速度选项：每条指令平均消耗的 PIT 时钟数（PIT 为 1.193182 MHz） */
+export const CPU_SPEEDS = [
+  { id: '8088', name: '8088 4.77MHz', clocks: 3.6, is286: false },
+  { id: '286', name: '286 12MHz', clocks: 1.0, is286: true },
+  { id: '386', name: '386 33MHz', clocks: 0.25, is286: true },
+] as const;
+export type CpuSpeedId = (typeof CPU_SPEEDS)[number]['id'];
 
 export type MachineStatus = 'empty' | 'ready' | 'paused' | 'running' | 'waiting' | 'exited' | 'error';
 export type StopReason = 'step' | 'breakpoint' | 'exit' | 'wait' | 'budget' | 'error' | 'paused';
@@ -91,6 +100,27 @@ export class Machine {
   pic = new PIC();
   kbd = new Keyboard(this.pic);
   pit = new PIT(() => this.pic.raise(0));
+  /** 虚拟时间（PIT 时钟数） */
+  clock = 0;
+  /** 每条指令消耗的 PIT 时钟数（决定虚拟 CPU 的速度） */
+  clocksPerInstr = 3.6;
+  cpuModel: CpuSpeedId = '8088';
+  /** DOS 文件操作是否消耗虚拟时间（模拟磁盘访问，几毫秒） */
+  diskLatency = true;
+  /** DOS 正在"等磁盘"（陷阱处忙等，不是在等键盘） */
+  busy = false;
+
+  /** 选择 CPU 型号：决定速度，以及 PUSH SP 等少数指令按 8086 还是 286 的方式执行 */
+  setCpu(id: CpuSpeedId): void {
+    const s = CPU_SPEEDS.find(x => x.id === id)!;
+    this.cpuModel = id;
+    this.clocksPerInstr = s.clocks;
+    this.cpu.is286 = s.is286;
+  }
+  com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => (on ? this.pic.raise(4) : this.pic.lower(4)));
+  com2 = new UART('COM2', 0x2f8, 3, () => this.clock, on => (on ? this.pic.raise(3) : this.pic.lower(3)));
+  /** 连接到另一台机器的串口线 */
+  link: NullModem | null = null;
   hle = new Hle(this);
   history = new History();
   /** 虚拟磁盘：文件名（大写）-> 内容 */
@@ -134,6 +164,7 @@ export class Machine {
     };
     cpu.trap = (n) => this.hle.handle(n);
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
+    this.com1.onWarn = this.com2.onWarn = msg => this.log(msg);
   }
 
   // ======================= 端口 =======================
@@ -141,6 +172,8 @@ export class Machine {
   private makeBus(): IOBus {
     return {
       in8: (port) => {
+        if (port >= 0x3f8 && port <= 0x3ff) return this.com1.in8(port - 0x3f8);
+        if (port >= 0x2f8 && port <= 0x2ff) return this.com2.in8(port - 0x2f8);
         switch (port) {
           case 0x20: case 0x21: return this.pic.in8(port);
           case 0x40: case 0x41: case 0x42: case 0x43: return this.pit.in8(port);
@@ -156,6 +189,8 @@ export class Machine {
         return 0xff;
       },
       out8: (port, v) => {
+        if (port >= 0x3f8 && port <= 0x3ff) { this.com1.out8(port - 0x3f8, v); return; }
+        if (port >= 0x2f8 && port <= 0x2ff) { this.com2.out8(port - 0x2f8, v); return; }
         switch (port) {
           case 0x20: case 0x21: {
             const had = this.pic.isr & 2;
@@ -185,8 +220,7 @@ export class Machine {
   private unknownPort(port: number, what: string): void {
     if (this.unknownPorts.has(port)) return;
     this.unknownPorts.add(port);
-    const hint = port >= 0x3f8 && port <= 0x3ff ? '（COM1 串口，暂未模拟）' : port >= 0x2f8 && port <= 0x2ff ? '（COM2 串口，暂未模拟）' : '';
-    this.log(`程序${what}了端口 ${port.toString(16).toUpperCase()}h${hint}，该端口没有模拟的设备${what === '读' ? '（读到 FFh）' : '（写入被忽略）'}`);
+    this.log(`程序${what}了端口 ${port.toString(16).toUpperCase()}h，该端口没有模拟的设备${what === '读' ? '（读到 FFh）' : '（写入被忽略）'}`);
   }
 
   private cmosRead(): number {
@@ -313,6 +347,9 @@ export class Machine {
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
     this.kbd.clear();
+    this.clock = 0;
+    this.com1.reset();
+    this.com2.reset();
     this.hle.reset(Math.ceil(program.imageEnd / 16) + 0x10);
     this.hle.clearWarnings();
     this.unknownPorts.clear();
@@ -362,24 +399,50 @@ export class Machine {
       this.history.begin(cpu, visible ? H_VISIBLE : 0);
     }
     if (cpu.halted) {
-      // HLT：快进到下一次定时器中断
-      const n = this.pit.instrsToNextTick();
-      this.pit.advance(n * PIT.CLOCKS_PER_INSTR);
-      this.kbd.tick(n);
+      // HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据
+      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity));
+      this.advanceTime(dt);
+      this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
       cpu.step();
       return;
     }
     cpu.step();
     this.instructions++;
-    this.pit.advance(PIT.CLOCKS_PER_INSTR);
+    // 等磁盘时一次多走一点时间（仍然足够细，能及时响应中断）
+    this.advanceTime(this.busy ? Math.max(this.clocksPerInstr, Math.min(this.hle.busyRemaining(), 32)) : this.clocksPerInstr);
     this.kbd.tick(1);
+  }
+
+  /** 推进虚拟时间：定时器、串口 */
+  private advanceTime(dt: number): void {
+    this.clock += dt;
+    this.pit.advance(dt);
+    this.com1.tick(this.clock);
+    this.com2.tick(this.clock);
+  }
+
+  /** 机器空闲（等待键盘、已停止）时，让时间流逝到 t（双机运行时保持两台机器的时间同步） */
+  idleTo(t: number): void {
+    if (t <= this.clock) return;
+    if (this.status === 'exited' || this.status === 'empty') { this.clock = t; this.com1.tick(t); this.com2.tick(t); return; }
+    this.advanceTime(t - this.clock);
+  }
+
+  /** 下一个串口事件（字节到达或发送完成）的时间，没有则为 Infinity */
+  nextSerialEvent(): number {
+    let t = Infinity;
+    for (const u of [this.com1, this.com2]) {
+      t = Math.min(t, u.nextEvent());
+      if (this.link && (u === this.link.a || u === this.link.b)) t = Math.min(t, this.link.nextArrival(u));
+    }
+    return t;
   }
 
   /** 检查执行一条指令之后是否需要停下 */
   private checkStop(): StopReason | null {
     const cpu = this.cpu;
     if (this.status === 'exited') return 'exit';
-    if (cpu.waiting && !this.kbd.queue.length && !(this.pic.pending() && cpu.flags & IF)) {
+    if (cpu.waiting && !this.busy && !this.kbd.queue.length && !(this.pic.pending() && cpu.flags & IF)) {
       this.status = 'waiting';
       this.message = '程序正在等待键盘输入（点击屏幕后直接打字）';
       return 'wait';
@@ -439,11 +502,12 @@ export class Machine {
   }
 
   /** 连续运行，最多执行 budget 条指令 */
-  run(budget: number): StopReason {
+  /** 连续运行：最多执行 budget 条指令，或者虚拟时间到达 untilClock 为止 */
+  run(budget: number, untilClock = Infinity): StopReason {
     if (!this.canRun()) return this.status === 'exited' ? 'exit' : 'error';
     if (!this.pending || this.pending.kind !== 'run') { this.pending = { kind: 'run' }; this.message = ''; }
     this.status = 'running';
-    return this.continuePending(budget);
+    return this.continuePending(budget, untilClock);
   }
 
   /** 暂停连续运行 */
@@ -462,12 +526,13 @@ export class Machine {
   }
 
   /** 继续执行尚未完成的单步/跳过/运行（例如等到按键之后） */
-  continuePending(budget: number): StopReason {
+  continuePending(budget: number, untilClock = Infinity): StopReason {
     const p = this.pending;
     if (!p) return 'paused';
     const cpu = this.cpu;
     if (this.status !== 'running') this.status = p.kind === 'run' ? 'running' : 'paused';
     for (let n = 0; n < budget; n++) {
+      if (p.kind === 'run' && this.clock >= untilClock) return 'budget';
       if (n > 0 || p.kind === 'run') {
         // 是否已到达停止点
         if (p.kind === 'step' && !this.inBios() && !cpu.repContinue && !cpu.waiting) return this.stopAt('step');
