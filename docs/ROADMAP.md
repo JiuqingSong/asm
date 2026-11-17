@@ -109,6 +109,8 @@ tools/                  测试和检查脚本（见下）
 | `node tools/ui-gfx.mjs <截图目录>` | 改了图形模式 |
 | `node tools/ui-mouse.mjs <截图目录>` | 改了鼠标 |
 | `node tools/ui-layout.mjs <截图目录>` | 改了窗口布局（分隔条、最大化，src/ui/layout.ts） |
+| `node tools/ui-disasm.mjs <截图目录> <EXE> [地址]` | 改了反汇编页（输入地址、翻页、滚轮、回到 CS:IP） |
+| `node tools/trace-fpu.ts <TP 程序.EXE> [参数] [F2 或 3E:EC]` | 借用 Turbo Pascal 程序里的 8087 仿真器，统计一条浮点指令或 Sin/Cos 等函数执行的 8086 指令和循环 |
 | `node tools/disasm-check.ts` | 改了反汇编器（需要 test-data/8088/） |
 | `node tools/run-exe.ts <EXE> [命令行] [条数] [截图.png]` | 看一个 DOS 程序用到了哪些中断、端口和没实现的功能；同目录的文件放进虚拟磁盘，图形模式可存截图 |
 | `node tools/ui-bgi.mjs <截图目录> <EXE> [x,y ...]` | 改了平面模式：在浏览器里运行 BGI 图形程序并单击（用户的 D:OLDgraphdmoGRAPHDMO.EXE，不提交） |

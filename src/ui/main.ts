@@ -63,7 +63,7 @@ class App {
   stack = new StackPanel($('stack'), $('stack-note'));
   vars = new VarsPanel($('tab-vars'));
   memory = new MemoryPanel($('memory'), $<HTMLInputElement>('mem-addr'));
-  disasm = new DisasmPanel($('tab-disasm'));
+  disasm = new DisasmPanel($('tab-disasm'), (m, t) => this.memory.parse(m, t));
   /** "运行到这里"的临时断点 */
   private tempBp: { i: number; lin: number } | null = null;
   messages: Message[] = [];
@@ -795,6 +795,7 @@ class App {
   }
 
   back(): void {
+    this.disasm.follow();
     if (this.mode === 'dual') { this.setStatus('双机模式下不能后退（已经从串口线上发出去的数据无法撤回）', ''); return; }
     if (this.run !== 'idle') this.pause();
     const s = this.cur;
@@ -829,6 +830,7 @@ class App {
   }
 
   private stopped(r: StopReason, who: number): void {
+    this.disasm.follow();
     if (this.tempBp) {
       const t = this.tempBp;
       this.tempBp = null;
