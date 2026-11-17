@@ -133,7 +133,12 @@ export class Hle {
         this.m.pic.out8(0x20, 0x20); // 默认的硬件中断处理：只发 EOI
         return true;
       case 0x10: return this.video();
-      case 0x11: this.cpu.r[AX] = 0x0021; return true;
+      case 0x11: this.cpu.r[AX] = this.cpu.rw(BDA, 0x10); return true;
+      case 0x13: return this.disk();
+      case 0x14: return this.serialBios();
+      case 0x15: return this.system();
+      case 0x17: return this.printer();
+      case 0x19: this.m.reboot(); return true;
       case 0x12: this.cpu.r[AX] = 640; return true;
       case 0x16: return this.keyboard();
       case 0x1a: return this.clock();
@@ -186,8 +191,143 @@ export class Hle {
         this.cpu.setR8(5, bcd(Math.floor(d.getFullYear() / 100))); this.cpu.setR8(1, bcd(d.getFullYear() % 100));
         this.cpu.setR8(6, bcd(d.getMonth() + 1)); this.cpu.setR8(2, bcd(d.getDate()));
         this.ok(); return true;
+      case 0x01: // 设置滴答数
+        this.cpu.ww(BDA, 0x6c, this.cpu.r[DX]); this.cpu.ww(BDA, 0x6e, this.cpu.r[CX]); this.cpu.wb(BDA, 0x70, 0);
+        return true;
+      case 0x03: case 0x05: this.ok(); return true; // 设置实时钟的时间、日期：不改你电脑的时钟，直接返回成功
+      case 0x06: case 0x07: this.retFlag(CF, true); return true; // 闹钟：没有
     }
     this.warnOnce(`INT 1Ah 功能 ${hex(this.ah)}h 暂未实现`);
+    return true;
+  }
+
+  // ---------- 磁盘（INT 13h） ----------
+
+  /** 设置 INT 13h 的返回状态：AH = 状态，CF = 状态非 0；同时记进 BIOS 数据区 */
+  private diskStatus(drive: number, status: number): void {
+    this.ah = status;
+    this.retFlag(CF, status !== 0);
+    this.cpu.wb(BDA, drive >= 0x80 ? 0x74 : 0x41, status);
+  }
+
+  private disk(): boolean {
+    const cpu = this.cpu, r = cpu.r, ah = this.ah;
+    const drive = r[DX] & 0xff;
+    const d = this.m.driveFor(drive);
+    const hard = drive >= 0x80;
+    const c = (r[CX] >> 8) | ((r[CX] & 0xc0) << 2), s = r[CX] & 0x3f, h = r[DX] >> 8;
+    const notReady = () => this.diskStatus(drive, hard ? 0x01 : 0x80); // 硬盘：无效命令；软驱：超时（没有盘）
+    switch (ah) {
+      case 0x00: case 0x0d: this.diskStatus(drive, d || drive === 0 || drive === 1 ? 0 : 0x01); return true; // 复位
+      case 0x01: { // 读上次的状态
+        const st = cpu.rb(BDA, hard ? 0x74 : 0x41);
+        this.ah = st; this.retFlag(CF, st !== 0);
+        return true;
+      }
+      case 0x02: case 0x03: case 0x04: { // 读、写、校验扇区：AL 个扇区，ES:BX 缓冲区
+        if (!d) { notReady(); this.al = 0; return true; }
+        const n = this.al;
+        let lba = d.lba(c, h, s);
+        if (lba < 0 || n === 0) { this.diskStatus(drive, 0x04); this.al = 0; return true; } // 扇区找不到
+        let done = 0;
+        let addr = (cpu.s[ES] << 4) + r[BX];
+        for (; done < n && lba < d.sectorCount; done++, lba++) {
+          const o = lba * 512;
+          if (ah === 0x02) {
+            for (let k = 0; k < 512; k++, addr++) cpu.wb((addr >> 4) & 0xffff, addr & 15, d.data[o + k]);
+          } else if (ah === 0x03) {
+            for (let k = 0; k < 512; k++, addr++) d.data[o + k] = cpu.rb((addr >> 4) & 0xffff, addr & 15);
+            d.dirty = true;
+          }
+        }
+        if (ah === 0x03 && done) this.m.disksChanged();
+        this.al = done;
+        this.diskStatus(drive, done === n ? 0 : 0x04);
+        return true;
+      }
+      case 0x05: { // 格式化一个磁道：把这个磁道的扇区填成 F6h
+        if (!d) { notReady(); return true; }
+        const first = d.lba(c, h, 1);
+        if (first < 0) { this.diskStatus(drive, 0x04); return true; }
+        d.data.fill(0xf6, first * 512, (first + d.geo.sectors) * 512);
+        d.dirty = true;
+        this.m.disksChanged();
+        this.diskStatus(drive, 0);
+        return true;
+      }
+      case 0x08: { // 读驱动器参数
+        if (!hard && drive > 1) { this.diskStatus(drive, 0x01); return true; }
+        const count = hard ? cpu.rb(BDA, 0x75) : (cpu.rw(BDA, 0x10) & 1 ? ((cpu.rw(BDA, 0x10) >> 6) & 3) + 1 : 0);
+        if (!d) {
+          if (hard) { r[DX] = 0; this.diskStatus(drive, 0x01); return true; }
+          // 软驱存在但没插盘：按 1.44MB 驱动器回答
+          r[BX] = (r[BX] & 0xff00) | 4; r[CX] = (79 << 8) | 18; r[DX] = (1 << 8) | count;
+          cpu.s[ES] = 0xf000; r[DI] = 0xefc7;
+          this.diskStatus(drive, 0);
+          return true;
+        }
+        const g = d.geo, maxC = g.cylinders - 1;
+        r[CX] = ((maxC & 0xff) << 8) | ((maxC >> 2) & 0xc0) | g.sectors;
+        r[DX] = ((g.heads - 1) << 8) | count;
+        if (!hard) { r[BX] = (r[BX] & 0xff00) | d.floppyType; cpu.s[ES] = 0xf000; r[DI] = 0xefc7; }
+        this.diskStatus(drive, 0);
+        return true;
+      }
+      case 0x15: { // 驱动器类型：软驱 AH=2（支持换盘信号），硬盘 AH=3，CX:DX = 扇区数
+        if (hard) {
+          if (!d) { this.ah = 0; this.retFlag(CF, false); return true; }
+          r[CX] = d.sectorCount >>> 16; r[DX] = d.sectorCount & 0xffff;
+          this.ah = 3; this.retFlag(CF, false);
+          return true;
+        }
+        this.ah = drive <= 1 ? 2 : 0; this.retFlag(CF, false);
+        return true;
+      }
+      case 0x16: // 软盘有没有换过：换过返回 AH=06h、CF=1（只报告一次）
+        if (d && d.changed) { d.changed = false; this.diskStatus(drive, 0x06); return true; }
+        this.diskStatus(drive, d ? 0 : 0x80);
+        return true;
+      case 0x17: case 0x18: // 设置软盘类型 / 介质类型
+        if (ah === 0x18) { cpu.s[ES] = 0xf000; r[DI] = 0xefc7; }
+        this.diskStatus(drive, d ? 0 : 0x80);
+        return true;
+      case 0x09: case 0x0c: case 0x10: case 0x11: case 0x12: case 0x13: case 0x14: // 初始化、寻道、就绪检查、校准、诊断
+        this.diskStatus(drive, d ? 0 : hard ? 0x01 : 0x80);
+        return true;
+      case 0x41: // 扩展磁盘功能：不支持
+        this.diskStatus(drive, 0x01);
+        return true;
+    }
+    this.warnOnce(`INT 13h 功能 ${hex(ah)}h 暂未实现`);
+    this.diskStatus(drive, 0x01);
+    return true;
+  }
+
+  // ---------- 其他 BIOS 中断 ----------
+
+  /** INT 15h：AT 的系统服务（没有扩展内存，大多数功能回答"不支持"） */
+  private system(): boolean {
+    const r = this.cpu.r;
+    switch (this.ah) {
+      case 0x4f: this.retFlag(CF, true); return true;          // 键盘拦截：照常处理这个键
+      case 0x88: r[AX] = 0; this.retFlag(CF, false); return true; // 扩展内存 KB 数
+      case 0x90: case 0x91: this.ah = 0; this.retFlag(CF, false); return true; // 设备忙 / 中断完成
+      case 0x86: this.retFlag(CF, false); return true;          // 等待 CX:DX 微秒：不等
+    }
+    this.ah = 0x86; this.retFlag(CF, true); // 不支持（C0h 系统配置、87h 扩展内存搬移、24h A20 等）
+    return true;
+  }
+
+  /** INT 17h：打印机（没有打印机，回答"就绪"，打印的字符丢弃） */
+  private printer(): boolean {
+    this.ah = 0x90;
+    return true;
+  }
+
+  /** INT 14h：串口 BIOS（只回答状态，不收发） */
+  private serialBios(): boolean {
+    if (this.ah === 0x00 || this.ah === 0x03) { this.ah = 0x60; this.al = 0x30; return true; }
+    this.ah = 0x80; // 超时
     return true;
   }
 
@@ -253,6 +393,16 @@ export class Hle {
         return true;
       }
       case 0x02: case 0x12: this.al = this.cpu.rb(BDA, 0x17); return true;
+      case 0x03: return true; // 设置重复速率：忽略
+      case 0x05: { // 把 CX 放进键盘缓冲区
+        const cpu = this.cpu, head = cpu.rw(BDA, 0x1a), tail = cpu.rw(BDA, 0x1c);
+        let next = tail + 2;
+        if (next >= 0x3e) next = 0x1e;
+        if (next === head) { this.al = 1; return true; }
+        cpu.ww(BDA, tail, cpu.r[CX]); cpu.ww(BDA, 0x1c, next);
+        this.al = 0;
+        return true;
+      }
     }
     this.warnOnce(`INT 16h 功能 ${hex(this.ah)}h 暂未实现`);
     return true;

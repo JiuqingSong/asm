@@ -1,5 +1,6 @@
 // 虚拟 PC：CPU + 内存 + 中断控制器 + 定时器 + 键盘 + BIOS/DOS，以及调试功能
-import { CPU, CS, DS, ES, SS, SP, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
+import { CPU, CS, DS, ES, SS, SP, DX, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
+import { Disk } from './disk.ts';
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, Keyboard, type KeyEvent } from './devices.ts';
 import { Hle } from './bios.ts';
@@ -27,6 +28,13 @@ export type StopReason = 'step' | 'breakpoint' | 'exit' | 'wait' | 'budget' | 'e
 const STUB_SIZE = 8;
 const STUB_INT8 = 0x0800;
 const STUB_INT9 = 0x0810;
+/** 软盘参数表、硬盘参数表在 F000 段里的位置（与 IBM AT BIOS 相同） */
+const DPT_OFF = 0xefc7;
+const FDPT_OFF = 0xe401;
+
+export function driveName(drive: number): string {
+  return drive >= 0x80 ? String.fromCharCode(67 + drive - 0x80) + ':' : String.fromCharCode(65 + drive) + ':';
+}
 
 /** 反向执行用的历史记录：每条指令执行前的寄存器 + 该指令覆盖掉的内存旧值 */
 class History {
@@ -102,6 +110,8 @@ export interface MachineEvents {
   log?(msg: string): void;
   bell?(): void;
   filesChanged?(): void;
+  /** 磁盘映像被写过 */
+  disksChanged?(): void;
   /** PC 喇叭：频率（Hz），0 表示不响 */
   speaker?(freq: number): void;
 }
@@ -142,6 +152,8 @@ export class Machine {
   history = new History();
   /** 虚拟磁盘：文件名（大写）-> 内容 */
   files = new Map<string, Uint8Array>();
+  /** 磁盘映像：0 = A:，1 = B:（软驱），2 = C:，3 = D:（硬盘）；换程序、重启时保留 */
+  drives: (Disk | null)[] = [null, null, null, null];
   /** 虚拟磁盘上文件的修改时间（毫秒）；没有记录的在第一次被查询时取当前时间 */
   fileTimes = new Map<string, number>();
 
@@ -211,7 +223,7 @@ export class Machine {
           case 0x20: case 0x21: return this.pic.in8(port);
           case 0x40: case 0x41: case 0x42: case 0x43: return this.pit.in8(port);
           case 0x60: return this.kbd.in60();
-          case 0x61: return this.port61;
+          case 0x61: return (this.port61 & 0xcf) | ((Math.floor(this.clock / 18) & 1) << 4); // 位 4：内存刷新，约每 15 微秒翻转一次（AT 机上程序用它计时）
           case 0x64: return this.kbd.queue.length ? 0x15 : 0x14;
           case 0x71: return this.cmosRead();
           case 0x3d4: return this.crtcIndex;
@@ -235,6 +247,8 @@ export class Machine {
           }
           case 0x40: case 0x41: case 0x42: case 0x43: this.pit.out8(port, v); return;
           case 0x61: this.port61 = v; this.updateSpeaker(); return;
+          case 0x64: if (v === 0xfe) this.reboot(); return; // 键盘控制器命令 FEh：复位 CPU（重新启动）
+          case 0x60: return; // 发给键盘的命令（设置指示灯等）：接受但不模拟
           case 0x70: this.cmosIndex = v & 0x7f; return;
           case 0xf0: case 0xf1: return; // 数学协处理器的复位端口：Turbo Pascal 等检测协处理器时会写
           case 0x3d4: this.crtcIndex = v; return;
@@ -353,7 +367,22 @@ export class Machine {
     mem[MOUSE_VECTOR * 4 + 2] = BIOS_SEG & 0xff; mem[MOUSE_VECTOR * 4 + 3] = BIOS_SEG >> 8;
     // INT 9：读键盘 -> 放入缓冲区 -> EOI
     mem.set([TRAP_OPCODE, 0x09, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
-    mem.set([0xea, 0x00, 0x00, 0x00, 0xf0], 0xffff0); // 复位向量（不会用到）
+    // 复位向量：跳到 F000:E05B（IBM PC 的开机入口），那里的陷阱重新启动机器
+    mem.set([0xea, 0x5b, 0xe0, 0x00, 0xf0], 0xffff0);
+    mem.set([TRAP_OPCODE, 0x19, 0xcf], bios + 0xe05b);
+    // 软盘参数表（INT 1Eh 指向它，DOS 的引导扇区会复制并修改它）
+    mem.set([0xdf, 0x02, 0x25, 0x02, 0x12, 0x1b, 0xff, 0x6c, 0xf6, 0x0f, 0x08], bios + DPT_OFF);
+    mem[0x1e * 4] = DPT_OFF & 0xff; mem[0x1e * 4 + 1] = DPT_OFF >> 8;
+    // 硬盘参数表（INT 41h、46h 指向第一、二个硬盘的）
+    for (const [k, vec] of [[2, 0x41], [3, 0x46]] as const) {
+      const d = this.drives[k], t = bios + FDPT_OFF + (k - 2) * 16;
+      if (d && !d.floppy) {
+        mem[t] = d.geo.cylinders & 0xff; mem[t + 1] = d.geo.cylinders >> 8; mem[t + 2] = d.geo.heads;
+        mem[t + 12] = d.geo.cylinders & 0xff; mem[t + 13] = d.geo.cylinders >> 8; mem[t + 14] = d.geo.sectors;
+      }
+      const off = FDPT_OFF + (k - 2) * 16;
+      mem[vec * 4] = off & 0xff; mem[vec * 4 + 1] = off >> 8;
+    }
     // 8×8 字库：INT 43h 指向前 128 个字符，INT 1Fh 指向后 128 个
     if (Machine.font) {
       mem.set(Machine.font.subarray(0, 1024), bios + FONT_LO);
@@ -365,7 +394,10 @@ export class Machine {
     // BIOS 数据区
     const bda = 0x400;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
-    w16(bda + 0x10, 0x0021);
+    // 设备字：位 0 有软驱，位 6~7 软驱数 − 1，位 4~5 = 10 表示 80×25 彩色
+    const floppies = this.drives[1] ? 2 : 1;
+    w16(bda + 0x10, 0x0021 | ((floppies - 1) << 6));
+    mem[bda + 0x75] = (this.drives[2] ? 1 : 0) + (this.drives[3] ? 1 : 0); // 硬盘个数
     w16(bda + 0x13, 640);
     w16(bda + 0x1a, 0x1e); w16(bda + 0x1c, 0x1e);
     mem[bda + 0x49] = 3;
@@ -376,6 +408,76 @@ export class Machine {
     w16(bda + 0x80, 0x1e); w16(bda + 0x82, 0x3e);
     mem[bda + 0x84] = 24;
     for (let o = 0; o < 4000; o += 2) { mem[0xb8000 + o] = 0x20; mem[0xb8000 + o + 1] = 0x07; }
+    if (program.format === 'boot') this.loadBootSector(program.bootDrive ?? 0);
+    else this.loadProgram(program, cmdline, name);
+    // 设备
+    this.pic.irr = 0; this.pic.isr = 0; this.pic.imr = 0xb8; this.pic.vectorBase = 8;
+    this.pit.reload = [0x10000, 0x10000, 0x10000];
+    this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
+    this.port61 = 0;
+    this.updateSpeaker();
+    this.kbd.clear();
+    this.clock = 0;
+    this.video.reset();
+    cpu.mmio = null;
+    this.mouse.powerOn();
+    this.com1.reset();
+    this.com2.reset();
+    this.hle.reset();
+    this.hle.clearWarnings();
+    this.unknownPorts.clear();
+    this.history.clear();
+    this.console = '';
+    this.instructions = 0;
+    this.status = 'ready';
+    this.loadTail();
+  }
+
+  /** 开机：把启动盘的第一个扇区读到 0000:7C00，从那里开始执行（DL = 驱动器号） */
+  private loadBootSector(drive: number): void {
+    const cpu = this.cpu, mem = this.mem;
+    // 和 BIOS 一样按 A:、C: 的顺序：A: 没有盘时从 C: 启动
+    if (drive === 0 && !this.drives[0] && this.drives[2]) drive = 0x80;
+    const d = this.driveFor(drive);
+    if (!d) throw new Error(`${driveName(drive)} 没有磁盘映像，不能启动`);
+    const sec = d.data.subarray(0, 512);
+    if (sec[510] !== 0x55 || sec[511] !== 0xaa) throw new Error(`${driveName(drive)} 的磁盘不能启动（第一个扇区末尾没有引导标记 55AAh；空白的硬盘需要先用启动软盘分区、格式化）`);
+    mem.set(sec, 0x7c00);
+    // 开机自检时 BIOS 按 CMOS 时钟设置"午夜以来的滴答数"，DOS 由此得到当前时间
+    const now = new Date();
+    const ticks = Math.floor(((now.getHours() * 60 + now.getMinutes()) * 60 + now.getSeconds()) * 1193182 / 65536);
+    mem[0x46c] = ticks & 0xff; mem[0x46d] = (ticks >> 8) & 0xff; mem[0x46e] = (ticks >> 16) & 0xff; mem[0x46f] = 0;
+    cpu.r.fill(0);
+    cpu.s.fill(0);
+    cpu.s[CS] = 0; cpu.ip = 0x7c00;
+    cpu.s[SS] = 0; cpu.r[SP] = 0x7c00;
+    cpu.r[DX] = drive;
+    cpu.flags = 0xf202;
+    cpu.halted = false;
+    cpu.waiting = false;
+    for (const x of this.drives) if (x) x.changed = true;
+  }
+
+  /** INT 19h 或复位：从原来的启动盘重新启动；普通程序调用时忽略 */
+  reboot(): void {
+    const p = this.program;
+    if (!p || p.format !== 'boot') { this.log('程序调用了 INT 19h（重新启动），只有从磁盘启动时才有效，已忽略'); return; }
+    try { this.load(p); } catch (e) { this.exit(0, (e as Error).message); }
+  }
+
+  disksChanged(): void { this.events.disksChanged?.(); }
+
+  /** BIOS 驱动器号对应的磁盘映像（0、1 软驱，80h、81h 硬盘） */
+  driveFor(drive: number): Disk | null {
+    if (drive === 0 || drive === 1) return this.drives[drive];
+    if (drive === 0x80 || drive === 0x81) return this.drives[drive - 0x80 + 2];
+    return null;
+  }
+
+  /** 装载汇编出来的程序或 EXE/COM：PSP、环境变量、内存控制块、程序映像和寄存器 */
+  private loadProgram(program: Program, cmdline: string, name: string): void {
+    const cpu = this.cpu, mem = this.mem;
+    const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
     // PSP
     const psp = program.pspSeg * 16;
     mem.set([0xcd, 0x20], psp);
@@ -413,26 +515,11 @@ export class Machine {
       cpu.s[DS] = cpu.s[ES] = cpu.s[SS] = cpu.s[CS] = program.pspSeg;
       w16(program.pspSeg * 16 + 0xfffe, 0);
     }
-    // 设备
-    this.pic.irr = 0; this.pic.isr = 0; this.pic.imr = 0xb8; this.pic.vectorBase = 8;
-    this.pit.reload = [0x10000, 0x10000, 0x10000];
-    this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
-    this.port61 = 0;
-    this.updateSpeaker();
-    this.kbd.clear();
-    this.clock = 0;
-    this.video.reset();
-    cpu.mmio = null;
-    this.mouse.powerOn();
-    this.com1.reset();
-    this.com2.reset();
-    this.hle.reset();
-    this.hle.clearWarnings();
-    this.unknownPorts.clear();
-    this.history.clear();
-    this.console = '';
-    this.instructions = 0;
-    this.status = 'ready';
+  }
+
+  /** load() 的最后一部分（原来紧跟在设备复位之后的代码） */
+  private loadTail(): void {
+    const program = this.program!;
     this.message = '';
     this.exitCode = 0;
     this.breakRequest = '';

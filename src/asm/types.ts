@@ -89,7 +89,9 @@ export interface ProgramSymbol {
 export interface Program {
   ok: boolean;
   diagnostics: Diag[];
-  format: 'exe' | 'com';
+  format: 'exe' | 'com' | 'boot';
+  /** format 为 boot 时：从哪个 BIOS 驱动器启动（0 = A:，80h = C:） */
+  bootDrive?: number;
   /** 程序映像装载的段（PSP 在它前面 0x10 个段落） */
   loadSeg: number;
   pspSeg: number;

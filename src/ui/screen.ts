@@ -356,10 +356,13 @@ export class Screen {
 
   focus(): void { this.el.focus(); }
 
+  /** 从磁盘启动时为 true：功能键全部交给虚拟机里的程序（DOS 安装程序要用 F3、F5、F8 等） */
+  allKeys = false;
+
   private key(e: KeyboardEvent, release: boolean): void {
     if (!this.onKey) return;
     if (e.ctrlKey && (e.key === 'v' || e.key === 'c')) return; // 允许复制粘贴
-    if (/^F(5|6|7|10|11)$/.test(e.key)) return;              // 调试快捷键
+    if (!this.allKeys && /^F(5|6|7|10|11)$/.test(e.key)) return; // 调试快捷键（从磁盘启动时全部交给程序）
     const scan = SCAN[e.code];
     if (scan === undefined) return;
     e.preventDefault();

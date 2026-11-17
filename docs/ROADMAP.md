@@ -110,6 +110,8 @@ tools/                  测试和检查脚本（见下）
 | `node tools/ui-mouse.mjs <截图目录>` | 改了鼠标 |
 | `node tools/ui-layout.mjs <截图目录>` | 改了窗口布局（分隔条、最大化，src/ui/layout.ts） |
 | `node tools/ui-disasm.mjs <截图目录> <EXE> [地址]` | 改了反汇编页（输入地址、翻页、滚轮、回到 CS:IP） |
+| `node tools/boot.ts <A: 映像> [C: 映像 或 new:64] [百万条指令] [按键…]` | 改了 INT 13h、开机流程：命令行里从磁盘启动并按键（`{ENTER}` `{F3}` `{SWAP}` 换盘 `{SHOT}` 显示屏幕），`SAVE_C` 保存硬盘映像 |
+| `node tools/ui-boot.mjs <截图目录> <A: 映像> [按键…]` | 改了磁盘映像面板：在浏览器里放入软盘、新建硬盘、启动、按键（用户的 DOS 6.22 映像在 D:\DOS，不提交） |
 | `node tools/trace-fpu.ts <TP 程序.EXE> [参数] [F2 或 3E:EC]` | 借用 Turbo Pascal 程序里的 8087 仿真器，统计一条浮点指令或 Sin/Cos 等函数执行的 8086 指令和循环 |
 | `node tools/disasm-check.ts` | 改了反汇编器（需要 test-data/8088/） |
 | `node tools/run-exe.ts <EXE> [命令行] [条数] [截图.png]` | 看一个 DOS 程序用到了哪些中断、端口和没实现的功能；同目录的文件放进虚拟磁盘，图形模式可存截图 |

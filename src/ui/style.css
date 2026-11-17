@@ -279,6 +279,11 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 
 /* ---------- 反汇编 ---------- */
 #tab-disasm { font-size: 12.5px; }
+.drives-head { padding: 6px 10px 4px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--border); background: var(--panel-2); }
+.drive-row .dl { width: 22px; flex: none; font-family: var(--mono); }
+.drive-row .fn { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.drive-row select { height: 24px; font-size: 12px; }
+.drive-boot { display: flex; gap: 6px; padding: 6px 10px 10px; border-bottom: 1px solid var(--border); }
 #tab-disasm:not(.hidden) { display: flex; flex-direction: column; overflow: hidden; }
 #tab-disasm .dis-list { flex: 1; min-height: 0; overflow: hidden; }
 #tab-disasm .dis-addr { width: 110px; }
@@ -306,3 +311,5 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 /* 图形模式：保持 4:3，像素放大时不模糊 */
 .screen canvas.gfx { position: absolute; top: 0; bottom: 0; left: 50%; height: 100%; aspect-ratio: 4 / 3; transform: translateX(-50%); image-rendering: pixelated; background: #000; }
 .screen.graphics .row { visibility: hidden; }
+.drive-row .fn { flex: 0 1 auto; }
+.drive-row .note { white-space: nowrap; }

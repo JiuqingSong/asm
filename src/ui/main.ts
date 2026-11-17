@@ -1,5 +1,7 @@
 import './style.css';
 import { setupLayout } from './layout.ts';
+import { DrivesPanel } from './drives.ts';
+import { bootProgram, driveName } from '../machine/boot.ts';
 import { assemble } from '../asm/assembler.ts';
 import type { Diag, Program } from '../asm/types.ts';
 import { Machine, CPU_SPEEDS, type StopReason, type CpuSpeedId } from '../machine/machine.ts';
@@ -64,6 +66,7 @@ class App {
   vars = new VarsPanel($('tab-vars'));
   memory = new MemoryPanel($('memory'), $<HTMLInputElement>('mem-addr'));
   disasm = new DisasmPanel($('tab-disasm'), (m, t) => this.memory.parse(m, t));
+  drives: DrivesPanel | null = null;
   /** "运行到这里"的临时断点 */
   private tempBp: { i: number; lin: number } | null = null;
   messages: Message[] = [];
@@ -110,6 +113,7 @@ class App {
           }
         },
         filesChanged: () => { if (this.tab === 'files') this.renderFiles(); },
+        disksChanged: () => this.drives?.changed(s.i),
       };
       box.addEventListener('mousedown', () => { s.screen.focus(); if (this.mode === 'dual' && this.active !== i) this.setActive(i); });
       box.querySelector('.screen')!.addEventListener('paste', e => {
@@ -249,6 +253,8 @@ class App {
 
     window.addEventListener('keydown', e => {
       const k = e.key;
+      // 从磁盘启动、DOS 屏幕有焦点时，功能键交给虚拟机（调试请用工具栏按钮）
+      if (/^F\d+$/.test(k) && (e.target as HTMLElement).closest?.('.screen') && this.cur.program?.format === 'boot') return;
       let handled = true;
       if (k === 'F5' && e.ctrlKey) this.restart();
       else if (k === 'F5') this.start();
@@ -265,6 +271,13 @@ class App {
     }, true);
 
     setupLayout(() => window.dispatchEvent(new Event('resize')));
+    this.drives = new DrivesPanel($('drives'), {
+      machines: () => this.live.map(x => ({ m: x.m, tag: x.tag, i: x.i })),
+      dual: () => this.mode === 'dual',
+      boot: (i, drive) => this.runBoot(this.sessions[i], drive),
+      message: (kind, text, i) => { this.addMessage(kind, text, i); if (kind === 'error') this.setTab('messages'); },
+    });
+    void this.drives.restore();
     const screenPane = document.querySelector('.screen-pane') as HTMLElement;
     new ResizeObserver(() => {
       document.documentElement.style.setProperty('--screen-h', screenPane.offsetHeight + 'px');
@@ -409,6 +422,44 @@ class App {
     }
     input.value = '';
     this.renderFiles();
+  }
+
+  /** 从磁盘映像启动（像开机一样：读引导扇区，运行真的 DOS 等系统） */
+  private runBoot(s: Session, drive: number): void {
+    let d = s.m.driveFor(drive);
+    if (drive === 0 && !d && s.m.drives[2]) { drive = 0x80; d = s.m.drives[2]; }
+    if (!d) { this.addMessage('error', `${driveName(drive)} 没有磁盘映像`, s.i); this.setTab('messages'); return; }
+    if (d.data[510] !== 0x55 || d.data[511] !== 0xaa) {
+      this.addMessage('error', `${driveName(drive)} 的磁盘不能启动：第一个扇区末尾没有引导标记 55AAh${d.floppy ? '（这张软盘没有格式化成启动盘）' : '（空白硬盘需要先用启动软盘分区、格式化，例如运行 DOS 的安装程序）'}`, s.i);
+      this.setTab('messages');
+      return;
+    }
+    this.stop();
+    const text = [
+      `; 从 ${driveName(drive)} 启动：${d.name}`,
+      ';',
+      '; 像开机一样：BIOS 把磁盘的第一个扇区（引导扇区）读到 0000:7C00 执行，',
+      '; 引导扇区再装入磁盘上的操作系统（例如 DOS 的 IO.SYS、MSDOS.SYS）。',
+      '; 从这里开始，INT 21h 等功能都由磁盘上真的 DOS 提供，模拟器只提供 BIOS 和硬件。',
+      ';',
+      '; 点一下 DOS 屏幕就可以用键盘操作；这时功能键（F1~F12）都交给虚拟机，',
+      '; 调试请用工具栏的按钮（暂停、单步……），反汇编页里可以看到正在执行的代码。',
+      '; 在"虚拟磁盘"页里可以换软盘（例如安装程序要第 2 张盘时）；写进映像的内容会保存在浏览器里。',
+      '; 想要原机的速度就选"原机速度"，想快一点就选"全速"。',
+      ';',
+      '; 回到源程序：点"汇编"，或者从"示例程序"、"打开"载入源程序。',
+    ].join('\n');
+    if (!s.binModel) s.binModel = this.editor.createModel('');
+    this.editor.setText(s.binModel, text);
+    s.binary = `[${driveName(drive)} 启动]`;
+    s.program = bootProgram(drive);
+    s.dirty = false;
+    if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
+    this.renderTabs();
+    this.addMessage('ok', `从 ${driveName(drive)} 启动（${d.name}）`, s.i);
+    this.loadAll();
+    this.start();
+    s.screen.focus();
   }
 
   /** 直接装载并运行虚拟磁盘上的 EXE/COM 文件（没有源码） */
@@ -622,6 +673,7 @@ class App {
   /** 装载所有会话的程序（双机时两台机器一起从头开始） */
   private loadAll(): void {
     for (const s of this.live) {
+      s.screen.allKeys = s.program?.format === 'boot';
       if (!s.program) continue;
       s.m.load(s.program, s.cmdline.value, s.binary ?? 'PROGRAM.EXE');
       s.snap = null;
@@ -937,7 +989,7 @@ class App {
       case 'disasm': this.disasm.render(s.m, s.m.breakpoints); break;
       case 'serial': this.renderSerial(); break;
       case 'messages': this.renderMessages(); break;
-      case 'files': this.renderFiles(); break;
+      case 'files': this.renderFiles(); this.drives?.render(); break;
     }
   }
 

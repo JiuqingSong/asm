@@ -920,3 +920,100 @@ end start`);
     expect(m.exitCode).toBe(date & 0xff);
   });
 });
+
+describe('磁盘映像与 INT 13h', () => {
+  it('读写扇区、读驱动器参数', async () => {
+    const { Disk, blankFloppy } = await import('../src/machine/disk.ts');
+    const m = load(`
+.model small
+.stack 100h
+.data
+buf     db 512 dup(0)
+.code
+start:  mov ax, @data
+        mov ds, ax
+        mov es, ax
+        mov di, offset buf          ; 填一个扇区：0,1,2,...
+        mov cx, 512
+        xor al, al
+fill:   stosb
+        inc al
+        loop fill
+        mov ax, 0301h               ; 写 1 个扇区：柱面 1，磁头 1，扇区 5
+        mov cx, 0105h
+        mov dx, 0100h
+        mov bx, offset buf
+        int 13h
+        jc bad
+        mov di, offset buf          ; 清掉缓冲区再读回来
+        mov cx, 256
+        xor ax, ax
+        rep stosw
+        mov ax, 0201h
+        mov cx, 0105h
+        mov dx, 0100h
+        mov bx, offset buf
+        int 13h
+        jc bad
+        cmp byte ptr buf+200, 200
+        jne bad
+        mov ah, 08h                 ; 读参数：1.44MB 软驱，79 柱面，18 扇区，2 个磁头
+        mov dl, 0
+        int 13h
+        jc bad
+        cmp bl, 4
+        jne bad
+        cmp cx, 4F12h
+        jne bad
+        cmp dh, 1
+        jne bad
+        mov ax, 0201h               ; 扇区号超出范围：错误 04h
+        mov cx, 0013h
+        mov dx, 0
+        int 13h
+        jnc bad
+        cmp ah, 4
+        jne bad
+        mov ax, 4c00h
+        int 21h
+bad:    mov ax, 4c01h
+        int 21h
+end start`);
+    m.drives[0] = new Disk('T.IMG', blankFloppy(), true);
+    runToEnd(m);
+    expect(m.exitCode).toBe(0);
+    const lba = (1 * 2 + 1) * 18 + 4;
+    expect(m.drives[0]!.data[lba * 512 + 200]).toBe(200);
+    expect(m.drives[0]!.dirty).toBe(true);
+  });
+
+  it('从软盘启动：引导扇区装到 0000:7C00，DL = 驱动器号', async () => {
+    const { Disk, blankFloppy } = await import('../src/machine/disk.ts');
+    const { bootProgram } = await import('../src/machine/boot.ts');
+    const img = blankFloppy();
+    // 引导扇区：用 INT 10h 显示 DL+'A'，再读第 2 个扇区到 0000:8000 并跳过去
+    const code = [
+      0x88, 0xd0, 0x04, 0x41, 0xb4, 0x0e, 0xcd, 0x10,       // mov al,dl / add al,'A' / mov ah,0Eh / int 10h
+      0xbb, 0x00, 0x80, 0xb8, 0x01, 0x02, 0xb9, 0x02, 0x00, // mov bx,8000h / mov ax,0201h / mov cx,0002h
+      0xb6, 0x00, 0xcd, 0x13,                               // mov dh,0 / int 13h
+      0xea, 0x00, 0x80, 0x00, 0x00,                         // jmp 0000:8000
+    ];
+    img.set(code, 0);
+    img[510] = 0x55; img[511] = 0xaa;
+    img.set([0xb0, 0x4b, 0xb4, 0x0e, 0xcd, 0x10, 0xf4], 512); // mov al,'K' / mov ah,0Eh / int 10h / hlt
+    const m = new Machine();
+    m.drives[0] = new Disk('BOOT.IMG', img, true);
+    m.load(bootProgram(0));
+    m.run(10_000);
+    expect(String.fromCharCode(m.mem[0xb8000], m.mem[0xb8002])).toBe('AK');
+  });
+
+  it('空白硬盘不能启动，给出说明', async () => {
+    const { Disk, blankHardDisk } = await import('../src/machine/disk.ts');
+    const { bootProgram } = await import('../src/machine/boot.ts');
+    const m = new Machine();
+    m.drives[2] = new Disk('C.IMG', blankHardDisk(32), false);
+    expect(() => m.load(bootProgram(0x80))).toThrow(/55AAh/);
+    expect(m.drives[2]!.geo).toEqual({ cylinders: 65, heads: 16, sectors: 63 });
+  });
+});
