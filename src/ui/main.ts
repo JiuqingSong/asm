@@ -10,6 +10,7 @@ import { AX } from '../cpu/cpu.ts';
 import { EditorView, monaco } from './editor.ts';
 import { Screen } from './screen.ts';
 import { Speaker } from './speaker.ts';
+import { DisasmPanel, currentInstruction } from './disasm-panel.ts';
 import { RegisterPanel, StackPanel, VarsPanel, MemoryPanel, takeSnapshot, h2, h4, type Snapshot } from './panels.ts';
 import { EXAMPLES } from './examples.ts';
 import { INSTR_HELP, DIRECTIVE_HELP, DOS_FUNCS, BIOS_FUNCS } from './help.ts';
@@ -43,6 +44,8 @@ interface Session {
   binary: string | null;
   /** 可执行文件的说明页（只读） */
   binModel: monaco.editor.ITextModel | null;
+  /** 在反汇编面板上按地址设的断点（线性地址） */
+  addrBps: Set<number>;
 }
 
 class App {
@@ -55,6 +58,9 @@ class App {
   stack = new StackPanel($('stack'), $('stack-note'));
   vars = new VarsPanel($('tab-vars'));
   memory = new MemoryPanel($('memory'), $<HTMLInputElement>('mem-addr'));
+  disasm = new DisasmPanel($('tab-disasm'));
+  /** "运行到这里"的临时断点 */
+  private tempBp: { i: number; lin: number } | null = null;
   messages: Message[] = [];
   tab = 'vars';
   run: 'idle' | 'run' | 'animate' = 'idle';
@@ -75,7 +81,7 @@ class App {
       const s: Session = {
         i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model: this.editor.createModel(''), program: null, dirty: true,
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
-        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null,
+        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(),
       };
       s.screen.onKey = e => this.key(s, e);
       s.m.events = {
@@ -100,6 +106,14 @@ class App {
     this.stack.onLineClick = l => this.editor.revealLine(this.cur.model, l);
     this.vars.onLineClick = l => this.editor.revealLine(this.cur.model, l);
     this.vars.onAddrClick = (seg, off) => { this.memory.go(seg, off); this.setTab('memory'); };
+    this.disasm.onToggleBp = lin => {
+      const s = this.cur;
+      if (s.addrBps.has(lin)) s.addrBps.delete(lin); else s.addrBps.add(lin);
+      this.syncBreakpoints(s);
+      this.renderTab();
+    };
+    this.disasm.onRunTo = lin => this.runTo(this.cur, lin);
+    this.disasm.onLine = l => this.editor.revealLine(this.cur.model, l);
 
     this.bindUi();
     this.restore();
@@ -170,6 +184,7 @@ class App {
     $('btn-pause').onclick = () => this.pause();
     $('btn-step').onclick = () => this.step(false);
     $('btn-over').onclick = () => this.step(true);
+    $('btn-out').onclick = () => this.step('out');
     $('btn-back').onclick = () => this.back();
     $('btn-reset').onclick = () => this.restart();
     $<HTMLSelectElement>('speed').onchange = e => {
@@ -198,6 +213,14 @@ class App {
         this.editor.revealLine(s.model, +a.dataset.line!);
       }
     };
+    $('regs').addEventListener('click', e => {
+      const el = (e.target as HTMLElement).closest('[data-reg]') as HTMLElement | null;
+      if (el) this.editRegister(el);
+    });
+    $('flags').addEventListener('click', e => {
+      const el = (e.target as HTMLElement).closest('[data-flag]') as HTMLElement | null;
+      if (el) this.toggleFlag(+el.dataset.flag!);
+    });
     for (const s of this.sessions) s.cmdline.onchange = () => store.set('cmdline' + (s.i ? '.b' : ''), s.cmdline.value);
     const cn = document.querySelectorAll<HTMLInputElement>('.cn-toggle');
     const setChinese = (on: boolean) => {
@@ -216,8 +239,10 @@ class App {
       else if (k === 'F5') this.start();
       else if (k === 'F6') this.pause();
       else if (k === 'F7') { this.stop(); this.assembleAll(true); }
+      else if (k === 'F10' && e.ctrlKey) this.runToCursor();
       else if (k === 'F10') this.step(true);
-      else if (k === 'F11' && e.shiftKey) this.back();
+      else if (k === 'F11' && e.shiftKey && e.ctrlKey) this.back();
+      else if (k === 'F11' && e.shiftKey) this.step('out');
       else if (k === 'F11') this.step(false);
       else if (k === 's' && e.ctrlKey) this.saveFile();
       else handled = false;
@@ -296,7 +321,7 @@ class App {
   private setTab(t: string): void {
     this.tab = t;
     for (const b of document.querySelectorAll<HTMLButtonElement>('.tabs button')) b.classList.toggle('active', b.dataset.tab === t);
-    for (const id of ['vars', 'memory', 'serial', 'messages', 'files']) $('tab-' + id).classList.toggle('hidden', id !== t);
+    for (const id of ['vars', 'memory', 'disasm', 'serial', 'messages', 'files']) $('tab-' + id).classList.toggle('hidden', id !== t);
     this.renderTab();
   }
 
@@ -407,8 +432,83 @@ class App {
     this.renderTabs();
     this.addMessage('ok', `装载 ${name}：${info.format.toUpperCase()}，${info.imageSize} 字节${info.packer ? `，${info.packer} 压缩` : ''}`, s.i);
     this.loadAll();
+    this.setTab('disasm');
     this.start();
     s.screen.focus();
+  }
+
+  /** 运行到某个地址（临时断点） */
+  private runTo(s: Session, lin: number): void {
+    if (this.run !== 'idle') this.pause();
+    if (!this.ensureReady()) return;
+    if (s.m.status === 'exited') { this.setStatus('程序已结束。点"重启"可以重新开始', 'error'); return; }
+    if (s.m.linearIP === lin) { this.setStatus('已经在这个位置了', ''); return; }
+    this.tempBp = { i: s.i, lin };
+    this.start();
+  }
+
+  /** 运行到编辑器光标所在的行（这一行没有代码时，用后面最近的有代码的行） */
+  private runToCursor(): void {
+    const s = this.cur;
+    if (s.binary) { this.setStatus('可执行文件没有源码：请在"反汇编"页里双击要运行到的那一行', ''); this.setTab('disasm'); return; }
+    if (!this.ensureReady() || !s.program) return;
+    const pos = this.editor.editor.getPosition();
+    if (!pos) return;
+    for (let l = pos.lineNumber; l < pos.lineNumber + 30; l++) {
+      const addrs = s.program.lineToAddrs.get(l);
+      if (addrs) { this.runTo(s, addrs[0]); return; }
+    }
+    this.setStatus('光标所在的行（以及后面几行）没有生成代码', '');
+  }
+
+  /** 在寄存器面板上直接修改寄存器 */
+  private editRegister(el: HTMLElement): void {
+    const s = this.cur, m = s.m, cpu = m.cpu;
+    if (this.run !== 'idle' || !s.program || m.status === 'empty') return;
+    const key = el.dataset.reg ?? "";
+    const get = () => key === 'ip' ? cpu.ip : key === 'flags' ? cpu.flags : key[0] === 'r' ? cpu.r[+key.slice(1)] : cpu.s[+key.slice(1)];
+    const set = (v: number) => {
+      if (key === 'ip') cpu.ip = v;
+      else if (key === 'flags') cpu.setFlags(v);
+      else if (key[0] === 'r') cpu.r[+key.slice(1)] = v;
+      else cpu.s[+key.slice(1)] = v;
+    };
+    if (el.querySelector('.reg-edit')) return;
+    const input = document.createElement('input');
+    input.className = 'reg-edit';
+    input.value = h4(get());
+    input.title = '十六进制；以 d 结尾表示十进制，例如 100d';
+    el.appendChild(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = (apply: boolean) => {
+      if (done) return;
+      done = true;
+      const raw = input.value.trim();
+      const t = raw.toLowerCase();
+      input.remove();
+      if (!apply) return;
+      const v = /^\d+d$/.test(t) ? parseInt(t, 10) : /^[0-9a-f]{1,4}h?$/.test(t) ? parseInt(t.replace(/h$/, ''), 16) : NaN;
+      if (Number.isNaN(v) || v > 0xffff) { this.setStatus(`"${raw}" 不是有效的 16 位数值`, 'error'); return; }
+      if (v === get()) return;
+      s.snap = takeSnapshot(m);
+      m.poke(() => set(v));
+      this.setStatus(`已修改 ${regName(key)}，"后退"可以撤销`, '');
+      this.render(true);
+    };
+    input.onkeydown = e => { e.stopPropagation(); if (e.key === 'Enter') finish(true); if (e.key === 'Escape') finish(false); };
+    input.onblur = () => finish(true);
+    input.onclick = e => e.stopPropagation();
+  }
+
+  /** 点标志位：切换它的值 */
+  private toggleFlag(mask: number): void {
+    const s = this.cur, m = s.m;
+    if (this.run !== 'idle' || !s.program || m.status === 'empty') return;
+    s.snap = takeSnapshot(m);
+    m.poke(() => m.cpu.setFlags(m.cpu.flags ^ mask));
+    this.render(true);
   }
 
   private fileAction(e: MouseEvent): void {
@@ -526,6 +626,8 @@ class App {
 
   private syncBreakpoints(s: Session): void {
     s.m.breakpoints.clear();
+    for (const a of s.addrBps) s.m.breakpoints.add(a);
+    if (this.tempBp && this.tempBp.i === s.i) s.m.breakpoints.add(this.tempBp.lin);
     if (!s.program || s.dirty) return;
     for (const l of this.editor.breakpointLines(s.model)) {
       const addrs = s.program.lineToAddrs.get(l);
@@ -628,7 +730,7 @@ class App {
     const s = this.cur;
     if (s.m.status === 'waiting') return;
     for (const x of this.live) x.snap = takeSnapshot(x.m);
-    const r = this.mode === 'dual' ? this.dual.step(this.active, false).reason : s.m.stepInto();
+    const r = this.mode === 'dual' ? this.dual.step(this.active, 'into').reason : s.m.stepInto();
     if (r === 'step' && s.m.breakpoints.has(s.m.linearIP)) {
       this.stop();
       s.m.message = '到达断点';
@@ -658,7 +760,7 @@ class App {
     this.render(true);
   }
 
-  step(over: boolean): void {
+  step(over: boolean | 'out'): void {
     if (this.run !== 'idle') this.pause();
     if (!this.ensureReady()) return;
     const s = this.cur;
@@ -667,10 +769,10 @@ class App {
     if (s.m.status === 'waiting') { this.setStatus(this.waitText(s), 'waiting'); s.screen.focus(); return; }
     for (const x of this.live) { this.syncBreakpoints(x); x.snap = takeSnapshot(x.m); }
     if (this.mode === 'dual') {
-      const d = this.dual.step(this.active, over);
+      const d = this.dual.step(this.active, over === 'out' ? 'out' : over ? 'over' : 'into');
       this.stopped(d.reason, d.who);
     } else {
-      this.stopped(over ? s.m.stepOver() : s.m.stepInto(), s.i);
+      this.stopped(over === 'out' ? s.m.stepOut() : over ? s.m.stepOver() : s.m.stepInto(), s.i);
     }
   }
 
@@ -695,6 +797,7 @@ class App {
 
   private stop(): void {
     this.run = 'idle';
+    if (this.tempBp) { const i = this.tempBp.i; this.tempBp = null; this.syncBreakpoints(this.sessions[i]); }
     for (const s of this.sessions) s.speaker.mute();
     clearInterval(this.animTimer);
     cancelAnimationFrame(this.raf);
@@ -708,6 +811,12 @@ class App {
   }
 
   private stopped(r: StopReason, who: number): void {
+    if (this.tempBp) {
+      const t = this.tempBp;
+      this.tempBp = null;
+      this.syncBreakpoints(this.sessions[t.i]);
+      if (r === 'breakpoint' && this.sessions[t.i].m.linearIP === t.lin) this.sessions[t.i].m.message = '已运行到指定位置';
+    }
     for (const x of this.sessions) x.speaker.mute();
     this.updateButtons();
     const s = this.sessions[who >= 0 ? who : this.active];
@@ -781,7 +890,7 @@ class App {
   render(full: boolean): void {
     const s = this.cur, m = s.m;
     const line = s.program && !s.dirty ? s.program.addrToLine.get(m.linearIP) ?? null : null;
-    const info = line ? `第 ${line} 行` : s.program ? (m.inBios() ? 'BIOS/DOS 内部' : '') : '';
+    const info = line ? `第 ${line} 行` : s.program && m.status !== 'empty' ? `${m.inBios() ? 'BIOS/DOS：' : ''}${currentInstruction(m).text}` : '';
     $('cpu-title').textContent = this.mode === 'dual' ? `${s.tag} 机寄存器` : '寄存器';
     this.regs.render(m.cpu, s.snap, info);
     this.stack.setProgram(s.program);
@@ -805,6 +914,7 @@ class App {
     switch (this.tab) {
       case 'vars': this.vars.render(s.m, s.snap); break;
       case 'memory': this.memory.render(s.m, s.snap); break;
+      case 'disasm': this.disasm.render(s.m, s.m.breakpoints); break;
       case 'serial': this.renderSerial(); break;
       case 'messages': this.renderMessages(); break;
       case 'files': this.renderFiles(); break;
@@ -951,6 +1061,13 @@ class App {
     if (dh) return [`**${word.toUpperCase()}**：${dh}`];
     return null;
   }
+}
+
+/** data-reg 标识 -> 寄存器名 */
+function regName(key: string): string {
+  if (key === 'ip') return 'IP';
+  if (key === 'flags') return 'FLAGS';
+  return (key[0] === 'r' ? ['AX', 'CX', 'DX', 'BX', 'SP', 'BP', 'SI', 'DI'] : ['ES', 'CS', 'SS', 'DS'])[+key.slice(1)] ?? key;
 }
 
 function statusName(st: string): string {

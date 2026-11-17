@@ -403,3 +403,62 @@ describe('PC 喇叭', () => {
     expect(notes[notes.length - 1].f).toBe(0);
   });
 });
+
+describe('跳出子程序', () => {
+  const SRC = `
+.model small
+.stack 100h
+.code
+start:  mov ax, 1
+        call outer
+        mov bx, 2           ; 第 7 行：从 outer 跳出后应停在这里
+        mov ah, 4ch
+        int 21h
+outer   proc
+        push bx
+        pop bx
+        call inner          ; 第 13 行
+        push cx
+        call inner
+        pop cx              ; 第 16 行
+        ret
+outer   endp
+inner   proc
+        nop                 ; 第 20 行
+        ret
+inner   endp
+end start`;
+
+  it('从子程序中间跳出，嵌套调用和 PUSH/POP 不影响判断', () => {
+    const m = load(SRC);
+    const p = m.program!;
+    const line = () => p.addrToLine.get(m.linearIP);
+    m.stepInto(); m.stepInto();             // mov ax / call outer
+    expect(line()).toBe(11);
+    m.stepInto(); m.stepInto();             // push bx / pop bx
+    expect(line()).toBe(13);
+    m.stepOut();
+    expect(line()).toBe(7);
+    expect(m.cpu.r[AX]).toBe(1);
+  });
+
+  it('从内层子程序跳出到外层', () => {
+    const m = load(SRC);
+    const p = m.program!;
+    const line = () => p.addrToLine.get(m.linearIP);
+    m.breakpoints.add(p.lineToAddrs.get(20)![0]);
+    m.run(100000);                          // 停在 inner 的 nop
+    expect(line()).toBe(20);
+    m.stepOut();
+    expect(line()).toBe(14);                // 第一次调用 inner 之后
+  });
+
+  it('后退可以撤销修改寄存器', () => {
+    const m = load(SRC);
+    m.stepInto();
+    m.poke(() => { m.cpu.r[AX] = 0x1234; });
+    expect(m.cpu.r[AX]).toBe(0x1234);
+    m.stepBack();
+    expect(m.cpu.r[AX]).toBe(1);
+  });
+});

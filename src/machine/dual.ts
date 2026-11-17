@@ -79,9 +79,9 @@ export class DualMachine {
   }
 
   /** 单步调试其中一台；另一台同步运行到相同的虚拟时间 */
-  step(who: number, over: boolean): DualStop {
+  step(who: number, how: 'into' | 'over' | 'out'): DualStop {
     const me = this.m[who], other = this.m[1 - who];
-    const r = over ? me.stepOver() : me.stepInto();
+    const r = how === 'over' ? me.stepOver() : how === 'out' ? me.stepOut() : me.stepInto();
     this.catchUp(other, me.clock);
     return { reason: r, who };
   }

@@ -67,6 +67,10 @@ export class CPU {
   waiting = false;
   /** 上一步是一个尚未完成的 REP 串操作迭代 */
   repContinue = false;
+  /** 上一步是进入硬件中断（没有执行 CS:IP 处的指令） */
+  irqTaken = false;
+  /** 进入中断的总次数（INT 指令、异常、硬件中断） */
+  interrupts = 0;
   /** 已执行的指令步数 */
   steps = 0;
 
@@ -160,6 +164,7 @@ export class CPU {
 
   /** 进入中断：压入 FLAGS、CS、IP，清 IF/TF，从中断向量表取新的 CS:IP */
   interrupt(n: number): void {
+    this.interrupts++;
     this.push(this.flags);
     this.flags &= ~(IF | TF);
     this.push(this.s[CS]);
@@ -454,7 +459,9 @@ export class CPU {
 
   step(): void {
     this.repContinue = false;
+    this.irqTaken = false;
     if (!this.inhibitIrq && this.flags & IF && this.irq && this.irq.pending()) {
+      this.irqTaken = true;
       this.interrupt(this.irq.ack());
       this.steps++;
       return;

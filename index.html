@@ -38,9 +38,10 @@
         </select>
       </div>
       <div class="group">
-        <button id="btn-back" title="后退一步 (Shift+F11)">⟲ 后退</button>
+        <button id="btn-back" title="后退一步 (Ctrl+Shift+F11)">⟲ 后退</button>
         <button id="btn-step" title="单步进入 (F11)">↓ 单步</button>
         <button id="btn-over" title="单步跳过：CALL / INT / LOOP 整体执行 (F10)">↷ 跳过</button>
+        <button id="btn-out" title="跳出：运行到当前子程序返回为止 (Shift+F11)">↑ 跳出</button>
         <button id="btn-reset" title="重新开始 (Ctrl+F5)">⟳ 重启</button>
       </div>
       <div class="group">
@@ -95,6 +96,7 @@
         <div class="tabs">
           <button data-tab="vars" class="active">变量</button>
           <button data-tab="memory">内存</button>
+          <button data-tab="disasm">反汇编</button>
           <button data-tab="serial">串口</button>
           <button data-tab="messages">消息 <span id="msg-count"></span></button>
           <button data-tab="files">虚拟磁盘</button>
@@ -108,6 +110,7 @@
           </div>
           <div id="memory" class="mono"></div>
         </div>
+        <div class="tab-body hidden mono" id="tab-disasm"></div>
         <div class="tab-body hidden" id="tab-serial">
           <div class="serial-settings">
             <label>串口芯片

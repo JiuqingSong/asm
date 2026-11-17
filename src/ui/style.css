@@ -250,3 +250,24 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 #examples { width: 132px; }
 /* 中文显示：一个汉字占两个字符格 */
 .screen .row span.wide { display: inline-block; width: 2ch; text-align: center; overflow: hidden; vertical-align: top; height: 1.18em; }
+
+/* ---------- 反汇编 ---------- */
+#tab-disasm { font-size: 12.5px; }
+.dhead { padding: 4px 10px; color: var(--muted); font: 11.5px var(--ui); border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--panel); }
+.drow { display: grid; grid-template-columns: 14px auto 74px minmax(0, 1fr) auto; gap: 8px; padding: 0 10px 0 4px; white-space: nowrap; cursor: default; }
+.drow:hover { background: var(--panel-2); }
+.drow.cur { background: var(--cur-line); }
+.drow .dg { color: var(--bp); cursor: pointer; text-align: center; }
+.drow.cur .dg { color: var(--cur-glyph); }
+.drow.bp .dg { color: var(--bp); }
+.drow .da { color: var(--muted); }
+.drow .da b { color: var(--text); font-weight: 600; margin-right: 6px; }
+.drow .db { color: var(--muted); overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.drow .dt { overflow: hidden; text-overflow: ellipsis; }
+.drow .dn { color: var(--accent); }
+.drow.odd .dt { color: var(--warn); }
+.drow .dl a { color: var(--accent); cursor: pointer; font: 11.5px var(--ui); }
+/* 在寄存器上直接修改 */
+#regs .cell, #regs .reg, #flags .flag { cursor: pointer; }
+.reg-edit { position: absolute; inset: 0; width: 100%; height: 100%; font: 15px var(--mono); text-align: center; border: 2px solid var(--accent); border-radius: 5px; background: var(--panel); color: var(--text); padding: 0; }
+#regs .reg { position: relative; }

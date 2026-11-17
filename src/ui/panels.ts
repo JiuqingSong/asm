@@ -66,18 +66,20 @@ export class RegisterPanel {
       const v = r[i], pv = prev ? prev.r[i] : v;
       const hiCh = (v >> 8) !== (pv >> 8), loCh = (v & 0xff) !== (pv & 0xff);
       const c = el('div', 'cell' + (hiCh || loCh ? ' changed' : ''));
+      c.dataset.reg = 'r' + i;
       c.title = `${tip}\n${v}（有符号 ${(v << 16) >> 16}）\n二进制 ${v.toString(2).padStart(16, '0').replace(/(.{4})/g, '$1 ').trim()}`;
       c.innerHTML = `<div class="name"><span>${name[0]}H</span><span>${name}</span><span>${name[0]}L</span></div>` +
         `<div class="halves"><span class="${hiCh ? 'changed' : ''}">${h2(v >> 8)}</span><span class="${loCh ? 'changed' : ''}">${h2(v)}</span></div>` +
         `<div class="dec">${v}</div>`;
       cells.appendChild(c);
     }
-    const line = (list: [string, number, string][], arr: Uint16Array, parr: Uint16Array | null) => {
+    const line = (list: [string, number, string][], arr: Uint16Array, parr: Uint16Array | null, kind = 'r') => {
       const d = el('div', 'regline');
       for (const [name, i, tip] of list) {
         const ch = parr && parr[i] !== arr[i];
         const e = el('div', 'reg' + (ch ? ' changed' : ''), `<b>${name}</b><span>${h4(arr[i])}</span>`);
         e.title = `${tip}\n${arr[i]}`;
+        e.dataset.reg = kind + i;
         d.appendChild(e);
       }
       return d;
@@ -85,15 +87,19 @@ export class RegisterPanel {
     const ipCh = prev && prev.ip !== cpu.ip;
     const flCh = prev && prev.flags !== cpu.flags;
     const misc = el('div', 'regline');
-    misc.appendChild(Object.assign(el('div', 'reg wide' + (ipCh ? ' changed' : ''), `<b>IP</b><span>${h4(cpu.ip)}</span>`), { title: '指令指针：下一条要执行的指令 CS:IP' }));
-    misc.appendChild(Object.assign(el('div', 'reg wide' + (flCh ? ' changed' : ''), `<b>FLAGS</b><span>${h4(cpu.flags)}</span>`), { title: '标志寄存器' }));
-    this.regsEl.replaceChildren(cells, line(IDX, r, prev?.r ?? null), line(SEGS, cpu.s, prev?.s ?? null), misc);
+    const ipEl = Object.assign(el('div', 'reg wide' + (ipCh ? ' changed' : ''), `<b>IP</b><span>${h4(cpu.ip)}</span>`), { title: '指令指针：下一条要执行的指令 CS:IP' });
+    const flEl = Object.assign(el('div', 'reg wide' + (flCh ? ' changed' : ''), `<b>FLAGS</b><span>${h4(cpu.flags)}</span>`), { title: '标志寄存器' });
+    ipEl.dataset.reg = 'ip';
+    flEl.dataset.reg = 'flags';
+    misc.append(ipEl, flEl);
+    this.regsEl.replaceChildren(cells, line(IDX, r, prev?.r ?? null), line(SEGS, cpu.s, prev?.s ?? null, 's'), misc);
 
     this.flagsEl.replaceChildren();
     for (const [name, mask, tip] of FLAGS) {
       const on = (cpu.flags & mask) !== 0;
       const ch = prev && ((prev.flags ^ cpu.flags) & mask);
       const f = el('div', 'flag' + (on ? ' on' : '') + (ch ? ' changed' : ''), `<b>${name}</b>${on ? 1 : 0}`);
+      f.dataset.flag = String(mask);
       f.title = tip;
       this.flagsEl.appendChild(f);
     }

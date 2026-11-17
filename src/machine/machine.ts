@@ -149,7 +149,7 @@ export class Machine {
   private instrLen = new Map<number, number>();
   private breakRequest = '';
   private wildWarned = false;
-  private pending: { kind: 'step' } | { kind: 'over'; cs: number; ip: number; sp: number } | { kind: 'run' } | null = null;
+  private pending: { kind: 'step' } | { kind: 'over'; cs: number; ip: number; sp: number } | { kind: 'out'; depth: number } | { kind: 'run' } | null = null;
   private port61 = 0;
   /** PC 喇叭当前的频率（Hz），0 表示不响 */
   speakerFreq = 0;
@@ -514,6 +514,38 @@ export class Machine {
     return this.continuePending(2_000_000);
   }
 
+  /** CS:IP 处的指令是调用还是返回（跳过前缀） */
+  private callKind(): 'call' | 'ret' | '' {
+    const cs = this.cpu.s[CS];
+    let ip = this.cpu.ip, op = 0;
+    for (let k = 0; k < 8; k++) {
+      op = this.cpu.rb(cs, ip);
+      if (![0x26, 0x2e, 0x36, 0x3e, 0xf0, 0xf1, 0xf2, 0xf3].includes(op)) break;
+      ip = (ip + 1) & 0xffff;
+    }
+    if (op === 0xe8 || op === 0x9a) return 'call';
+    if (op === 0xff) { const reg = (this.cpu.rb(cs, ip + 1) >> 3) & 7; return reg === 2 || reg === 3 ? 'call' : ''; }
+    if ((op >= 0xc0 && op <= 0xc3) || (op >= 0xc8 && op <= 0xcb) || op === 0xcf) return 'ret';
+    return '';
+  }
+
+  /**
+   * 跳出：一直运行到当前子程序（或中断处理程序）返回为止。
+   * 用"调用深度"判断：CALL 和进入中断加 1，RET/IRET 减 1，变成负数就是从当前子程序返回了。
+   */
+  stepOut(): StopReason {
+    if (!this.canRun()) return this.status === 'exited' ? 'exit' : 'error';
+    this.pending = { kind: 'out', depth: 0 };
+    this.message = '';
+    return this.continuePending(50_000_000);
+  }
+
+  /** 修改寄存器、标志位或内存：记入历史，"后退"可以撤销 */
+  poke(fn: () => void): void {
+    if (this.history.enabled) this.history.begin(this.cpu, H_VISIBLE);
+    fn();
+  }
+
   /** 单步（跳过）：CALL、INT、REP 串操作和 LOOP 整体执行 */
   stepOver(): StopReason {
     if (!this.canRun()) return this.status === 'exited' ? 'exit' : 'error';
@@ -562,13 +594,20 @@ export class Machine {
 
   /** 继续执行尚未完成的单步/跳过/运行（例如等到按键之后） */
   continuePending(budget: number, untilClock = Infinity): StopReason {
-    const p = this.pending;
+    let p = this.pending;
     if (!p) return 'paused';
     const cpu = this.cpu;
     if (this.status !== 'running') this.status = p.kind === 'run' ? 'running' : 'paused';
     for (let n = 0; n < budget; n++) {
       if (p.kind === 'run' && this.clock >= untilClock) return 'budget';
-      if (n > 0 || p.kind === 'run') {
+      if (p.kind === 'out') {
+        if (n > 0 && !this.inBios() && !cpu.repContinue && this.breakpoints.has(this.linearIP)) return this.stopAt('breakpoint');
+        const kind = this.callKind(), ints = cpu.interrupts;
+        this.exec1();
+        if (!cpu.irqTaken) p.depth += kind === 'call' ? 1 : kind === 'ret' ? -1 : 0;
+        p.depth += cpu.interrupts - ints;
+        if (p.depth < 0) p = this.pending = { kind: 'step' }; // 已经返回：再走出 BIOS 代码就停
+      } else if (n > 0 || p.kind === 'run') {
         // 是否已到达停止点
         if (p.kind === 'step' && !this.inBios() && !cpu.repContinue && !cpu.waiting) return this.stopAt('step');
         if (p.kind === 'over' && cpu.s[CS] === p.cs && cpu.ip === p.ip && cpu.r[SP] >= p.sp && !cpu.repContinue) return this.stopAt('step');
