@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AsmPerfect 86</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23306998'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='14' font-weight='bold' fill='white' text-anchor='middle'%3E86%3C/text%3E%3C/svg%3E" />
+</head>
+<body>
+  <div id="app">
+    <header class="toolbar">
+      <div class="brand">AsmPerfect <span>86</span></div>
+      <div class="group">
+        <select id="examples" title="打开示例程序">
+          <option value="">示例程序…</option>
+        </select>
+        <button id="btn-open" title="打开 .asm 文件">打开</button>
+        <button id="btn-save" title="保存为 .asm 文件">保存</button>
+      </div>
+      <div class="group">
+        <button id="btn-assemble" title="汇编并装载 (F7)">汇编</button>
+        <button id="btn-run" class="primary" title="运行 (F5)">▶ 运行</button>
+        <button id="btn-pause" title="暂停 (F6)">❚❚ 暂停</button>
+        <select id="speed" title="运行速度">
+          <option value="0">全速</option>
+          <option value="100">每秒 100 步</option>
+          <option value="20">每秒 20 步</option>
+          <option value="5">每秒 5 步</option>
+          <option value="1">每秒 1 步</option>
+        </select>
+      </div>
+      <div class="group">
+        <button id="btn-back" title="后退一步 (Shift+F11)">⟲ 后退</button>
+        <button id="btn-step" title="单步进入 (F11)">↓ 单步</button>
+        <button id="btn-over" title="单步跳过：CALL / INT / LOOP 整体执行 (F10)">↷ 跳过</button>
+        <button id="btn-reset" title="重新开始 (Ctrl+F5)">⟳ 重启</button>
+      </div>
+      <div class="group">
+        <label class="check" title="在每行代码后面显示地址和机器码"><input type="checkbox" id="show-bytes" /> 机器码</label>
+      </div>
+      <div class="spacer"></div>
+      <div id="status" class="status">就绪</div>
+    </header>
+
+    <main class="layout">
+      <section class="pane editor-pane">
+        <div class="pane-head">
+          <span id="file-name">未命名.asm</span>
+          <span id="dirty-note" class="note"></span>
+        </div>
+        <div id="editor"></div>
+      </section>
+
+      <section class="pane screen-pane">
+        <div class="pane-head">
+          <span>DOS 屏幕</span>
+          <span class="note">点击屏幕后可以直接用键盘输入</span>
+          <span class="spacer"></span>
+          <input id="cmdline" placeholder="命令行参数" title="程序的命令行参数（PSP:81h）" />
+        </div>
+        <div id="screen-wrap"><div id="screen" tabindex="0"></div></div>
+      </section>
+
+      <section class="pane cpu-pane">
+        <div class="pane-head"><span>寄存器</span><span class="spacer"></span><span id="cs-ip" class="mono note"></span></div>
+        <div id="regs"></div>
+        <div id="flags"></div>
+        <div class="pane-head sub"><span>栈</span><span class="spacer"></span><span id="stack-note" class="mono note"></span></div>
+        <div id="stack"></div>
+      </section>
+
+      <section class="pane info-pane">
+        <div class="tabs">
+          <button data-tab="vars" class="active">变量</button>
+          <button data-tab="memory">内存</button>
+          <button data-tab="messages">消息 <span id="msg-count"></span></button>
+          <button data-tab="files">虚拟磁盘</button>
+        </div>
+        <div class="tab-body" id="tab-vars"></div>
+        <div class="tab-body hidden" id="tab-memory">
+          <div class="mem-bar">
+            <button id="mem-prev" title="上一页">◀</button>
+            <input id="mem-addr" class="mono" value="DS:0000" title="地址：段:偏移，也可以写变量名或 ES:DI 之类的寄存器" />
+            <button id="mem-next" title="下一页">▶</button>
+
+          </div>
+          <div id="memory" class="mono"></div>
+        </div>
+        <div class="tab-body hidden" id="tab-messages"></div>
+        <div class="tab-body hidden" id="tab-files">
+          <div class="mem-bar">
+            <button id="file-upload">上传文件到虚拟磁盘</button>
+          </div>
+          <div id="files"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <input type="file" id="file-input" accept=".asm,.inc,.txt" hidden />
+  <input type="file" id="disk-input" hidden multiple />
+  <script type="module" src="/src/ui/main.ts"></script>
+</body>
+</html>
