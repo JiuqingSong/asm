@@ -19,6 +19,7 @@
 | 部署 | 家庭服务器 Docker，`release.bat` 一键发布 | 发布脚本核对线上版本号 |
 | 调试器 | 反汇编视图（真机测试集 96,900 条指令长度全对；往返对照）、跳出、运行到光标处、修改寄存器和标志位 | 测试 + 浏览器检查脚本 `tools/ui-debug.mjs` |
 | 图形模式 | VGA 13h（256 色、调色板端口）、CGA 04h/05h/06h、BIOS 写点/读点、图形模式下的文字（内置 8×8 点阵） | 示例"VGA 256 色""画线"；`tools/ui-gfx.mjs` |
+| EGA/VGA 平面模式 | 0Dh、0Eh、10h、12h：4 个平面在 `Video.planar` 里，CPU 读写 A000 段经 `cpu.mmio` 交给图形控制器；属性控制器调色板 → DAC；反向执行能撤销平面写入；鼠标范围随模式变化。用户的 Turbo Pascal + EGAVGA.BGI 程序（中文界面、鼠标）能正常运行 | 测试 + `tools/ui-bgi.mjs`、`tools/run-exe.ts <EXE> "" <条数> <截图.png>` |
 | 鼠标 | INT 33h 驱动：常用功能、事件回调（经 BIOS 桩代码远调用用户程序）、文本/图形光标；按键变化排队，至少保持 30 毫秒虚拟时间 | 测试 + `tools/ui-mouse.mjs` |
 | 运行 DOS 程序 | 虚拟磁盘上的 EXE/COM 直接运行；DOS 内存控制块链（48h/49h/4Ah）、环境变量块；中文显示（GBK + 制表符识别） | 1996 年的 QuickBASIC 程序 SCRMK.EXE（PKLITE 压缩）能运行并显示中文菜单 |
 
@@ -37,7 +38,7 @@
 
 ### 2. 图形模式（剩下的部分）
 
-13h、CGA 模式和鼠标（INT 33h，含事件回调）已经完成。还剩：EGA/VGA 的 16 色平面模式（0Dh、0Eh、10h、12h，需要模拟位平面和读写模式寄存器）、更多示例（例如用定时器驱动的小游戏）。
+13h、CGA 模式、EGA/VGA 16 色平面模式和鼠标（INT 33h，含事件回调）已经完成。还剩：更多示例（例如用定时器驱动的小游戏、平面模式的汇编示例）、CRTC 起始地址（翻页/硬件卷屏）、8×14/8×16 的 ROM 字库（现在把 8×8 字形放大）。
 
 ### 3. 8255 虚拟实验面板
 
@@ -98,7 +99,7 @@ tools/                  测试和检查脚本（见下）
 | 命令 | 什么时候跑 |
 |---|---|
 | `npx tsc --noEmit -p .` | 每次 |
-| `npm test` | 每次（34 个测试） |
+| `npm test` | 每次（80 个测试） |
 | `npm run test:cpu` | 改了 `src/cpu/`（需要 `test-data/8088/`，约 730MB，不在仓库里） |
 | `node tools/ml-compare.ts tests/ml/*.asm ../send.asm ../receive.asm` | 改了汇编器（需要 ML.EXE：默认 `../bin/ML.EXE`，或用 `ML_EXE` 指定） |
 | `node tools/ui-check.mjs <截图目录>` | 改了界面（需要 `npm run dev -- --port 5317`，用本机 Chrome） |
@@ -108,7 +109,8 @@ tools/                  测试和检查脚本（见下）
 | `node tools/ui-gfx.mjs <截图目录>` | 改了图形模式 |
 | `node tools/ui-mouse.mjs <截图目录>` | 改了鼠标 |
 | `node tools/disasm-check.ts` | 改了反汇编器（需要 test-data/8088/） |
-| `node tools/run-exe.ts <EXE>` | 看一个 DOS 程序用到了哪些中断、端口和没实现的功能 |
+| `node tools/run-exe.ts <EXE> [命令行] [条数] [截图.png]` | 看一个 DOS 程序用到了哪些中断、端口和没实现的功能；同目录的文件放进虚拟磁盘，图形模式可存截图 |
+| `node tools/ui-bgi.mjs <截图目录> <EXE> [x,y ...]` | 改了平面模式：在浏览器里运行 BGI 图形程序并单击（用户的 D:OLDgraphdmoGRAPHDMO.EXE，不提交） |
 
 新功能要加测试；新的汇编语法要在 `tests/ml/` 加一个 ML 对照程序。
 

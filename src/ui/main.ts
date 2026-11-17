@@ -90,7 +90,7 @@ class App {
       s.screen.onKey = e => this.key(s, e);
       s.screen.onMouse = (fx, fy, buttons) => {
         if (!s.program || (s.dirty && !s.binary)) return;
-        s.m.mouse.moveTo(fx * 640, fy * 200);
+        s.m.mouse.moveTo(fx * 640, fy * s.m.mouse.screenH);
         s.m.mouse.queueButtons(buttons, s.m.clock);
         if (this.run === 'idle') {
           const mem = s.m.mem, bda = 0x400;

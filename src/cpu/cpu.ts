@@ -56,6 +56,8 @@ export class CPU {
   trap: TrapHandler | null = null;
   /** 内存写入钩子（用于反向执行的历史记录）：参数为线性地址和写入前的旧值 */
   onWrite: ((addr: number, old: number) => void) | null = null;
+  /** 显卡显存（EGA/VGA 平面模式时 A0000~AFFFF 的读写交给它；参数是段内偏移） */
+  mmio: { read(off: number): number; write(off: number, v: number): void } | null = null;
 
   halted = false;
   /**
@@ -92,13 +94,16 @@ export class CPU {
   // ================= 内存访问 =================
 
   rb(seg: number, off: number): number {
-    return this.mem[((seg << 4) + (off & 0xffff)) & 0xfffff];
+    const a = ((seg << 4) + (off & 0xffff)) & 0xfffff;
+    if (this.mmio !== null && (a & 0xf0000) === 0xa0000) return this.mmio.read(a & 0xffff);
+    return this.mem[a];
   }
   rw(seg: number, off: number): number {
     return this.rb(seg, off) | (this.rb(seg, off + 1) << 8);
   }
   wb(seg: number, off: number, v: number): void {
     const a = ((seg << 4) + (off & 0xffff)) & 0xfffff;
+    if (this.mmio !== null && (a & 0xf0000) === 0xa0000) { this.mmio.write(a & 0xffff, v & 0xff); return; }
     if (this.onWrite) this.onWrite(a, this.mem[a]);
     this.mem[a] = v & 0xff;
   }

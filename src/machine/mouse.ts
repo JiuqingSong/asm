@@ -1,3 +1,4 @@
+import { modeInfo } from './video.ts';
 // 鼠标驱动（INT 33h），按微软鼠标驱动的接口
 //
 // 坐标是驱动的"虚拟屏幕"坐标：水平 0~639，垂直 0~199（文本模式下每个字符 8×8；
@@ -76,7 +77,7 @@ export class Mouse {
 
   /** 装载新程序时：完全恢复初始状态 */
   powerOn(): void {
-    this.minX = 0; this.maxX = 639; this.minY = 0; this.maxY = 199;
+    this.minX = 0; this.maxX = 639; this.minY = 0; this.maxY = 199; this.screenH = 200;
     this.buttons = 0;
     this.queue = [];
     this.lastChange = -Infinity;
@@ -222,9 +223,21 @@ export class Mouse {
   }
 
   /** 按显示模式设置默认的活动范围 */
+  /** 驱动的虚拟屏幕高度：200 行的模式（包括文本模式）是 200，10h 是 350，12h 是 480 */
+  screenH = 200;
+
   private setDefaultRange(mode: number): void {
+    const vi = modeInfo(mode);
+    this.screenH = vi.graphics && vi.height > 200 ? vi.height : 200;
     this.minX = 0; this.minY = 0;
-    this.maxX = mode === 0x00 || mode === 0x01 ? 639 : 639;
-    this.maxY = 199;
+    this.maxX = 639;
+    this.maxY = this.screenH - 1;
+  }
+
+  /** 程序用 INT 10h 切换了显示模式：和真的鼠标驱动一样，按新模式重设移动范围 */
+  modeChanged(mode: number): void {
+    this.setDefaultRange(mode);
+    this.clamp();
+    this.version++;
   }
 }

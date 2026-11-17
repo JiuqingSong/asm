@@ -654,3 +654,96 @@ describe('鼠标画图示例', () => {
     expect(m.mem[0x449]).toBe(3);
   });
 });
+
+describe('VGA 平面模式（12h）', () => {
+  const PROG = `
+.model small
+.stack 100h
+.code
+start:  mov ax, 12h
+        int 10h
+        mov ax, 0A000h
+        mov es, ax
+        ; 写模式 2，位屏蔽只留最左边的像素：(0,0) 写成颜色 12
+        mov dx, 3CEh
+        mov ax, 0205h
+        out dx, ax
+        mov ax, 8008h
+        out dx, ax
+        mov al, es:[0]          ; 先读一下，装入锁存器
+        mov byte ptr es:[0], 0Ch
+        ; 写模式 0 + 置位/复位：第 1 行最左边 8 个像素都写成颜色 9
+        mov ax, 0005h
+        out dx, ax
+        mov ax, 0FF08h
+        out dx, ax
+        mov ax, 0F01h
+        out dx, ax
+        mov ax, 0900h
+        out dx, ax
+        mov byte ptr es:[80], 0
+        mov ax, 0001h
+        out dx, ax
+        ; 读模式 1：和颜色 9 比较，8 个像素都相同
+        mov ax, 0805h
+        out dx, ax
+        mov ax, 0902h
+        out dx, ax
+        mov bl, es:[80]
+        mov ax, 0005h
+        out dx, ax
+        ; BIOS 写点、读点
+        mov ah, 0Ch
+        mov al, 14
+        mov cx, 639
+        mov dx, 479
+        int 10h
+        mov ah, 0Dh
+        mov cx, 0
+        mov dx, 0
+        int 10h
+        cmp bl, 0FFh
+        je ok
+        mov al, 0EEh
+ok:     mov ah, 4ch
+        int 21h
+end start`;
+
+  it('写模式 0/2、置位/复位、位屏蔽、读模式 1 和 BIOS 写点读点', () => {
+    const m = load(PROG);
+    runToEnd(m);
+    const pl = m.video.planar;
+    expect(m.exitCode).toBe(12);                       // BIOS 读回 (0,0) 的颜色
+    expect(pl.pixel(0, 0)).toBe(12);
+    expect(pl.pixel(0, 1)).toBe(0);                    // 位屏蔽之外的像素没变
+    for (let b = 0; b < 8; b++) expect(pl.pixel(80, b)).toBe(9);
+    expect(pl.pixel(479 * 80 + 79, 7)).toBe(14);       // (639,479)
+    expect(m.mem[0xa0000]).toBe(0);                    // 平面里的数据不在普通内存里
+    expect(m.mem[0x484]).toBe(29);                     // 30 行文字
+  });
+
+  it('反向执行能撤销对平面的写入', () => {
+    const m = load(PROG);
+    runToEnd(m);
+    for (let k = 0; k < 200 && m.video.planar.pixel(0, 0) !== 0; k++) m.stepBack();
+    expect(m.video.planar.pixel(0, 0)).toBe(0);
+  });
+
+  it('切换到 12h 后鼠标的移动范围是 640×480', () => {
+    const m = load(`
+.model small
+.stack 100h
+.code
+start:  mov ax, 0
+        int 33h
+        mov ax, 12h
+        int 10h
+        mov ax, 4c00h
+        int 21h
+end start`);
+    runToEnd(m);
+    expect(m.mouse.maxY).toBe(479);
+    m.mouse.moveTo(600, 470);
+    expect([m.mouse.x, m.mouse.y]).toEqual([600, 470]);
+  });
+});

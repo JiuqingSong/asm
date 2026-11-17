@@ -72,7 +72,7 @@ class History {
   }
 
   /** 撤销最近一条记录；返回该记录的标志（-1 表示没有记录） */
-  undo(cpu: CPU): number {
+  undo(cpu: CPU, restore: (addr: number, old: number) => void): number {
     if (this.count === 0) return -1;
     this.head--;
     this.count--;
@@ -80,7 +80,9 @@ class History {
     const start = this.wstart[i];
     for (let w = this.wpos - 1; w >= start; w--) {
       const j = w % this.wcap;
-      cpu.mem[this.waddr[j]] = this.wold[j];
+      const a = this.waddr[j];
+      if (a >= 0x100000) restore(a - 0x100000, this.wold[j]); // 显卡平面里的字节
+      else cpu.mem[a] = this.wold[j];
     }
     this.wpos = start;
     const o = i * 16, r = this.regs;
@@ -192,6 +194,7 @@ export class Machine {
     cpu.trap = (n) => this.hle.handle(n);
     this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
+    this.video.planar.onWrite = (a, old) => { if (this.history.enabled) this.history.write(0x100000 + a, old); };
     this.com1.onWarn = this.com2.onWarn = msg => this.log(msg);
   }
 
@@ -211,7 +214,8 @@ export class Machine {
           case 0x71: return this.cmosRead();
           case 0x3d4: return this.crtcIndex;
           case 0x3d5: return this.crtc[this.crtcIndex & 31];
-          case 0x3da: this.retrace ^= 0x09; return this.retrace;
+          case 0x3da: this.retrace ^= 0x09; this.video.resetAttrFlip(); return this.retrace;
+          case 0xf0: case 0xf1: return 0xff; // 数学协处理器（没有）
           case 0x3c6: case 0x3c7: case 0x3c8: case 0x3c9: case 0x3d9: return this.video.in8(port);
         }
         this.unknownPort(port, '读');
@@ -230,10 +234,11 @@ export class Machine {
           case 0x40: case 0x41: case 0x42: case 0x43: this.pit.out8(port, v); return;
           case 0x61: this.port61 = v; this.updateSpeaker(); return;
           case 0x70: this.cmosIndex = v & 0x7f; return;
+          case 0xf0: case 0xf1: return; // 数学协处理器的复位端口：Turbo Pascal 等检测协处理器时会写
           case 0x3d4: this.crtcIndex = v; return;
           case 0x3d5: {
             this.crtc[this.crtcIndex & 31] = v;
-            if (this.crtcIndex === 0x0e || this.crtcIndex === 0x0f) {
+            if ((this.crtcIndex === 0x0e || this.crtcIndex === 0x0f) && !this.cpu.mmio && this.mem[0x449] <= 3) {
               const pos = (this.crtc[0x0e] << 8) | this.crtc[0x0f];
               this.hle.setCursor(Math.floor(pos / 80) % 25, pos % 80);
             }
@@ -415,6 +420,7 @@ export class Machine {
     this.kbd.clear();
     this.clock = 0;
     this.video.reset();
+    cpu.mmio = null;
     this.mouse.powerOn();
     this.com1.reset();
     this.com2.reset();
@@ -676,7 +682,7 @@ export class Machine {
     if (!this.program) return false;
     let any = false;
     for (;;) {
-      const f = this.history.undo(this.cpu);
+      const f = this.history.undo(this.cpu, (a, old) => this.video.planar.restore(a, old));
       if (f < 0) break;
       any = true;
       if (f & H_VISIBLE) break;

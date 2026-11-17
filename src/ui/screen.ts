@@ -275,6 +275,11 @@ export class Screen {
           const k = (i & video.pelMask) * 3;
           this.rgba[i] = pack(video.dac[k], video.dac[k + 1], video.dac[k + 2]);
         }
+      } else if (info.planar) {
+        for (let i = 0; i < 16; i++) {
+          const k = (video.dacIndex(i) & video.pelMask) * 3;
+          this.rgba[i] = pack(video.dac[k], video.dac[k + 1], video.dac[k + 2]);
+        }
       } else if (mode === 0x06) {
         this.rgba[0] = pack(0, 0, 0); this.rgba[1] = pack(63, 63, 63);
       } else {
@@ -286,6 +291,14 @@ export class Screen {
     if (mode === 0x13) {
       const base = 0xa0000;
       for (let i = 0; i < 64000; i++) px[i] = this.rgba[mem[base + i]];
+    } else if (info.planar) {
+      // 4 个平面的同一位拼成颜色号；每个字节 8 个像素，最高位在左边
+      const [p0, p1, p2, p3] = video.planar.planes, rgba = this.rgba;
+      const bytes = (width >> 3) * height;
+      for (let o = 0, i = 0; o < bytes; o++) {
+        const b0 = p0[o], b1 = p1[o], b2 = p2[o], b3 = p3[o];
+        for (let s = 7; s >= 0; s--) px[i++] = rgba[((b0 >> s) & 1) | (((b1 >> s) & 1) << 1) | (((b2 >> s) & 1) << 2) | (((b3 >> s) & 1) << 3)];
+      }
     } else {
       const base = 0xb8000;
       const ppb = mode === 0x06 ? 8 : 4, bits = mode === 0x06 ? 1 : 2, mask = (1 << bits) - 1;
@@ -297,7 +310,7 @@ export class Screen {
         }
       }
     }
-    if (mouse) this.drawGfxCursor(px, mem, mode, mouse);
+    if (mouse) this.drawGfxCursor(px, mem, mode, mouse, video);
     this.ctx.putImageData(this.image, 0, 0);
   }
 
@@ -310,11 +323,11 @@ export class Screen {
   }
 
   /** 在图形画面上叠加鼠标光标（16×16 的屏幕掩码和光标掩码） */
-  private drawGfxCursor(px: Uint32Array, mem: Uint8Array, mode: number, mouse: Mouse): void {
-    const { width, height } = modeInfo(mode);
+  private drawGfxCursor(px: Uint32Array, mem: Uint8Array, mode: number, mouse: Mouse, video: Video): void {
+    const { width, height, planar } = modeInfo(mode);
     const half = width === 320; // 320 像素宽的模式里，驱动的 x 坐标是像素的 2 倍
     const cx = (half ? mouse.x >> 1 : mouse.x) - mouse.hotX, cy = mouse.y - mouse.hotY;
-    const white = mode === 0x13 ? 15 : mode === 0x06 ? 1 : 3;
+    const white = mode === 0x13 || planar ? 15 : mode === 0x06 ? 1 : 3;
     for (let r = 0; r < 16; r++) {
       const y = cy + r;
       if (y < 0 || y >= height) continue;
@@ -325,6 +338,7 @@ export class Screen {
         if (s && !k) continue;
         let idx: number;
         if (mode === 0x13) idx = mem[0xa0000 + y * 320 + x];
+        else if (planar) idx = video.planar.pixel(y * (width >> 3) + (x >> 3), x & 7);
         else {
           const ppb = mode === 0x06 ? 8 : 4, bits = mode === 0x06 ? 1 : 2;
           const b = mem[0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb)];

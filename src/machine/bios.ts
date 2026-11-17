@@ -14,7 +14,6 @@ export const FONT_LO = 0xfa6e, FONT_HI = 0x0a00;
 
 const BDA = 0x40;
 
-const ROWS = 25;
 
 interface OpenFile { name: string; pos: number; data: number[]; write: boolean; dirty: boolean }
 
@@ -27,6 +26,8 @@ export class Hle {
   private warned = new Set<string>();
   /** 正在进行的磁盘操作结束的虚拟时间（-1 表示没有） */
   private busyUntil = -1;
+  /** 模拟 DOS 的磁盘缓冲区：最近读写过的扇区（文件名:扇区号），命中时几乎不花时间 */
+  private sectorCache = new Map<string, true>();
 
   constructor(m: Machine) {
     this.m = m;
@@ -36,6 +37,7 @@ export class Hle {
   reset(): void {
     this.line = null;
     this.busyUntil = -1;
+    this.sectorCache.clear();
     this.m.busy = false;
     this.handles.clear();
   }
@@ -45,13 +47,31 @@ export class Hle {
    * 期间中断保持开放（桩代码先执行了 STI），和真实的 DOS 等待磁盘时一样。
    */
   private spin(ms: number): boolean {
-    if (!this.m.diskLatency || ms <= 0) return true;
-    if (this.busyUntil < 0) this.busyUntil = this.m.clock + (ms * PIT_HZ) / 1000;
+    if (!this.m.diskLatency) return true;
+    if (this.busyUntil < 0) {
+      if (ms <= 0) return true;
+      this.busyUntil = this.m.clock + (ms * PIT_HZ) / 1000; // 截止时间只在第一次进入时确定
+    }
     if (this.m.clock < this.busyUntil) { this.m.busy = true; return false; }
     this.busyUntil = -1;
     this.m.busy = false;
     return true;
   }
+  /** 读写文件 n 字节要花的时间（毫秒）：不在缓冲区里的扇区按每个约 1 毫秒计，命中缓冲区只算 DOS 调用本身 */
+  private diskCost(f: OpenFile | undefined, n: number): number {
+    if (!f) return 0;
+    const first = Math.floor(f.pos / 512), last = Math.floor((f.pos + Math.max(n, 1) - 1) / 512);
+    let misses = 0;
+    for (let s = first; s <= last; s++) {
+      const key = f.name + ':' + s;
+      if (this.sectorCache.has(key)) this.sectorCache.delete(key);
+      else misses++;
+      this.sectorCache.set(key, true);
+    }
+    while (this.sectorCache.size > 40) this.sectorCache.delete(this.sectorCache.keys().next().value!); // DOS 的 BUFFERS=40
+    return misses ? 0.5 + misses * 0.5 : 0.01;
+  }
+
   busyRemaining(): number { return this.busyUntil < 0 ? 0 : Math.max(0, this.busyUntil - this.m.clock); }
 
   private warnOnce(msg: string): void {
@@ -213,6 +233,7 @@ export class Hle {
   private get mode(): number { return this.cpu.rb(BDA, 0x49); }
   private get vinfo(): ModeInfo { return modeInfo(this.mode); }
   private get cols(): number { return this.vinfo.cols; }
+  private get rows(): number { return this.vinfo.rows; }
 
   getCursor(): { row: number; col: number } {
     return { col: this.cpu.rb(BDA, 0x50), row: this.cpu.rb(BDA, 0x51) };
@@ -239,6 +260,7 @@ export class Hle {
   putPixel(x: number, y: number, color: number, xor = false): void {
     const vi = this.vinfo;
     if (!vi.graphics || x < 0 || y < 0 || x >= vi.width || y >= vi.height) return;
+    if (vi.planar) { this.m.video.planar.setPixel(y * (vi.width >> 3) + (x >> 3), x & 7, color & 15, xor); return; }
     const { off, shift, mask } = this.pixelAt(x, y);
     const old = this.cpu.rb(vi.seg, off);
     const c = (color & mask) << shift;
@@ -249,6 +271,7 @@ export class Hle {
   getPixel(x: number, y: number): number {
     const vi = this.vinfo;
     if (!vi.graphics || x < 0 || y < 0 || x >= vi.width || y >= vi.height) return 0;
+    if (vi.planar) return this.m.video.planar.pixel(y * (vi.width >> 3) + (x >> 3), x & 7);
     const { off, shift, mask } = this.pixelAt(x, y);
     return (this.cpu.rb(vi.seg, off) >> shift) & mask;
   }
@@ -258,13 +281,13 @@ export class Hle {
     const xor = this.mode !== 0x13 && (color & 0x80) !== 0;
     const vecNo = ch < 128 ? 0x43 : 0x1f;
     const tOff = this.cpu.rw(0, vecNo * 4), tSeg = this.cpu.rw(0, vecNo * 4 + 2);
-    const base = (ch & 0x7f) * 8;
-    for (let gy = 0; gy < 8; gy++) {
-      const bits = this.cpu.rb(tSeg, tOff + base + gy);
+    const base = (ch & 0x7f) * 8, h = this.vinfo.charH;
+    for (let gy = 0; gy < h; gy++) {
+      const bits = this.cpu.rb(tSeg, tOff + base + Math.floor((gy * 8) / h));
       for (let gx = 0; gx < 8; gx++) {
         const on = (bits >> (7 - gx)) & 1;
-        if (xor) { if (on) this.putPixel(col * 8 + gx, row * 8 + gy, color & 0x7f, true); }
-        else this.putPixel(col * 8 + gx, row * 8 + gy, on ? color : 0);
+        if (xor) { if (on) this.putPixel(col * 8 + gx, row * h + gy, color & 0x7f, true); }
+        else this.putPixel(col * 8 + gx, row * h + gy, on ? color : 0);
       }
     }
   }
@@ -272,13 +295,27 @@ export class Hle {
   /** 卷动一个窗口（文字坐标）；图形模式下按 8 像素一行卷动像素 */
   scroll(up: boolean, n: number, attr: number, r1: number, c1: number, r2: number, c2: number): void {
     const cpu = this.cpu, vi = this.vinfo, cols = this.cols;
-    r2 = Math.min(r2, ROWS - 1); c2 = Math.min(c2, cols - 1);
+    r2 = Math.min(r2, this.rows - 1); c2 = Math.min(c2, cols - 1);
     if (r1 > r2 || c1 > c2) return;
     const h = r2 - r1 + 1;
     if (n === 0 || n > h) n = h;
     if (vi.graphics) {
-      const y1 = r1 * 8, y2 = r2 * 8 + 7, x1 = c1 * 8, x2 = c2 * 8 + 7, dy = n * 8;
-      const fill = vi.bpp === 8 ? attr : 0;
+      const ch = vi.charH;
+      const y1 = r1 * ch, y2 = r2 * ch + ch - 1, x1 = c1 * 8, x2 = c2 * 8 + 7, dy = n * ch;
+      const fill = vi.bpp === 8 ? attr : vi.planar ? attr & 15 : 0;
+      if (vi.planar) {
+        // 平面模式：每个字符正好占每行的一个字节，按平面整字节搬移
+        const pl = this.m.video.planar, bpl = vi.width >> 3;
+        const rows = up ? range(y1, y2) : range(y1, y2).reverse();
+        for (const y of rows) {
+          const src = up ? y + dy : y - dy;
+          for (let k = 0; k < 4; k++) {
+            const p = pl.planes[k];
+            for (let c = c1; c <= Math.min(c2, bpl - 1); c++) pl.setByte(y * bpl + c, k, src >= y1 && src <= y2 ? p[src * bpl + c] : (fill >> k) & 1 ? 0xff : 0);
+          }
+        }
+        return;
+      }
       if (this.mode === 0x13 && x1 === 0 && x2 >= 319) {
         // 整行卷动：按字节整块搬移，快得多
         const rows = up ? range(y1, y2) : range(y1, y2).reverse();
@@ -333,7 +370,7 @@ export class Hle {
         if (col >= cols) { col = 0; row++; }
       }
     }
-    if (row >= ROWS) { this.scroll(true, 1, graphics ? 0 : 0x07, 0, 0, ROWS - 1, cols - 1); row = ROWS - 1; }
+    if (row >= this.rows) { this.scroll(true, 1, graphics ? 0 : 0x07, 0, 0, this.rows - 1, cols - 1); row = this.rows - 1; }
     this.setCursor(row, col);
     this.m.consoleOut(ch);
   }
@@ -344,11 +381,15 @@ export class Hle {
 
   clearScreen(): void {
     const vi = this.vinfo;
-    if (vi.graphics) {
+    if (vi.planar) {
+      const pl = this.m.video.planar;
+      for (let k = 0; k < 4; k++) pl.planes[k].fill(0);
+      pl.writes++;
+    } else if (vi.graphics) {
       const size = this.mode === 0x13 ? 64000 : 0x4000;
       for (let o = 0; o < size; o++) this.cpu.wb(vi.seg, o, 0);
     } else {
-      for (let o = 0; o < vi.cols * ROWS * 2; o += 2) {
+      for (let o = 0; o < vi.cols * this.rows * 2; o += 2) {
         this.cpu.wb(vi.seg, o, 0x20);
         this.cpu.wb(vi.seg, o + 1, 0x07);
       }
@@ -360,18 +401,23 @@ export class Hle {
     const cpu = this.cpu;
     const mode = al & 0x7f;
     if (!SUPPORTED_MODES.has(mode)) {
-      this.warnOnce(`程序要切换到显示模式 ${hex(mode)}h，本模拟器暂不支持（支持文本模式和图形模式 04h、05h、06h、13h），仍保持原来的模式`);
+      this.warnOnce(`程序要切换到显示模式 ${hex(mode)}h，本模拟器暂不支持（支持文本模式和图形模式 04h、05h、06h、0Dh、0Eh、10h、12h、13h），仍保持原来的模式`);
       return;
     }
     const vi = modeInfo(mode);
     cpu.wb(BDA, 0x49, mode);
     cpu.ww(BDA, 0x4a, vi.cols);
-    cpu.ww(BDA, 0x4c, vi.graphics ? (mode === 0x13 ? 0xfa00 : 0x4000) : vi.cols * ROWS * 2);
+    cpu.ww(BDA, 0x4c, vi.graphics ? (mode === 0x13 ? 0xfa00 : vi.planar ? (vi.width >> 3) * vi.height : 0x4000) : vi.cols * vi.rows * 2);
+    cpu.wb(BDA, 0x84, vi.rows - 1);
+    cpu.ww(BDA, 0x85, vi.charH);
     const video = this.m.video;
-    if (mode === 0x13) video.reset();
+    cpu.mmio = vi.planar ? video.planar : null;
+    if (vi.planar) video.enterPlanar(mode);
+    else if (mode === 0x13) video.reset();
     else if (mode === 0x04 || mode === 0x05) video.cgaColor = 0x30;
     else if (mode === 0x06) video.cgaColor = 0x3f;
     video.version++;
+    this.m.mouse.modeChanged(mode);
     if (!(al & 0x80)) this.clearScreen(); else this.setCursor(0, 0);
   }
 
@@ -401,7 +447,7 @@ export class Hle {
           return true;
         }
         let o = this.cellOff(c.row, c.col);
-        for (let k = 0; k < r[CX] && o < this.cols * ROWS * 2; k++, o += 2) {
+        for (let k = 0; k < r[CX] && o < this.cols * this.rows * 2; k++, o += 2) {
           cpu.wb(this.textSeg, o, this.al);
           if (this.ah === 0x09) cpu.wb(this.textSeg, o + 1, bl);
         }
@@ -423,7 +469,7 @@ export class Hle {
         if (this.al === 0x30) { // 取字库信息：ES:BP 指向 8×8 字库
           const upper = r[BX] >> 8 === 4;
           cpu.s[ES] = 0xf000; r[BP] = upper ? FONT_HI : FONT_LO;
-          r[CX] = 8; cpu.setR8(2, ROWS - 1);
+          r[CX] = this.vinfo.charH; cpu.setR8(2, this.rows - 1);
         }
         return true;
       case 0x12:
@@ -455,7 +501,7 @@ export class Hle {
 
   /** INT 10h AH=10h：调色板 */
   private palette(): boolean {
-    const cpu = this.cpu, r = cpu.r, v = this.m.video;
+    const cpu = this.cpu, r = cpu.r, v = this.m.video, bl = r[BX] & 0xff;
     switch (this.al) {
       case 0x10: v.setColor(r[BX] & 0xff, r[DX] >> 8, r[CX] >> 8, r[CX] & 0xff); return true;
       case 0x12: {
@@ -475,7 +521,19 @@ export class Hle {
         for (let k = 0; k < r[CX] * 3; k++) cpu.wb(cpu.s[ES], p++, v.dac[(((r[BX] + Math.floor(k / 3)) & 0xff) * 3) + (k % 3)]);
         return true;
       }
-      case 0x00: case 0x01: case 0x02: case 0x03: case 0x07: case 0x08: case 0x09: case 0x13: case 0x1a: return true;
+      case 0x00: v.setAttr(bl, r[BX] >> 8); return true;               // 设一个调色板寄存器
+      case 0x01: v.setAttr(0x11, r[BX] >> 8); return true;             // 边框色
+      case 0x02: {                                                      // 16 个调色板寄存器 + 边框色
+        for (let k = 0; k < 17; k++) v.setAttr(k, cpu.rb(cpu.s[ES], r[DX] + k));
+        return true;
+      }
+      case 0x07: cpu.setR8(7, v.attr[bl & 0x1f] ?? 0); return true;    // 读一个调色板寄存器
+      case 0x08: cpu.setR8(7, v.attr[0x11]); return true;
+      case 0x09: {
+        for (let k = 0; k < 17; k++) cpu.wb(cpu.s[ES], r[DX] + k, v.attr[k]);
+        return true;
+      }
+      case 0x03: case 0x13: case 0x1a: return true;
     }
     this.warnOnce(`INT 10h AX=10${hex(this.al)}h 暂未实现`);
     return true;
@@ -669,8 +727,8 @@ export class Hle {
           r[AX] = bytes.length; this.ok();
           return true;
         }
-        if (!this.spin(1 + n / 1000)) return false;
         const f = this.handles.get(h);
+        if (!this.spin(this.busyUntil < 0 ? this.diskCost(f, n) : 0)) return false;
         if (!f) { this.fail(6); return true; }
         const cnt = Math.max(0, Math.min(n, f.data.length - f.pos));
         for (let k = 0; k < cnt; k++) cpu.wb(seg, off + k, f.data[f.pos + k]);
@@ -686,8 +744,8 @@ export class Hle {
           return true;
         }
         if (h === 3 || h === 4) { r[AX] = n; this.ok(); return true; }
-        if (!this.spin(1 + n / 1000)) return false;
         const f = this.handles.get(h);
+        if (!this.spin(this.busyUntil < 0 ? this.diskCost(f, n) : 0)) return false;
         if (!f) { this.fail(6); return true; }
         if (!f.write) { this.fail(5); return true; }
         if (n === 0) { f.data.length = f.pos; f.dirty = true; r[AX] = 0; this.ok(); this.flushFile(f); return true; }
