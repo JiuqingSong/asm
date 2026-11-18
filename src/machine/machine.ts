@@ -241,7 +241,7 @@ export class Machine {
             if (this.kbcOutputPending) { this.kbcOutputPending = false; return this.kbcOutputPort(); } // 命令 D0h 的回答
             return this.kbd.in60();
           case 0x61: return (this.port61 & 0xcf) | ((Math.floor(this.clock / 18) & 1) << 4); // 位 4：内存刷新，约每 15 微秒翻转一次（AT 机上程序用它计时）
-          case 0x64: return this.kbd.queue.length || this.kbcOutputPending ? 0x15 : 0x14;
+          case 0x64: return this.kbd.outputFull || this.kbd.queue.length || this.kbcOutputPending ? 0x15 : 0x14;
           case 0x92: return this.cpu.a20Enabled ? 0x02 : 0x00;
           case 0x71: return this.cmosRead();
           case 0x3da: this.retrace ^= 0x09; this.video.resetAttrFlip(); return this.retrace;

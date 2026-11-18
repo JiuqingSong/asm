@@ -152,6 +152,8 @@ export class Keyboard {
   current: KeyEvent | null = null;
   private pic: PIC;
   private inService = false;
+  /** 键盘控制器的"输出缓冲区满"：送出一个按键后置位，读端口 60h 后清除（Windows 的键盘驱动先查它再读 60h） */
+  outputFull = false;
   /** 两次按键之间至少间隔的指令数（模拟真实键盘的节奏，避免程序来不及读取） */
   static readonly GAP = 3000;
   private cooldown = 0;
@@ -169,6 +171,7 @@ export class Keyboard {
   delivered(): void {
     this.current = this.queue.shift() ?? null;
     this.inService = true;
+    this.outputFull = this.current !== null;
   }
 
   /** 中断结束（EOI）后，送出下一个 */
@@ -191,6 +194,7 @@ export class Keyboard {
   }
 
   in60(): number {
+    this.outputFull = false;
     return this.current ? this.current.scan : 0;
   }
 
@@ -199,6 +203,7 @@ export class Keyboard {
     this.current = null;
     this.inService = false;
     this.cooldown = 0;
+    this.outputFull = false;
   }
 }
 
