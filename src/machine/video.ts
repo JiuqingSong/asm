@@ -17,6 +17,12 @@ export interface ModeInfo {
   planar: boolean; // EGA/VGA 的 4 位平面模式
 }
 
+/**
+ * 不是 BIOS 模式号：256 色、但不用链式寻址（像素分散在 4 个平面里，"Mode X"）。Windows 95 的启动画面
+ * （320×400）就是先设模式 13h 再改寄存器得到的
+ */
+export const MODE_UNCHAINED = 0x7f;
+
 export function modeInfo(mode: number): ModeInfo {
   const g = (width: number, height: number, bpp: number, seg: number, charH = 8, planar = false): ModeInfo =>
     ({ graphics: true, width, height, cols: width >> 3, bpp, seg, rows: Math.floor(height / charH), charH, planar });
@@ -30,6 +36,7 @@ export function modeInfo(mode: number): ModeInfo {
     case 0x10: return g(640, 350, 4, 0xa000, 14, true);
     case 0x12: return g(640, 480, 4, 0xa000, 16, true);
     case 0x13: return g(320, 200, 8, 0xa000);
+    case MODE_UNCHAINED: return g(320, 400, 8, 0xa000); // 实际的宽高由 CRTC 决定（unchainedSize）
     case 0x00: case 0x01: return t(40, 0xb800);
     case 0x07: return t(80, 0xb000);
     default: return t(80, 0xb800);
@@ -352,6 +359,17 @@ export class Video {
     if (!(s4 & 4)) return pl.planes[o & 1][o & 0xfffe];
     return pl.planes[pl.gc[4] & 3][o & 0xffff];
   }
+  /**
+   * 256 色非链式模式的画面：宽度 = (CRTC 1 + 1) × 4，高度 = 显示的扫描线数 ÷ 每行重复的次数；
+   * 每行在每个平面里占 CRTC 13h × 2 字节，从 CRTC 0Ch/0Dh 的起始地址开始
+   */
+  unchainedSize(): { width: number; height: number; stride: number; start: number } {
+    const c = this.crtc;
+    const vde = (c[0x12] | ((c[7] & 2) << 7) | ((c[7] & 0x40) << 3)) + 1;
+    const rep = ((c[9] & 0x1f) + 1) * (c[9] & 0x80 ? 2 : 1);
+    return { width: (c[1] + 1) * 4, height: Math.max(1, Math.floor(vde / rep)), stride: c[0x13] * 2, start: (c[0x0c] << 8) | c[0x0d] };
+  }
+
   /** 文本模式的字符和属性（第 i 个字符格，从 CRTC 的起始地址算起） */
   textCell(i: number): [number, number] {
     const start = ((this.crtc[0x0c] << 8) | this.crtc[0x0d]) * 2;
@@ -381,6 +399,7 @@ export class Video {
     const gc = this.planar.gc, seq = this.planar.seq, crtc = this.crtc;
     if (!(gc[6] & 1)) return crtc[1] < 0x40 ? 0x01 : 0x03;
     if (seq[4] & 8) return 0x13;
+    if (gc[5] & 0x40) return MODE_UNCHAINED; // 256 色移位方式，但没有链式寻址
     if (gc[5] & 0x20) return 0x04;
     if (((gc[6] >> 2) & 3) === 3) return 0x06;
     const vde = (crtc[0x12] | ((crtc[7] & 2) << 7) | ((crtc[7] & 0x40) << 3)) + 1;

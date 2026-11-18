@@ -1,6 +1,6 @@
 // DOS 文本屏幕（80×25，B800:0000）的渲染与键盘输入
 import { SCAN, type KeyEvent } from '../machine/devices.ts';
-import { modeInfo, type Video } from '../machine/video.ts';
+import { modeInfo, MODE_UNCHAINED, type Video } from '../machine/video.ts';
 import type { Mouse } from '../machine/mouse.ts';
 
 const LOW = ' ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼';
@@ -118,6 +118,8 @@ export class Screen {
   private ctx: CanvasRenderingContext2D | null;
   private image: ImageData | null = null;
   private graphicsMode = -1;
+  /** 画布尺寸对应的模式和宽高（非链式 256 色模式的宽高可变） */
+  private graphicsKey = -1;
   private paletteVersion = -1;
   private rgba = new Uint32Array(256);
 
@@ -285,6 +287,7 @@ export class Screen {
 
   private leaveGraphics(): void {
     this.graphicsMode = -1;
+    this.graphicsKey = -1;
     this.canvas.style.display = 'none';
     this.el.classList.remove('graphics');
     this.prev.fill(-1);
@@ -293,8 +296,12 @@ export class Screen {
 
   /** 图形模式：按显示模式把显存换算成像素 */
   private renderGraphics(mem: Uint8Array, mode: number, video: Video, mouse?: Mouse): void {
-    const info = modeInfo(mode);
-    if (mode !== this.graphicsMode) {
+    const info = { ...modeInfo(mode) };
+    const ux = mode === MODE_UNCHAINED ? video.unchainedSize() : null;
+    if (ux) { info.width = Math.min(ux.width, 1024); info.height = Math.min(ux.height, 768); }
+    const key = mode * 1e6 + info.width * 1000 + info.height;
+    if (key !== this.graphicsKey) {
+      this.graphicsKey = key;
       this.graphicsMode = mode;
       this.canvas.width = info.width;
       this.canvas.height = info.height;
@@ -310,7 +317,7 @@ export class Screen {
       this.paletteVersion = video.version;
       const c8 = (v: number) => ((v & 63) << 2) | ((v & 63) >> 4);
       const pack = (r: number, g: number, b: number) => (255 << 24) | (c8(b) << 16) | (c8(g) << 8) | c8(r);
-      if (mode === 0x13) {
+      if (mode === 0x13 || mode === MODE_UNCHAINED) {
         for (let i = 0; i < 256; i++) {
           const k = (i & video.pelMask) * 3;
           this.rgba[i] = pack(video.dac[k], video.dac[k + 1], video.dac[k + 2]);
@@ -332,6 +339,13 @@ export class Screen {
     if (mode === 0x13) {
       // 链式：第 i 个像素在平面 i & 3 的 i >> 2 处
       for (let i = 0; i < 64000; i++) px[i] = this.rgba[planes[i & 3][i >> 2]];
+    } else if (ux) {
+      // 非链式：x 在平面 x & 3，每行 stride 字节
+      const w = info.width, h = info.height;
+      for (let y = 0, i = 0; y < h; y++) {
+        const row = ux.start + y * ux.stride;
+        for (let x = 0; x < w; x++) px[i++] = this.rgba[planes[x & 3][(row + (x >> 2)) & 0xffff]];
+      }
     } else if (info.planar) {
       // 4 个平面的同一位拼成颜色号；每个字节 8 个像素，最高位在左边
       const [p0, p1, p2, p3] = video.planar.planes, rgba = this.rgba;

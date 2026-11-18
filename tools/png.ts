@@ -2,12 +2,15 @@
 import { writeFileSync } from 'node:fs';
 import { deflateSync } from 'node:zlib';
 import type { Machine } from '../src/machine/machine.ts';
-import { modeInfo } from '../src/machine/video.ts';
+import { modeInfo, MODE_UNCHAINED } from '../src/machine/video.ts';
 
 /** 当前是图形模式时保存截图，返回 true；文本模式返回 false */
 export function saveScreenPng(m: Machine, file: string): boolean {
-  const vi = modeInfo(m.video.hardwareMode()); // 和界面一样按显卡寄存器判断
+  const mode = m.video.hardwareMode(); // 和界面一样按显卡寄存器判断
+  const vi = { ...modeInfo(mode) };
   if (!vi.graphics) return false;
+  const ux = mode === MODE_UNCHAINED ? m.video.unchainedSize() : null;
+  if (ux) { vi.width = ux.width; vi.height = ux.height; }
   const { width: w, height: h } = vi, v = m.video;
   const rgb = (i: number) => { const k = (i & v.pelMask) * 3; return [v.dac[k], v.dac[k + 1], v.dac[k + 2]].map(c => (c << 2) | (c >> 4)); };
   const raw = Buffer.alloc((w * 3 + 1) * h);
@@ -15,7 +18,8 @@ export function saveScreenPng(m: Machine, file: string): boolean {
     raw[y * (w * 3 + 1)] = 0;
     for (let x = 0; x < w; x++) {
       let c: number[];
-      if (vi.planar) c = rgb(v.dacIndex(v.planar.pixel(y * (w >> 3) + (x >> 3), x & 7)));
+      if (ux) c = rgb(v.planar.planes[x & 3][(ux.start + y * ux.stride + (x >> 2)) & 0xffff]);
+      else if (vi.planar) c = rgb(v.dacIndex(v.planar.pixel(y * (w >> 3) + (x >> 3), x & 7)));
       else if (vi.bpp === 8) c = rgb(v.peek(0xa0000 + y * 320 + x));
       else {
         const ppb = 8 / vi.bpp, b = v.peek(0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb));
