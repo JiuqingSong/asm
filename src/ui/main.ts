@@ -447,7 +447,7 @@ class App {
     let d = s.m.driveFor(drive);
     if (drive === 0 && !d && s.m.drives[2]) { drive = 0x80; d = s.m.drives[2]; }
     if (!d) { this.addMessage('error', `${driveName(drive)} 没有磁盘映像`, s.i); this.setTab('messages'); return; }
-    if (d.data[510] !== 0x55 || d.data[511] !== 0xaa) {
+    if (d.readSector(0)![510] !== 0x55 || d.readSector(0)![511] !== 0xaa) {
       this.addMessage('error', `${driveName(drive)} 的磁盘不能启动：第一个扇区末尾没有引导标记 55AAh${d.floppy ? '（这张软盘没有格式化成启动盘）' : '（空白硬盘需要先用启动软盘分区、格式化，例如运行 DOS 的安装程序）'}`, s.i);
       this.setTab('messages');
       return;

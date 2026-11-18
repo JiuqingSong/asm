@@ -229,15 +229,22 @@ export class Hle {
         const n = this.al;
         let lba = d.lba(c, h, s);
         if (lba < 0 || n === 0) { this.diskStatus(drive, 0x04); this.al = 0; return true; } // 扇区找不到
+        if (ah === 0x03 && d.readOnly) { this.diskStatus(drive, 0x03); this.al = 0; return true; } // 写保护
         let done = 0;
         let addr = (cpu.s[ES] << 4) + r[BX];
+        const buf = new Uint8Array(512);
+        // 光盘映像：先确认这次要读的扇区都已经从文件里读出来了，没有的话等一会儿再执行（像磁盘在转）
+        if (ah === 0x02 && d.iso) {
+          for (let k = 0; k < n && lba + k < d.sectorCount; k++) if (!d.readSector(lba + k)) { this.m.busy = true; return false; }
+          this.m.busy = false;
+        }
         for (; done < n && lba < d.sectorCount; done++, lba++) {
-          const o = lba * 512;
           if (ah === 0x02) {
-            for (let k = 0; k < 512; k++, addr++) cpu.wb((addr >> 4) & 0xffff, addr & 15, d.data[o + k]);
+            const sec = d.readSector(lba)!;
+            for (let k = 0; k < 512; k++, addr++) cpu.wb((addr >> 4) & 0xffff, addr & 15, sec[k]);
           } else if (ah === 0x03) {
-            for (let k = 0; k < 512; k++, addr++) d.data[o + k] = cpu.rb((addr >> 4) & 0xffff, addr & 15);
-            d.dirty = true;
+            for (let k = 0; k < 512; k++, addr++) buf[k] = cpu.rb((addr >> 4) & 0xffff, addr & 15);
+            d.writeSector(lba, buf);
           }
         }
         if (ah === 0x03 && done) this.m.disksChanged();
@@ -249,6 +256,7 @@ export class Hle {
         if (!d) { notReady(); return true; }
         const first = d.lba(c, h, 1);
         if (first < 0) { this.diskStatus(drive, 0x04); return true; }
+        if (d.readOnly) { this.diskStatus(drive, 0x03); return true; }
         d.data.fill(0xf6, first * 512, (first + d.geo.sectors) * 512);
         d.dirty = true;
         this.m.disksChanged();

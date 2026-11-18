@@ -4,6 +4,8 @@
 // 扇区的位置用"柱面、磁头、扇区"（CHS）表示：
 //   线性扇区号 = (柱面 × 磁头数 + 磁头) × 每道扇区数 + (扇区 − 1)
 
+import type { IsoDisk } from './iso.ts';
+
 export interface Geometry {
   cylinders: number;
   heads: number;
@@ -33,11 +35,21 @@ export class Disk {
   dirty = false;
   /** 软盘刚插入、还没被 INT 13h AH=16h 查询过（换盘信号） */
   changed = true;
+  /** 光盘映像合成的只读硬盘（这时 data 是 ISO 文件本身，扇区由它生成） */
+  readonly iso: IsoDisk | null = null;
+  /** 光盘映像的文件（浏览器里保存它，而不是 data） */
+  isoFile: Blob | null = null;
 
-  constructor(name: string, data: Uint8Array, floppy: boolean) {
+  /** iso 不为空时是光盘映像，data 不用（传空数组） */
+  constructor(name: string, data: Uint8Array, floppy: boolean, iso: IsoDisk | null = null) {
     this.name = name;
     this.floppy = floppy;
-    if (floppy) {
+    if (iso) {
+      this.iso = iso;
+      this.data = data;
+      this.geo = iso.geo;
+      this.floppyType = 0;
+    } else if (floppy) {
       const f = FLOPPIES.find(x => x.size === data.length);
       if (!f) throw new Error(`${name} 的大小是 ${data.length} 字节，不是标准的软盘映像（160KB、360KB、720KB、1.2MB、1.44MB、2.88MB）`);
       this.data = data;
@@ -54,6 +66,23 @@ export class Disk {
 
   get sectorCount(): number { return this.geo.cylinders * this.geo.heads * this.geo.sectors; }
 
+  /** 只读（光盘映像） */
+  get readOnly(): boolean { return this.iso !== null; }
+
+  /** 读一个扇区（512 字节；返回的数组不要修改）。光盘映像的内容还没读出来时返回 null */
+  readSector(lba: number): Uint8Array | null {
+    if (this.iso) return this.iso.readSector(lba);
+    return this.data.subarray(lba * 512, lba * 512 + 512);
+  }
+
+  /** 写一个扇区；只读时返回 false */
+  writeSector(lba: number, buf: Uint8Array): boolean {
+    if (this.iso) return false;
+    this.data.set(buf.subarray(0, 512), lba * 512);
+    this.dirty = true;
+    return true;
+  }
+
   /** CHS 换成线性扇区号；超出范围时返回 -1 */
   lba(c: number, h: number, s: number): number {
     const g = this.geo;
@@ -63,6 +92,7 @@ export class Disk {
 
   /** 软盘的规格名，例如 1.44MB；硬盘返回容量 */
   get description(): string {
+    if (this.iso) return this.iso.description;
     if (this.floppy) return FLOPPIES.find(x => x.size === this.data.length)?.name ?? '';
     return `${Math.round(this.data.length / 1024 / 1024)}MB 硬盘`;
   }

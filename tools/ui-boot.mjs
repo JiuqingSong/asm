@@ -1,7 +1,7 @@
 // 从磁盘映像启动的界面检查（开发版）：通过"放入"按钮选择软盘映像，新建硬盘，从 A: 启动，按键，截图
 // 用法：node tools/ui-boot.mjs <截图目录> <A: 映像> [按键...]
 //   按键：Enter、F3、Escape 之类的键名，或者 "text:要输入的文字"，或者 "wait:秒数"
-//   环境变量 HD=硬盘映像：上传到 C:（否则新建 64MB 空白硬盘）；FROM=C 从 C: 启动；A: 映像写 - 表示不放软盘
+//   环境变量 HD=硬盘映像：上传到 C:（否则新建 64MB 空白硬盘）；ISO=光盘映像：放进 D:；FROM=C 从 C: 启动；A: 映像写 - 表示不放软盘
 import puppeteer from 'puppeteer-core';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
@@ -36,6 +36,11 @@ if (process.env.HD) {
   await chooser.accept([process.env.HD]);
   await sleep(1000);
 } else await page.select('#drives select[data-act="newhd"]', '64');
+if (process.env.ISO) { // 光盘映像放进 D:
+  const [chooser] = await Promise.all([page.waitForFileChooser(), page.click('#drives button[data-act="insert"][data-drive="3"]')]);
+  await chooser.accept([process.env.ISO]);
+  await sleep(1000);
+}
 await sleep(300);
 console.log('磁盘：', await page.$$eval('#drives .drive-row', rows => rows.map(r => r.textContent.replace(/\s+/g, ' ').trim()).join(' | ')));
 await page.screenshot({ path: join(out, 'boot-0-drives.png') });

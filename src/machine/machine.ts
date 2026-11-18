@@ -551,7 +551,7 @@ export class Machine {
     if (drive === 0 && !this.drives[0] && this.drives[2]) drive = 0x80;
     const d = this.driveFor(drive);
     if (!d) throw new Error(`${driveName(drive)} 没有磁盘映像，不能启动`);
-    const sec = d.data.subarray(0, 512);
+    const sec = d.readSector(0)!;
     if (sec[510] !== 0x55 || sec[511] !== 0xaa) throw new Error(`${driveName(drive)} 的磁盘不能启动（第一个扇区末尾没有引导标记 55AAh；空白的硬盘需要先用启动软盘分区、格式化）`);
     mem.set(sec, 0x7c00);
     // 开机自检时 BIOS 按 CMOS 时钟设置"午夜以来的滴答数"，DOS 由此得到当前时间

@@ -1,12 +1,14 @@
-// 磁盘映像面板（"虚拟磁盘"页上半部分）：软驱 A:、B:，硬盘 C:；插入/取出/新建/下载映像，从磁盘启动。
+// 磁盘映像面板（"虚拟磁盘"页上半部分）：软驱 A:、B:，硬盘 C:、D:（D: 也可以放光盘映像 .iso，变成只读硬盘）；插入/取出/新建/下载映像，从磁盘启动。
 // 映像保存在浏览器的 IndexedDB 里，刷新页面后还在（硬盘上装好的 DOS 不会丢）。
+// 光盘映像不读进内存：保存的是文件本身（Blob），DOS 读到哪里才从文件里读哪一段。
 import type { Machine } from '../machine/machine.ts';
 import { Disk, blankHardDisk, blankFloppy, isFloppySize } from '../machine/disk.ts';
 import { FatVolume } from '../machine/fat.ts';
+import { IsoDisk, BlobSource, isIsoFile } from '../machine/iso.ts';
 import { UTILITIES, buildUtility } from '../dos/utilities.ts';
 
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
-const LETTERS = ['A:', 'B:', 'C:'];
+const LETTERS = ['A:', 'B:', 'C:', 'D:'];
 
 // ----- IndexedDB：每台机器每个驱动器一条记录 -----
 const DB = 'asm86-disks', STORE = 'drives';
@@ -28,7 +30,8 @@ async function dbPut(key: string, value: unknown): Promise<void> {
   });
   db.close();
 }
-async function dbGet(key: string): Promise<{ name: string; floppy: boolean; data: Uint8Array } | undefined> {
+interface DriveRecord { name: string; floppy: boolean; data?: Uint8Array; iso?: Blob }
+async function dbGet(key: string): Promise<DriveRecord | undefined> {
   const db = await openDb();
   const v = await new Promise<unknown>((resolve, reject) => {
     const req = db.transaction(STORE).objectStore(STORE).get(key);
@@ -36,7 +39,14 @@ async function dbGet(key: string): Promise<{ name: string; floppy: boolean; data
     req.onerror = () => reject(req.error);
   });
   db.close();
-  return v as { name: string; floppy: boolean; data: Uint8Array } | undefined;
+  return v as DriveRecord | undefined;
+}
+
+/** 打开光盘映像文件：只读出目录，变成一块只读硬盘 */
+async function isoDisk(name: string, f: Blob): Promise<Disk> {
+  const d = new Disk(name, new Uint8Array(0), false, await IsoDisk.open(new BlobSource(f), name));
+  d.isoFile = f;
+  return d;
 }
 
 export interface DriveHost {
@@ -61,7 +71,7 @@ export class DrivesPanel {
     this.el = el; this.host = host;
     this.input = document.createElement('input');
     this.input.type = 'file';
-    this.input.accept = '.img,.ima,.vfd,.dsk,.bin';
+    this.input.accept = '.img,.ima,.vfd,.dsk,.bin,.iso';
     this.input.hidden = true;
     document.body.appendChild(this.input);
     this.input.onchange = () => this.loadFile();
@@ -82,9 +92,12 @@ export class DrivesPanel {
   async restore(): Promise<void> {
     try {
       for (const { m, i } of this.host.machines()) {
-        for (let k = 0; k < 3; k++) {
+        for (let k = 0; k < 4; k++) {
           const v = await dbGet(`${i}:${k}`);
-          if (v) m.drives[k] = new Disk(v.name, new Uint8Array(v.data), v.floppy);
+          try {
+            if (v?.iso) m.drives[k] = await isoDisk(v.name, v.iso);
+            else if (v?.data) m.drives[k] = new Disk(v.name, new Uint8Array(v.data), v.floppy);
+          } catch { /* 坏的记录：跳过 */ }
         }
       }
     } catch { /* 浏览器不允许使用 IndexedDB：映像只保存在内存里 */ }
@@ -95,7 +108,7 @@ export class DrivesPanel {
   changed(i: number): void {
     const { m } = this.host.machines().find(x => x.i === i) ?? {};
     if (!m) return;
-    for (let k = 0; k < 3; k++) {
+    for (let k = 0; k < 4; k++) {
       const d = m.drives[k];
       if (!d || !d.dirty) continue;
       const key = `${i}:${k}`;
@@ -107,7 +120,7 @@ export class DrivesPanel {
 
   /** 关机时：马上把改过的映像存进浏览器（不等定时器） */
   flushAll(i: number): void {
-    for (let k = 0; k < 3; k++) {
+    for (let k = 0; k < 4; k++) {
       const key = `${i}:${k}`;
       if (this.saveTimers.has(key)) { clearTimeout(this.saveTimers.get(key)); this.saveTimers.delete(key); this.persist(i, k); }
     }
@@ -117,7 +130,8 @@ export class DrivesPanel {
     const m = this.host.machines().find(x => x.i === i)?.m;
     if (!m) return;
     const d = m.drives[k];
-    dbPut(`${i}:${k}`, d ? { name: d.name, floppy: d.floppy, data: d.data } : null).catch(() => { /* 存不下就算了 */ });
+    const rec: DriveRecord | null = !d ? null : d.isoFile ? { name: d.name, floppy: false, iso: d.isoFile } : { name: d.name, floppy: d.floppy, data: d.data };
+    dbPut(`${i}:${k}`, rec).catch(() => { /* 存不下就算了 */ });
   }
 
   private machine(i: number): Machine { return this.host.machines().find(x => x.i === i)!.m; }
@@ -162,6 +176,7 @@ export class DrivesPanel {
     if (!b) return '没有选择磁盘';
     const d = this.machine(b.i).drives[b.k];
     if (!d) return '驱动器里没有磁盘';
+    if (d.iso) return '光盘映像在 DOS 里读（只读），这里不能浏览';
     const v = FatVolume.open(d.data, d.floppy);
     return typeof v === 'string' ? v : { v, d };
   }
@@ -302,10 +317,20 @@ export class DrivesPanel {
     this.input.value = '';
     if (!f || !this.target) return;
     const { i, k } = this.target;
-    const data = new Uint8Array(await f.arrayBuffer());
     try {
       const floppy = k < 2;
-      if (floppy && !isFloppySize(data.length)) throw new Error(`${f.name} 不是标准大小的软盘映像（${data.length} 字节）。硬盘映像请放进 C:`);
+      if (!floppy && await isIsoFile(f)) {
+        if (k !== 3) throw new Error(`${f.name} 是光盘映像，请放进 D:（C: 要用来启动 DOS）`);
+        const d = await isoDisk(f.name, f);
+        this.machine(i).drives[k] = d;
+        this.persist(i, k);
+        this.host.message('ok', `D: 放入了光盘映像 ${f.name}：它被变成一块只读的 FAT16 硬盘（${d.description}）。` +
+          `重新启动 DOS 后光盘的内容就在 D:，不需要光驱驱动和 MSCDEX；长文件名换成了 8.3 格式。映像不会读进内存，DOS 读到哪里才从文件里读哪一段`, i);
+        this.render();
+        return;
+      }
+      const data = new Uint8Array(await f.arrayBuffer());
+      if (floppy && !isFloppySize(data.length)) throw new Error(`${f.name} 不是标准大小的软盘映像（${data.length} 字节）。硬盘映像请放进 C: 或 D:，光盘映像（.iso）请放进 D:`);
       this.machine(i).drives[k] = new Disk(f.name, data, floppy);
       this.persist(i, k);
       this.host.message('ok', `${LETTERS[k]} 放入了 ${f.name}`, i);
@@ -325,10 +350,10 @@ export class DrivesPanel {
   }
 
   render(): void {
-    const parts: string[] = ['<div class="drives-head">磁盘映像：放入软盘或硬盘的映像文件（.img），可以从磁盘启动真的 DOS</div>'];
+    const parts: string[] = ['<div class="drives-head">磁盘映像：放入软盘或硬盘的映像文件（.img），可以从磁盘启动真的 DOS；D: 还可以放光盘映像（.iso）</div>'];
     for (const { m, tag, i } of this.host.machines()) {
       if (this.host.dual()) parts.push(`<div class="pane-head sub">${tag} 机</div>`);
-      for (let k = 0; k < 3; k++) {
+      for (let k = 0; k < 4; k++) {
         const d = m.drives[k];
         const at = `data-i="${i}" data-drive="${k}"`;
         const info = d ? `<span class="fn" title="${esc(d.name)}">${esc(d.name)}</span><span class="note" title="${d.geometryText}">${d.description}${d.dirty ? '，已修改' : ''}</span>`
@@ -338,11 +363,13 @@ export class DrivesPanel {
           btns = `<button data-act="insert" ${at} title="选择一个软盘映像文件放进这个软驱">${d ? '换盘' : '放入'}</button>` +
             (d ? '' : `<button data-act="blank" ${at} title="放入一张未格式化的空白 1.44MB 软盘">空白盘</button>`);
         } else {
-          btns = `<button data-act="insert" ${at} title="选择一个硬盘映像文件">上传映像</button>` +
+          btns = k === 3
+            ? `<button data-act="insert" ${at} title="选择第二块硬盘的映像文件（.img），或者光盘映像（.iso，变成一块只读硬盘，DOS 里不用光驱驱动就能读）">上传映像/ISO</button>`
+            : `<button data-act="insert" ${at} title="选择一个硬盘映像文件">上传映像</button>` +
             `<select data-act="newhd" data-i="${i}" title="新建一个空白硬盘"><option value="">新建硬盘…</option><option value="32">32MB</option><option value="64">64MB</option><option value="128">128MB</option><option value="504">504MB</option></select>`;
         }
-        if (d) btns = `<button data-act="browse" ${at} title="查看、放入、取出映像里的文件">${this.browse?.i === i && this.browse.k === k ? '收起文件' : '文件'}</button>` + btns;
-        if (d) btns += `<button data-act="download" ${at} title="把映像文件下载到电脑上保存">下载</button><button data-act="eject" ${at} title="${k < 2 ? '取出软盘' : '拿掉这个硬盘（浏览器里保存的映像也会删除）'}">${k < 2 ? '取出' : '移除'}</button>`;
+        if (d && !d.iso) btns = `<button data-act="browse" ${at} title="查看、放入、取出映像里的文件">${this.browse?.i === i && this.browse.k === k ? '收起文件' : '文件'}</button>` + btns;
+        if (d) btns += (d.iso ? '' : `<button data-act="download" ${at} title="把映像文件下载到电脑上保存">下载</button>`) + `<button data-act="eject" ${at} title="${k < 2 ? '取出软盘' : '拿掉这个硬盘（浏览器里保存的映像也会删除）'}">${k < 2 ? '取出' : '移除'}</button>`;
         parts.push(`<div class="file-row drive-row"><b class="dl">${LETTERS[k]}</b>${info}<span class="spacer"></span>${btns}</div>`);
         if (this.browse && this.browse.i === i && this.browse.k === k) parts.push(this.renderBrowser());
       }

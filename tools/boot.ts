@@ -5,7 +5,7 @@
 //   {PNG} 把图形画面存成 PNG（文件名前缀用环境变量 PNG 指定）；CPU=8088/286/386 选 CPU
 //   调试：WATCH=1 跑飞（执行 00 00 或跑到 A000 段以上）时打印之前的指令和最近的换段；WATCHAT=段:偏移 第一次执行到这里时打印；
 //         DUMPAT=段:偏移 同时反汇编那里的代码；VIDEO=1 打印显卡状态；STATE=1 打印 CPU 状态；VEC=33 打印中断向量；DIS=段:偏移 反汇编
-//   环境变量 BOOT=C 表示从硬盘启动；DISKS="映像2;映像3" 是依次换进 A: 的软盘，按键里写 {SWAP} 换下一张，{EJECT} 取出 A:
+//   环境变量 ISO=光盘映像 放进 D:；BOOT=C 表示从硬盘启动；DISKS="映像2;映像3" 是依次换进 A: 的软盘，按键里写 {SWAP} 换下一张，{EJECT} 取出 A:
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { Machine } from '../src/machine/machine.ts';
@@ -14,6 +14,7 @@ import { scanForChar } from '../src/machine/devices.ts';
 import { CP437 } from '../src/ui/screen.ts';
 import { bootProgram } from '../src/machine/boot.ts';
 import { saveScreenPng } from './png.ts';
+import { IsoDisk, BytesSource } from '../src/machine/iso.ts';
 
 const [a, c = '-', millionsArg = '200', ...keys] = process.argv.slice(2);
 const m = new Machine();
@@ -21,6 +22,8 @@ m.setCpu((process.env.CPU as '8088' | '286' | '386') || '386');
 if (a && a !== '-') m.drives[0] = new Disk(basename(a), new Uint8Array(readFileSync(a)), true);
 if (c.startsWith('new:')) m.drives[2] = new Disk('C.IMG', blankHardDisk(+c.slice(4)), false);
 else if (c !== '-') m.drives[2] = new Disk(basename(c), new Uint8Array(readFileSync(c)), false);
+// ISO=光盘映像：放进 D:（变成只读的 FAT16 硬盘）
+if (process.env.ISO) m.drives[3] = new Disk(basename(process.env.ISO), new Uint8Array(0), false, await IsoDisk.open(new BytesSource(new Uint8Array(readFileSync(process.env.ISO))), basename(process.env.ISO)));
 const logs: string[] = [];
 m.events.log = s => logs.push(s);
 const ints = new Map<string, number>();
