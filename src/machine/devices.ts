@@ -7,9 +7,20 @@ export class PIC implements IrqSource {
   isr = 0;      // 在服务寄存器
   imr = 0xb8;   // 中断屏蔽寄存器（BIOS 默认开放 IRQ0/1/2/6）
   vectorBase = 8;
+  /** 接在 IRQ2 上的从片（AT 机的第二个 8259，IRQ8~15）；只有主片有 */
+  slave: PIC | null = null;
   private initStep = 0;
   private needIcw4 = false;
   private readIsr = false;
+
+  /** 复位到 BIOS 开机后的状态 */
+  reset(vectorBase: number, imr: number): void {
+    this.irr = 0; this.isr = 0; this.imr = imr; this.vectorBase = vectorBase;
+    this.initStep = 0; this.readIsr = false;
+  }
+
+  /** 请求：从片有待处理的中断时，主片的 IRQ2 就有请求 */
+  private requests(): number { return this.irr | (this.slave !== null && this.slave.pending() ? 4 : 0); }
 
   raise(irq: number): void { this.irr |= 1 << irq; }
   lower(irq: number): void { this.irr &= ~(1 << irq); }
@@ -20,14 +31,15 @@ export class PIC implements IrqSource {
   }
 
   pending(): boolean {
-    const req = this.highest(this.irr & ~this.imr);
+    const req = this.highest(this.requests() & ~this.imr);
     if (req < 0) return false;
     const svc = this.highest(this.isr);
     return svc < 0 || req < svc;
   }
 
   ack(): number {
-    const req = this.highest(this.irr & ~this.imr);
+    const req = this.highest(this.requests() & ~this.imr);
+    if (req === 2 && this.slave !== null && this.slave.pending()) { this.isr |= 4; return this.slave.ack(); } // 级联：向量由从片给出
     this.irr &= ~(1 << req);
     this.isr |= 1 << req;
     return this.vectorBase + req;
@@ -35,7 +47,7 @@ export class PIC implements IrqSource {
 
   in8(port: number): number {
     if (port === 0x21) return this.imr;
-    return this.readIsr ? this.isr : this.irr;
+    return this.readIsr ? this.isr : this.requests();
   }
 
   out8(port: number, v: number): void {
@@ -65,6 +77,75 @@ export class PIC implements IrqSource {
     if (this.initStep === 3) { this.initStep = this.needIcw4 ? 4 : 0; return; }
     if (this.initStep === 4) { this.initStep = 0; return; }
     this.imr = v;
+  }
+}
+
+/**
+ * DMA 控制器：AT 机的两片 8237（0~3 号通道 8 位，端口 00h~0Fh；4~7 号通道 16 位，端口 C0h~DEh）和页寄存器（80h~8Fh）。
+ * 没有设备真的做 DMA 传输（软盘、硬盘都由 BIOS 高层模拟），这里只保存寄存器，让探测、编程 DMA 的程序读回合理的值
+ */
+export class DMA {
+  /** 各通道的地址、计数（基准值和当前值相同，因为不传输） */
+  addr = new Uint16Array(8);
+  count = new Uint16Array(8);
+  mode = new Uint8Array(8);
+  /** 屏蔽位：位 n = 通道 n */
+  mask = 0xff;
+  command = [0, 0];
+  private flip = [false, false];
+  /** 页寄存器 80h~8Fh（80h 也是开机自检的诊断端口） */
+  page = new Uint8Array(16);
+
+  reset(): void {
+    this.addr.fill(0); this.count.fill(0); this.mode.fill(0);
+    this.mask = 0xff; this.command = [0, 0]; this.flip = [false, false]; this.page.fill(0);
+  }
+
+  /** 端口是不是 DMA 控制器或页寄存器的 */
+  static owns(port: number): boolean {
+    return port <= 0x0f || (port >= 0x80 && port <= 0x8f) || (port >= 0xc0 && port <= 0xdf);
+  }
+
+  /** 端口 → (控制器号, 寄存器号 0~15) */
+  private decode(port: number): [number, number] {
+    return port <= 0x0f ? [0, port] : [1, (port - 0xc0) >> 1];
+  }
+
+  in8(port: number): number {
+    if (port >= 0x80 && port <= 0x8f) return this.page[port - 0x80];
+    if (port >= 0xc0 && port & 1) return 0xff;
+    const [c, r] = this.decode(port);
+    if (r < 8) {
+      const ch = c * 4 + (r >> 1), v = r & 1 ? this.count[ch] : this.addr[ch];
+      const hi = this.flip[c];
+      this.flip[c] = !hi;
+      return hi ? v >> 8 : v & 0xff;
+    }
+    if (r === 8) return 0;                                  // 状态：没有通道到达终点、没有请求
+    if (r === 0x0f) return ((this.mask >> (c * 4)) & 0x0f) | 0xf0; // 屏蔽寄存器（有些芯片组可以读）
+    return 0xff;
+  }
+
+  out8(port: number, v: number): void {
+    if (port >= 0x80 && port <= 0x8f) { this.page[port - 0x80] = v; return; }
+    if (port >= 0xc0 && port & 1) return;
+    const [c, r] = this.decode(port);
+    if (r < 8) {
+      const ch = c * 4 + (r >> 1), arr = r & 1 ? this.count : this.addr;
+      arr[ch] = this.flip[c] ? (arr[ch] & 0x00ff) | (v << 8) : (arr[ch] & 0xff00) | v;
+      this.flip[c] = !this.flip[c];
+      return;
+    }
+    const base = c * 4;
+    switch (r) {
+      case 0x08: this.command[c] = v; return;
+      case 0x0a: if (v & 4) this.mask |= 1 << (base + (v & 3)); else this.mask &= ~(1 << (base + (v & 3))); return; // 单个屏蔽位
+      case 0x0b: this.mode[base + (v & 3)] = v; return;
+      case 0x0c: this.flip[c] = false; return;                                         // 清先后触发器
+      case 0x0d: this.flip[c] = false; this.mask |= 0x0f << base; this.command[c] = 0; return; // 主清除
+      case 0x0e: this.mask &= ~(0x0f << base); return;                                // 清除全部屏蔽
+      case 0x0f: this.mask = (this.mask & ~(0x0f << base)) | ((v & 0x0f) << base); return;
+    }
   }
 }
 

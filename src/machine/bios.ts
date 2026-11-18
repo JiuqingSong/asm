@@ -133,6 +133,12 @@ export class Hle {
       case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
         this.m.pic.out8(0x20, 0x20); // 默认的硬件中断处理：只发 EOI
         return true;
+      case 0x70: case 0x71: case 0x72: case 0x73: case 0x76: case 0x77: // 74h、75h 是鼠标桩代码用的陷阱号
+        // IRQ8~15：给从片和主片都发 EOI；IRQ8 是实时钟，读寄存器 C 清掉中断标志
+        if (n === 0x70) this.m.rtcAck();
+        this.m.pic2.out8(0x20, 0x20);
+        this.m.pic.out8(0x20, 0x20);
+        return true;
       case 0x10: return this.video();
       case 0x11: this.cpu.r[AX] = this.cpu.rw(BDA, 0x10); return true;
       case 0x13: return this.disk();

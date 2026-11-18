@@ -3,7 +3,7 @@ import { CPU, CS, DS, ES, SS, SP, DX, AX, BX, CX, BP, SI, DI, IF, BIOS_SEG, TRAP
 import { Disk } from './disk.ts';
 import { SerialMouse } from './serial-mouse.ts';
 import type { Program } from '../asm/types.ts';
-import { PIC, PIT, Keyboard, type KeyEvent } from './devices.ts';
+import { PIC, PIT, DMA, Keyboard, type KeyEvent } from './devices.ts';
 import { Hle } from './bios.ts';
 import { UART, type NullModem } from './uart.ts';
 import { DosMemory, MEM_TOP } from './dosmem.ts';
@@ -125,6 +125,15 @@ export class Machine {
   cpu = new CPU();
   mem = this.cpu.mem;
   pic = new PIC();
+  /** AT 机的第二个中断控制器（IRQ8~15，接在主片的 IRQ2 上） */
+  pic2 = new PIC();
+  dma = new DMA();
+  // ---- 实时钟的中断（IRQ8）：CMOS 寄存器 A 的周期中断、每秒一次的更新结束中断；寄存器 C 是中断标志 ----
+  private rtcFlags = 0;
+  private rtcNextPeriodic = Infinity;
+  private rtcNextSecond = 0;
+  /** 下一个实时钟事件的时间（PIT 时钟） */
+  private rtcNext = 0;
   kbd = new Keyboard(this.pic);
   pit = new PIT(() => this.pic.raise(0));
   /** 虚拟时间（PIT 时钟数） */
@@ -199,6 +208,8 @@ export class Machine {
     const cpu = this.cpu;
     cpu.io = this.makeBus();
     const pic = this.pic, kbd = this.kbd;
+    pic.slave = this.pic2;
+    this.pic2.reset(0x70, 0xff);
     const mouse = this.mouse;
     cpu.irq = {
       pending: () => pic.pending() || mouse.wantsCallback(),
@@ -238,6 +249,7 @@ export class Machine {
         if (port >= 0x2f8 && port <= 0x2ff) return this.com2.in8(port - 0x2f8);
         switch (port) {
           case 0x20: case 0x21: return this.pic.in8(port);
+          case 0xa0: case 0xa1: return this.pic2.in8(port & 0x21);
           case 0x40: case 0x41: case 0x42: case 0x43: return this.pit.in8(port);
           case 0x60:
             if (this.kbcOutputPending) { this.kbcOutputPending = false; return this.kbcOutputPort(); } // 命令 D0h 的回答
@@ -251,6 +263,7 @@ export class Machine {
           case 0x3c0: case 0x3c1: case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7: case 0x3c8: case 0x3c9:
           case 0x3cc: case 0x3ce: case 0x3cf: case 0x3d9: case 0x3ca: case 0x3c3: case 0x3d4: case 0x3d5: return this.video.in8(port);
         }
+        if (DMA.owns(port)) return this.dma.in8(port);
         this.unknownPort(port, '读');
         return 0xff;
       },
@@ -293,6 +306,7 @@ export class Machine {
             return;
           }
           case 0x71: this.cmosWrite(v); return;
+          case 0xa0: case 0xa1: this.pic2.out8(port & 0x21, v); return;
           case 0x70: this.cmosIndex = v & 0x7f; return;
           case 0xf0: case 0xf1: return; // 数学协处理器的复位端口：Turbo Pascal 等检测协处理器时会写
           case 0x3d4: this.video.crtcIndex = v; return;
@@ -307,6 +321,7 @@ export class Machine {
           }
           default: if (this.video.out8(port, v)) return;
         }
+        if (DMA.owns(port)) { this.dma.out8(port, v); return; }
         this.unknownPort(port, '写');
       },
     };
@@ -324,14 +339,54 @@ export class Machine {
 
   private cmosWrite(v: number): void {
     const i = this.cmosIndex;
-    if ([0x00, 0x02, 0x04, 0x06, 0x07, 0x08, 0x09, 0x32].includes(i)) return; // 时间、日期跟着电脑的时钟走
+    if ([0x00, 0x02, 0x04, 0x06, 0x07, 0x08, 0x09, 0x32, 0x0c, 0x0d].includes(i)) return; // 时间、日期跟着电脑的时钟走；C、D 只读
     this.cmos[i] = v;
+    if (i === 0x0a || i === 0x0b) this.rtcSchedule();
+  }
+
+  /** BIOS 的 IRQ8 处理：读一次寄存器 C */
+  rtcAck(): void { this.rtcFlags = 0; }
+
+  /** 实时钟的周期：寄存器 A 的低 4 位是速率（3~15：8192Hz~2Hz；1、2 按 256Hz、128Hz），0 表示关闭 */
+  private rtcSchedule(): void {
+    const rate = this.cmos[0x0a] & 0x0f;
+    if (!rate || !(this.cmos[0x0b] & 0x40)) this.rtcNextPeriodic = Infinity;
+    else {
+      const hz = 32768 >> ((rate < 3 ? rate + 7 : rate) - 1);
+      const period = 1193182 / hz;
+      this.rtcNextPeriodic = this.clock + period;
+    }
+    if (this.rtcNextSecond <= this.clock) this.rtcNextSecond = this.clock + 1193182;
+    this.rtcNext = Math.min(this.rtcNextPeriodic, this.rtcNextSecond);
+  }
+
+  /** 到了实时钟事件的时间：设置寄存器 C 的标志，允许的话在 IRQ8 上发中断（读寄存器 C 之前不会再发） */
+  private rtcEvent(): void {
+    const b = this.cmos[0x0b];
+    let fire = 0;
+    if (this.clock >= this.rtcNextPeriodic) {
+      fire |= 0x40;
+      const rate = this.cmos[0x0a] & 0x0f;
+      const period = 1193182 / (32768 >> ((rate < 3 ? rate + 7 : rate) - 1));
+      while (this.rtcNextPeriodic <= this.clock) this.rtcNextPeriodic += period;
+    }
+    if (this.clock >= this.rtcNextSecond) {
+      fire |= 0x10;
+      while (this.rtcNextSecond <= this.clock) this.rtcNextSecond += 1193182;
+    }
+    this.rtcNext = Math.min(this.rtcNextPeriodic, this.rtcNextSecond);
+    this.rtcFlags |= fire;
+    if (fire & b & 0x70 && !(this.rtcFlags & 0x80)) {
+      this.rtcFlags |= 0x80;
+      this.pic2.raise(0);
+    }
   }
 
   /** CMOS 的初始内容：1.44MB 软驱、640KB 常规内存、扩展内存（286 时 15MB） */
   private initCmos(): void {
     const c = this.cmos;
     c.fill(0);
+    c[0x0a] = 0x26; c[0x0b] = 0x02;        // 实时钟：32768Hz 晶振、1024Hz 周期；24 小时制，周期中断关闭
     c[0x10] = 0x40;                        // A: 1.44MB
     c[0x14] = 0x01 | (this.drives[1] ? 0x40 : 0); // 设备字节
     c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
@@ -386,8 +441,7 @@ export class Machine {
       case 0x07: return bcd(d.getDate());
       case 0x08: return bcd(d.getMonth() + 1);
       case 0x09: return bcd(d.getFullYear() % 100);
-      case 0x0a: return 0x26;
-      case 0x0b: return 0x02;
+      case 0x0c: { const f = this.rtcFlags; this.rtcFlags = 0; return f; } // 读出后清零
       case 0x0d: return 0x80;
       case 0x32: return bcd(Math.floor(d.getFullYear() / 100));
     }
@@ -521,7 +575,10 @@ export class Machine {
     if (program.format === 'boot') this.loadBootSector(program.bootDrive ?? 0);
     else this.loadProgram(program, cmdline, name);
     // 设备
-    this.pic.irr = 0; this.pic.isr = 0; this.pic.imr = 0xb8; this.pic.vectorBase = 8;
+    this.pic.reset(8, 0xb8);
+    this.pic2.reset(0x70, 0xff);
+    this.dma.reset();
+    this.rtcFlags = 0;
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
     this.port61 = 0;
@@ -537,6 +594,7 @@ export class Machine {
     this.kbcOutputPending = this.kbcWriteOutput = false;
     this.port92 = 0;
     this.initCmos();
+    this.rtcNextSecond = 0; this.rtcSchedule();
     this.mouse.powerOn();
     this.com1.reset();
     this.com2.reset();
@@ -720,7 +778,7 @@ export class Machine {
     }
     if (cpu.halted) {
       // HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据
-      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity));
+      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock)));
       this.advanceTime(dt);
       this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
       cpu.step();
@@ -737,6 +795,7 @@ export class Machine {
   private advanceTime(dt: number): void {
     this.clock += dt;
     this.pit.advance(dt);
+    if (this.clock >= this.rtcNext) this.rtcEvent();
     this.com1.tick(this.clock);
     this.com2.tick(this.clock);
     this.mouse.tick(this.clock);
