@@ -310,6 +310,18 @@ export class Video {
    * 装入标准 VGA BIOS 在这个模式下设置的寄存器值（定序器、CRTC、图形控制器、属性控制器的模式寄存器、杂项输出）。
    * 调色板寄存器（属性 0~0Fh）不动，由各模式自己的代码设置
    */
+  /** BIOS 设置这个模式时装入的属性调色板（16 个）和 DAC（256 色模式 256 种颜色，其余 64 种 EGA 颜色） */
+  static modePalette(mode: number): { attr: number[]; dac: Uint8Array } {
+    if (mode === 0x13) return { attr: Array.from({ length: 16 }, (_, i) => i), dac: defaultDac() };
+    const dac = new Uint8Array(64 * 3);
+    for (let i = 0; i < 64; i++) dac.set(ega64(i), i * 3);
+    let attr = ATTR_DEFAULT;
+    if (mode === 0x0d || mode === 0x0e) attr = [0, 1, 2, 3, 4, 5, 6, 7, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+    else if (mode === 0x04 || mode === 0x05) attr = [0, 0x13, 0x15, 0x17, 2, 4, 6, 7, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+    else if (mode === 0x06) attr = [0, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17, 0x17];
+    return { attr, dac };
+  }
+
   /** 这个模式的寄存器表（杂项输出、定序器 0~4、CRTC 0~18h、图形控制器 0~8、属性 10h~14h），不改寄存器 */
   static modeTable(mode: number): number[] {
     const t = VGA_MODE_REGS[mode] ?? T80;

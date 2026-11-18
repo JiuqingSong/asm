@@ -6,7 +6,7 @@
 import { AX, BX, CX, DX, SI, DI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
 import { MOUSE_STUB } from './mouse.ts';
-import { VGA_TABLE, VGA_FLAG, VGA_CLEAR } from './vgarom.ts';
+import { VGA_TABLE, VGA_FLAG, VGA_CLEAR, VGA_PALETTE, VGA_DAC, VGA_DAC_COUNT } from './vgarom.ts';
 import { PIT_HZ } from './uart.ts';
 import { modeInfo, SUPPORTED_MODES, Video, type ModeInfo } from './video.ts';
 
@@ -653,6 +653,10 @@ export class Hle {
     // 在 DOS 窗口里只改那个虚拟机的显卡状态，不会动到真正显示着的 Windows 画面
     const tbl = Video.modeTable(mode);
     for (let k = 0; k < tbl.length; k++) cpu.wb(0xf000, VGA_TABLE + k, tbl[k]);
+    const pal = Video.modePalette(mode);
+    for (let k = 0; k < 16; k++) cpu.wb(0xf000, VGA_PALETTE + k, pal.attr[k]);
+    cpu.ww(0xf000, VGA_DAC_COUNT, pal.dac.length);
+    for (let k = 0; k < pal.dac.length; k++) cpu.wb(0xf000, VGA_DAC + k, pal.dac[k]);
     // 清屏也由桩代码在换好寄存器以后做（REP STOSW）：段、字数、填充值
     const words = vi.planar ? ((vi.width >> 3) * vi.height) >> 1 : mode === 0x13 ? 32000 : vi.graphics ? 0x2000 : vi.cols * vi.rows;
     cpu.ww(0xf000, VGA_CLEAR, vi.seg); cpu.ww(0xf000, VGA_CLEAR + 2, words); cpu.ww(0xf000, VGA_CLEAR + 4, vi.graphics ? 0 : 0x0720);

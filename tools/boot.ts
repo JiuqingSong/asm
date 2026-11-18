@@ -43,6 +43,22 @@ if (process.env.PORTS) {
     out8: (p, v) => { if ((p & 0xfff8) === 0x2f8 || (p & 0xfff8) === 0x3f8) log.push(`OUT ${p.toString(16)},${v.toString(16)}`); io.out8(p, v); },
   };
 }
+// WATCHPHYS=起点-终点（物理地址，十六进制）：记录读写这段内存的代码位置（每个位置只记第一次，最多 200 条）
+if (process.env.WATCHPHYS) {
+  const [w0, w1] = process.env.WATCHPHYS.split('-').map(x => parseInt(x, 16));
+  const cpu = m.cpu, seen = new Set<string>(), log: string[] = [];
+  (globalThis as { __physlog?: string[] }).__physlog = log;
+  const note = (what: string, a: number) => {
+    if (a < w0 || a >= w1 || log.length >= 200) return;
+    const key = `${cpu.s[1].toString(16)}:${cpu.instructionStart.toString(16)} ${what}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    log.push(`${key} ${a.toString(16)}${cpu.v86 ? '（V86）' : ''} 第 ${m.instructions} 条`);
+  };
+  const rl = cpu.readLin.bind(cpu), wl = cpu.writeLin.bind(cpu);
+  cpu.readLin = (a: number) => { note('读', a); return rl(a); };
+  cpu.writeLin = (a: number, v: number) => { note('写', a); wl(a, v); };
+}
 // PORTLOG=3c0-3df,a0-a1：记录这些端口的读写（只记保护模式下的；PORTLOGALL=1 时都记），最后打印最近的 PORTLOGN 条
 if (process.env.PORTLOG) {
   const ranges = process.env.PORTLOG.split(',').map(r => r.split('-').map(x => parseInt(x, 16))).map(([a, b]) => [a, b ?? a]);
@@ -233,6 +249,26 @@ if (process.env.STATE) {
 }
 
 if (process.env.TRACEFROM) console.log('跟踪：\n' + traceLog.join('\n'));
+if (process.env.WATCHPHYS) console.log('访问记录：\n' + ((globalThis as { __physlog?: string[] }).__physlog ?? []).join('\n'));
+// PLANEDUMP=偏移,偏移,...（十六进制）：结束时打印 4 个平面在这些偏移处的 16 个字节
+if (process.env.PLANEDUMP) for (const o of process.env.PLANEDUMP.split(",").map(x => parseInt(x, 16))) m.video.planar.planes.forEach((p, k) => console.log(`平面 ${k} @${o.toString(16)}：`, Array.from(p.subarray(o, o + 16), b => b.toString(16).padStart(2, "0")).join(" ")));
+// FINDTEXT=文字：结束时在整个物理内存和显卡的 4 个平面里找这段文字（连续存放，或者"字符、属性"交替存放）
+if (process.env.FINDTEXT) {
+  const t = Array.from(process.env.FINDTEXT, c => c.charCodeAt(0));
+  const find = (buf: Uint8Array, step: number) => {
+    const hits: number[] = [];
+    for (let a = 0; a + t.length * step <= buf.length && hits.length < 12; a++) {
+      let ok = true;
+      for (let k = 0; k < t.length && ok; k++) ok = buf[a + k * step] === t[k];
+      if (ok) hits.push(a);
+    }
+    return hits.map(h => h.toString(16));
+  };
+  console.log('内存里（连续）：', find(m.mem, 1).join(' '));
+  console.log('内存里（字符、属性交替）：', find(m.mem, 2).join(' '));
+for (const h of find(m.mem, 2)) { const a = parseInt(h, 16); console.log(`  ${h} 处的属性字节：`, Array.from({ length: 6 }, (_, k) => m.mem[a + 1 + k * 2].toString(16)).join(' ')); }
+  m.video.planar.planes.forEach((p, k) => console.log(`平面 ${k}（连续 / 隔一个字节）：`, find(p, 1).join(' '), '/', find(p, 2).join(' ')));
+}
 if (process.env.WATCH) console.log('最后执行的指令：\n' + ((globalThis as { __tail?: string[] }).__tail ?? []).slice(-40).join('\n'));
 
 if (process.env.PORTLOG) { const l = (globalThis as { __portlog?: string[] }).__portlog ?? []; const n = +(process.env.PORTLOGN ?? 300); console.log(`端口访问（共 ${l.length} 次，最后 ${n} 次）：\n` + l.slice(-n).join('\n')); }

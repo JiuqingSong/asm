@@ -6,15 +6,22 @@
 // 驱动看不到寄存器的变化，以为显卡还在原来的模式，或者改动了正在显示的 Windows 画面。
 // 清屏也必须在寄存器换好以后做：显存怎么映射（平面、奇偶、链式）由寄存器决定。
 //
-// 陷阱处理函数切换模式后把寄存器表写到 F000:0900（杂项输出 1 字节、定序器 5、CRTC 25、图形控制器 9、
-// 属性控制器 10h~14h 5 个，共 45 字节），清屏参数写在后面（段、字数、填充的字），并把 F000:08FF 置位：
-// 位 0 = 写寄存器，位 1 = 清屏。
+// 陷阱处理函数切换模式后把寄存器表写到 F000:0970（杂项输出 1 字节、定序器 5、CRTC 25、图形控制器 9、
+// 属性控制器 10h~14h 5 个，共 45 字节），后面是属性控制器的 16 个调色板寄存器、清屏参数（段、字数、填充的字）、
+// DAC 的字节数；DAC 的数据在 F000:1000（0A00~0DFF 是 8×8 字库的高半部分）。F000:0960 的位 0 = 写寄存器，位 1 = 清屏。
+// 和真的 VGA BIOS 一样，设置模式时也装入调色板和 DAC：Windows 把 DOS 窗口里的文字画出来时，按那个虚拟机自己的
+// 调色板换算颜色（驱动靠截获端口记下它），不装的话前景色、背景色都是黑的。
 
 export const STUB_INT10 = 0x0840;
-export const VGA_TABLE = 0x0900;
-export const VGA_FLAG = 0x08ff;
+export const VGA_TABLE = 0x0970;
+export const VGA_FLAG = 0x0960;
+/** 属性控制器的 16 个调色板寄存器（紧接在寄存器表后面） */
+export const VGA_PALETTE = VGA_TABLE + 45;
 /** 清屏参数：段、字数、填充值（各一个字） */
-export const VGA_CLEAR = VGA_TABLE + 45;
+export const VGA_CLEAR = VGA_TABLE + 61;
+/** DAC 要装入的字节数（一个字），后面是数据（3 字节一种颜色，最多 256 种） */
+export const VGA_DAC_COUNT = VGA_TABLE + 67;
+export const VGA_DAC = 0x1000;
 
 const lo = (v: number) => v & 0xff, hi = (v: number) => v >> 8;
 
@@ -53,7 +60,13 @@ export function int10Stub(trap: number): number[] {
     0xba, 0xda, 0x03, 0xec,                                 // 属性控制器：读 3DAh 回到"写索引"状态
     0xba, 0xc0, 0x03, 0xb9, 0x05, 0x00, 0xb4, 0x10,         // mov dx,3C0h / mov cx,5 / mov ah,10h
     0x88, 0xe0, 0xee, 0x2e, 0xac, 0xee, 0xfe, 0xc4, 0xe2, 0xf6, // 索引、数值交替写到 3C0h
+    0xb9, 0x10, 0x00, 0xb4, 0x00,                           // 调色板寄存器 0~0Fh：mov cx,16 / mov ah,0
+    0x88, 0xe0, 0xee, 0x2e, 0xac, 0xee, 0xfe, 0xc4, 0xe2, 0xf6,
     0xb0, 0x20, 0xee,                                       // 打开显示（索引的位 5）
+    0xba, 0xc8, 0x03, 0x30, 0xc0, 0xee, 0x42,               // DAC：mov dx,3C8h / xor al,al / out / inc dx
+    0x2e, 0x8b, 0x0e, lo(VGA_DAC_COUNT), hi(VGA_DAC_COUNT), // mov cx, cs:[字节数]
+    0xbe, lo(VGA_DAC), hi(VGA_DAC),                         // mov si, 1000h
+    0x2e, 0xac, 0xee, 0xe2, 0xfb,                           // lods byte ptr cs:[si] / out dx,al / loop 回到 CS: 前缀（只用 8086 的指令：8088 上 6Eh 不是 OUTSB）
     0x58, 0xa8, 0x02, 0x74, clear.length,                   // pop ax / test al,2 / jz 不清屏
     ...clear,
     0x07, 0x5f, 0x5e, 0x59, 0x5a, 0x58,                     // pop es di si cx dx ax

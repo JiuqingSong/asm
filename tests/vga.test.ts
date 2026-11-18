@@ -55,6 +55,23 @@ end start`);
     expect([p[0][1], p[1][1], p[2][1], p[3][1]]).toEqual([0x55, 0x55, 0x55, 0x55]);
   });
 
+  it('INT 10h 设置模式时和真的 VGA BIOS 一样用 OUT 装入调色板和 DAC（Windows 的 DOS 窗口靠它换算颜色）', () => {
+    const m = run(`
+.model small
+.stack 100h
+.code
+start:  mov ax, 0003h
+        int 10h
+        mov ax, 4C00h
+        int 21h
+end start`);
+    const v = m.video;
+    expect(Array.from(v.attr.subarray(0, 16))).toEqual([0, 1, 2, 3, 4, 5, 0x14, 7, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f]);
+    expect(Array.from(v.dac.subarray(0, 9))).toEqual([0, 0, 0, 0, 0, 42, 0, 42, 0]); // 黑、蓝、绿
+    expect(Array.from(v.dac.subarray(7 * 3, 8 * 3))).toEqual([42, 42, 42]);          // 7：浅灰
+    expect(Array.from(v.dac.subarray(63 * 3, 64 * 3))).toEqual([63, 63, 63]);        // 3Fh：白
+  });
+
   it('模式 13h（链式）：第 i 个像素在平面 i & 3', () => {
     const m = run(`
 .model small
