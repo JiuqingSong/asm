@@ -217,7 +217,9 @@ export class Screen {
 
   /** 从显存渲染 */
   render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number, video?: Video, mouse?: Mouse): void {
-    const mode = mem[0x449];
+    // 显示什么由显卡寄存器决定（和真的显示器一样），不看 BIOS 数据区的模式号；CGA 4 色模式 4、5 的区别只在 BIOS 数据区里
+    let mode = video ? video.hardwareMode() : mem[0x449];
+    if (mode === 0x04 && mem[0x449] === 0x05) mode = 0x05;
     const info = modeInfo(mode);
     const showMouse = !!mouse && mouse.used && mouse.visible >= 0;
     this.el.style.cursor = showMouse ? 'none' : '';

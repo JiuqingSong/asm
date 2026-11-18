@@ -6,7 +6,7 @@ import { modeInfo } from '../src/machine/video.ts';
 
 /** 当前是图形模式时保存截图，返回 true；文本模式返回 false */
 export function saveScreenPng(m: Machine, file: string): boolean {
-  const vi = modeInfo(m.mem[0x449]);
+  const vi = modeInfo(m.video.hardwareMode()); // 和界面一样按显卡寄存器判断
   if (!vi.graphics) return false;
   const { width: w, height: h } = vi, v = m.video;
   const rgb = (i: number) => { const k = (i & v.pelMask) * 3; return [v.dac[k], v.dac[k + 1], v.dac[k + 2]].map(c => (c << 2) | (c >> 4)); };

@@ -8,7 +8,7 @@ import type { Machine } from './machine.ts';
 import { MOUSE_STUB } from './mouse.ts';
 import { VGA_TABLE, VGA_FLAG } from './vgarom.ts';
 import { PIT_HZ } from './uart.ts';
-import { modeInfo, SUPPORTED_MODES, type ModeInfo } from './video.ts';
+import { modeInfo, SUPPORTED_MODES, Video, type ModeInfo } from './video.ts';
 
 /** ROM 里 8×8 字库的位置：前 128 个字符在 F000:FA6E（与 IBM PC 相同），后 128 个在 F000:0A00 */
 export const FONT_LO = 0xfa6e, FONT_HI = 0x0a00;
@@ -641,14 +641,13 @@ export class Hle {
     cpu.wb(BDA, 0x84, vi.rows - 1);
     cpu.ww(BDA, 0x85, vi.charH);
     const video = this.m.video;
-    cpu.mmio = vi.planar ? video.planar : null;
     if (vi.planar) video.enterPlanar(mode);
     else if (mode === 0x13) video.reset();
     else if (mode === 0x04 || mode === 0x05) video.cgaColor = 0x30;
     else if (mode === 0x06) video.cgaColor = 0x3f;
-    video.loadModeRegs(mode);
-    // 让 ROM 里的桩代码再用 OUT 指令把寄存器写一遍（Windows 386 增强模式的显卡驱动靠截获端口来跟踪显卡状态）
-    const tbl = video.modeRegTable();
+    // 寄存器由 ROM 里的桩代码用 OUT 指令写（和真的 VGA BIOS 一样）：Windows 386 增强模式下这些写操作被显卡驱动截获，
+    // 在 DOS 窗口里只改那个虚拟机的显卡状态，不会动到真正显示着的 Windows 画面
+    const tbl = Video.modeTable(mode);
     for (let k = 0; k < tbl.length; k++) cpu.wb(0xf000, VGA_TABLE + k, tbl[k]);
     cpu.wb(0xf000, VGA_FLAG, 1);
     video.version++;

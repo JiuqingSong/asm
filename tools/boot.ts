@@ -188,9 +188,9 @@ for (const k of keys) {
     if (mv) { for (let k = 0; k < 10; k++) { m.mouse.moveRel(+mv[1] / 10, +mv[2] / 10); run(1); } continue; }
     if (part === '{CLICK}') { m.mouse.queueButtons(1, m.clock); run(2); m.mouse.queueButtons(0, m.clock); run(2); continue; }
     if (part === '{SHOT}') { console.log('屏幕：\n' + screen()); continue; }
-    const alt = /^\{ALT:([A-Z])\}$/.exec(part);
-    if (alt) { // Alt + 字母
-      const sc = scanForChar(alt[1].toLowerCase());
+    const alt = /^\{ALT:([A-Z]|ENTER|TAB)\}$/.exec(part);
+    if (alt) { // Alt + 字母（或回车、Tab）
+      const sc = alt[1] === 'ENTER' ? 0x1c : alt[1] === 'TAB' ? 0x0f : scanForChar(alt[1].toLowerCase());
       m.pressKey({ scan: 0x38, ascii: 0, release: false });
       m.pressKey({ scan: sc, ascii: 0, release: false });
       m.pressKey({ scan: sc | 0x80, ascii: 0, release: true });
@@ -202,7 +202,7 @@ for (const k of keys) {
   }
   run(+millionsArg);
 }
-console.log(`执行了 ${(m.instructions / 1e6).toFixed(1)} 百万条指令（${((Date.now() - t0) / 1000).toFixed(1)} 秒），虚拟时间 ${(m.clock / 1193182).toFixed(1)} 秒，CS:IP=${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}，模式 ${m.mem[0x449].toString(16)}h`);
+console.log(`执行了 ${(m.instructions / 1e6).toFixed(1)} 百万条指令（${((Date.now() - t0) / 1000).toFixed(1)} 秒），虚拟时间 ${(m.clock / 1193182).toFixed(1)} 秒，CS:IP=${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}，模式 ${m.video.hardwareMode().toString(16)}h（BIOS 数据区 ${m.mem[0x449].toString(16)}h）`);
 console.log('BIOS/DOS 调用：', [...ints].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => `${k}×${v}`).join('，'));
 console.log('提示：', logs.join(' | ') || '无');
 console.log('屏幕：\n' + screen());

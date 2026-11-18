@@ -297,6 +297,37 @@ export class Video {
    * 装入标准 VGA BIOS 在这个模式下设置的寄存器值（定序器、CRTC、图形控制器、属性控制器的模式寄存器、杂项输出）。
    * 调色板寄存器（属性 0~0Fh）不动，由各模式自己的代码设置
    */
+  /** 这个模式的寄存器表（杂项输出、定序器 0~4、CRTC 0~18h、图形控制器 0~8、属性 10h~14h），不改寄存器 */
+  static modeTable(mode: number): number[] {
+    const t = VGA_MODE_REGS[mode] ?? T80;
+    return [t.misc, ...t.seq, ...t.crtc, ...t.gc, ...t.attr];
+  }
+
+  /** 显存映射可能变了（A0000 段是否按 4 个平面访问）：机器据此设置 CPU 的 mmio */
+  onMapChange: (() => void) | null = null;
+  /** A0000~AFFFF 按 4 个平面访问：图形模式、不是 256 色的链式模式、不是 CGA 兼容模式、映射在 A0000 */
+  get planarMapped(): boolean {
+    const gc = this.planar.gc;
+    return (gc[6] & 1) !== 0 && !(this.planar.seq[4] & 8) && !(gc[5] & 0x20) && ((gc[6] >> 2) & 3) <= 1;
+  }
+
+  /**
+   * 按寄存器判断显卡现在实际处在哪个模式（像真的显示器一样只看硬件，不看 BIOS 数据区里的模式号：
+   * Windows 增强模式下每个虚拟机有自己的 BIOS 数据区，切换虚拟机时它跟着变）
+   */
+  hardwareMode(): number {
+    const gc = this.planar.gc, seq = this.planar.seq, crtc = this.crtc;
+    if (!(gc[6] & 1)) return crtc[1] < 0x40 ? 0x01 : 0x03;
+    if (seq[4] & 8) return 0x13;
+    if (gc[5] & 0x20) return 0x04;
+    if (((gc[6] >> 2) & 3) === 3) return 0x06;
+    const vde = (crtc[0x12] | ((crtc[7] & 2) << 7) | ((crtc[7] & 0x40) << 3)) + 1;
+    const h = crtc[9] & 0x80 ? vde >> 1 : vde;
+    if (h > 400) return 0x12;
+    if (h > 300) return 0x10;
+    return seq[1] & 8 ? 0x0d : 0x0e;
+  }
+
   loadModeRegs(mode: number): void {
     const t = VGA_MODE_REGS[mode] ?? T80;
     const pl = this.planar;
@@ -306,6 +337,7 @@ export class Video {
     this.crtc.fill(0); this.crtc.set(t.crtc);
     this.attr.set(t.attr, 0x10);
     this.version++;
+    this.onMapChange?.();
   }
 
   /** 当前模式的寄存器表（杂项输出、定序器 0~4、CRTC 0~18h、图形控制器 0~8、属性 10h~14h），给 BIOS 桩代码用 OUT 写出去 */
@@ -380,9 +412,9 @@ export class Video {
         this.attrFlip = !this.attrFlip;
         return true;
       case 0x3c4: pl.seqIndex = v; return true;
-      case 0x3c5: pl.seq[pl.seqIndex & 7] = v; return true;
+      case 0x3c5: pl.seq[pl.seqIndex & 7] = v; if ((pl.seqIndex & 7) === 4) this.onMapChange?.(); return true;
       case 0x3ce: pl.gcIndex = v; return true;
-      case 0x3cf: pl.gc[pl.gcIndex & 15] = v; return true;
+      case 0x3cf: pl.gc[pl.gcIndex & 15] = v; if ((pl.gcIndex & 15) === 5 || (pl.gcIndex & 15) === 6) { this.version++; this.onMapChange?.(); } return true;
       case 0x3c2: this.misc = v; return true;
       case 0x3c3: case 0x3ca: case 0x3da: case 0x3d8: return true; // VGA 允许、特性控制、CGA 模式寄存器：接受但不模拟
     }

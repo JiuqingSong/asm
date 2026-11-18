@@ -218,6 +218,8 @@ export class Machine {
       },
     };
     cpu.trap = (n) => this.hle.handle(n);
+    // A0000 段是否按平面访问，跟着显卡寄存器走
+    this.video.onMapChange = () => { cpu.mmio = this.video.planarMapped ? this.video.planar : null; };
     cpu.onUnsupported = msg => { this.fatal = msg; };
     cpu.onShutdown = () => this.cpuReset(); // 三重错误：主板复位 CPU
     this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
@@ -297,7 +299,7 @@ export class Machine {
           case 0x3d5: {
             const vc = this.video, ci = vc.crtcIndex & 31;
             vc.crtc[ci] = v;
-            if ((ci === 0x0e || ci === 0x0f) && !this.cpu.mmio && this.mem[0x449] <= 3) {
+            if ((ci === 0x0e || ci === 0x0f) && !(vc.planar.gc[6] & 1) && this.mem[0x449] <= 3) {
               const pos = (vc.crtc[0x0e] << 8) | vc.crtc[0x0f];
               this.hle.setCursor(Math.floor(pos / 80) % 25, pos % 80);
             }
