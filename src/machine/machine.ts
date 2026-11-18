@@ -401,9 +401,14 @@ export class Machine {
     // BIOS 数据区
     const bda = 0x400;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
-    // 设备字：位 0 有软驱，位 6~7 软驱数 − 1，位 4~5 = 10 表示 80×25 彩色
+    // 设备字：位 0 有软驱，位 6~7 软驱数 − 1，位 4~5 = 00 表示 EGA/VGA（显卡有自己的 BIOS）
     const floppies = this.drives[1] ? 2 : 1;
-    w16(bda + 0x10, 0x0021 | ((floppies - 1) << 6));
+    w16(bda + 0x10, 0x0001 | ((floppies - 1) << 6));
+    // EGA/VGA 的信息：87h 显存 256KB、显示器是彩色的；88h 开关设置；89h VGA 的模式设置选项
+    mem[bda + 0x87] = 0x60; mem[bda + 0x88] = 0x09; mem[bda + 0x89] = 0x11; mem[bda + 0x8a] = 0x0b;
+    // 显卡 BIOS 的 ROM：C000:0000 起是 55AAh 标志和长度（32KB），程序据此判断有 EGA/VGA 显卡
+    mem.set([0x55, 0xaa, 0x40], 0xc0000);
+    mem.set(Array.from('IBM VGA COMPATIBLE BIOS (AsmPerfect 86)', c => c.charCodeAt(0)), 0xc001e);
     mem[bda + 0x75] = (this.drives[2] ? 1 : 0) + (this.drives[3] ? 1 : 0); // 硬盘个数
     w16(bda + 0x13, 640);
     w16(bda + 0x1a, 0x1e); w16(bda + 0x1c, 0x1e);

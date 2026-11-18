@@ -40,6 +40,23 @@ if (process.env.PORTS) {
     out8: (p, v) => { if ((p & 0xfff8) === 0x2f8 || (p & 0xfff8) === 0x3f8) log.push(`OUT ${p.toString(16)},${v.toString(16)}`); io.out8(p, v); },
   };
 }
+if (process.env.INT6) {
+  const hle = m.hle.handle.bind(m.hle);
+  let shown = 0;
+  const { disassemble: dis6 } = await import('../src/cpu/disasm.ts');
+  m.hle.handle = (n: number) => {
+    if (n === 6 && shown++ < 3) {
+      const ss = m.cpu.s[2], sp = m.cpu.r[4];
+      const ip = m.mem[ss * 16 + sp] | (m.mem[ss * 16 + sp + 1] << 8), cs = m.mem[ss * 16 + sp + 2] | (m.mem[ss * 16 + sp + 3] << 8);
+      const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
+      console.log(`INT 6 在 ${cs.toString(16)}:${ip.toString(16)}：${dis6(read, ip, true).text}，字节 ${[...m.mem.subarray(cs * 16 + ip, cs * 16 + ip + 10)].map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+      console.log('之前的字节：' + [...m.mem.subarray(cs * 16 + ip - 16, cs * 16 + ip)].map(b => b.toString(16).padStart(2, '0')).join(' ')); let o = Math.max(0, ip - 24); const lines: string[] = [];
+      for (let k = 0; k < 14; k++) { const ins = dis6(read, o, true); lines.push(`  ${cs.toString(16)}:${o.toString(16).padStart(4, '0')} ${ins.text}`); o += ins.length; }
+      console.log(lines.join('\n'));
+    }
+    return hle(n);
+  };
+}
 m.load(bootProgram(process.env.BOOT === 'C' ? 0x80 : 0));
 // WATCH=1：CPU 第一次跑到 A000 段以上（又不是 BIOS 的 F000 段）时，打印最近执行过的 40 条指令的位置
 if (process.env.WATCH) {
