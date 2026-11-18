@@ -132,6 +132,15 @@ for (const k of keys) {
     if (mv) { for (let k = 0; k < 10; k++) { m.mouse.moveRel(+mv[1] / 10, +mv[2] / 10); run(1); } continue; }
     if (part === '{CLICK}') { m.mouse.queueButtons(1, m.clock); run(2); m.mouse.queueButtons(0, m.clock); run(2); continue; }
     if (part === '{SHOT}') { console.log('屏幕：\n' + screen()); continue; }
+    const alt = /^\{ALT:([A-Z])\}$/.exec(part);
+    if (alt) { // Alt + 字母
+      const sc = scanForChar(alt[1].toLowerCase());
+      m.pressKey({ scan: 0x38, ascii: 0, release: false });
+      m.pressKey({ scan: sc, ascii: 0, release: false });
+      m.pressKey({ scan: sc | 0x80, ascii: 0, release: true });
+      m.pressKey({ scan: 0xb8, ascii: 0, release: true });
+      continue;
+    }
     if (sp && SPECIAL[sp[1]]) { m.pressKey({ scan: SPECIAL[sp[1]][0], ascii: SPECIAL[sp[1]][1], release: false }); m.pressKey({ scan: SPECIAL[sp[1]][0] | 0x80, ascii: 0, release: true }); }
     else m.typeText(part, scanForChar);
   }

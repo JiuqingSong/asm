@@ -70,7 +70,7 @@
 - **Windows 3.0**：选 286/386 时可以安装并运行（实模式，到 Program Manager）。用户的映像在 D:\Downloads\Microsoft Windows 3.0 (5.25 1.2MB)，不提交。
   - 选 8088 时 Windows 走 8086 专用的路线，显示驱动编译出来的 BitBlt 代码跑飞（tools/boot.ts 的 WATCH/WATCHAT 可以跟踪），原因还没查清；怀疑和 8088 的指令预取队列（自修改代码）有关。
   - Windows 的鼠标驱动：安装时检测到"没有鼠标"，还没试过 Windows 3.0 的鼠标驱动能不能借用 INT 33h。
-  - 286 保护模式 + A20 + 16MB 内存 + CMOS 复位恢复已完成（tests/protected.test.ts）：原版 HIMEM.SYS、DOS=HIGH、Windows 3.0 标准模式可以运行。下一步：Windows 3.1 标准模式；再往后是 386（EMM386、增强模式）。
+  - 286 保护模式 + A20 + 16MB 内存 + CMOS 复位恢复已完成（tests/protected.test.ts）：原版 HIMEM.SYS、DOS=HIGH、Windows 3.0 标准模式可以运行。Windows 3.1 也已经能安装、以标准模式运行，鼠标选 Microsoft, or IBM PS/2。下一步是 386（32 位指令、分页、V86 模式 → EMM386、增强模式）。用户的 Windows 3.1 映像在 D:Windows 3.1 EN，不提交。
 - 缺少的 DOS 功能按需补：执行子程序（4Bh）等。运行 `node tools/run-exe.ts <文件>` 可以列出程序用到的中断、端口和没实现的功能。
 - 图形模式（见第 2 项）。
 - 中文显示的制表符识别是启发式规则（`src/ui/screen.ts` 的 `layoutGbk`），遇到识别错的屏幕，把它加进 `tests/screen.test.ts` 再调规则。

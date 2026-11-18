@@ -114,7 +114,7 @@
 | 出错的处理 | 异常时退回到指令开头再进入处理程序；处理异常时又出错是双重错误（#DF），再出错就"停机"，由主板复位 CPU（见 9.5） |
 | `LOADALL` | 286 的未公开指令：从物理地址 800h 起装入全部寄存器和段描述符缓存。HIMEM.SYS 在 286 上用它访问扩展内存 |
 
-已验证：MS-DOS 6.22 的 HIMEM.SYS 3.10（15MB XMS 内存，`DOS=HIGH` 把 DOS 放进 HMA）；Windows 3.0 的**标准模式**（`WIN /S`，运行到 Program Manager，"关于"里显示 Standard Mode）。
+已验证：MS-DOS 6.22 的 HIMEM.SYS 3.10（15MB XMS 内存，`DOS=HIGH` 把 DOS 放进 HMA）；Windows 3.0 的**标准模式**（`WIN /S`，运行到 Program Manager，"关于"里显示 Standard Mode）；**Windows 3.1** 的安装（6 张 1.44MB 软盘）和运行（"关于"里显示 Standard Mode，可用内存 13,395KB）。
 
 **不支持**：386 的指令、32 位寄存器、分页、V86 模式，所以 EMM386 和 Windows 的 386 增强模式还不能用。从实模式回到保护模式的过程不会被"后退"完整撤销（段描述符缓存不在历史记录里）。
 
@@ -511,6 +511,8 @@ Windows 的鼠标驱动和当年的 DOS 鼠标驱动（MOUSE.COM、CTMOUSE 等�
 | 1200 bps，8 位数据 | Mouse Systems 鼠标 | DTR 或 RTS 置 1 后开始工作；每次发 5 字节的数据包 |
 
 鼠标的移动量来自网页上的鼠标。驱动在用串口鼠标时（程序自己画光标），单击 DOS 屏幕会"捕获"鼠标：浏览器的光标消失，移动量全部交给虚拟机，按 Esc 释放。
+
+**Windows 3.1 使用鼠标**：在 Windows Setup 里把 Mouse 改成 **Microsoft, or IBM PS/2**，它的驱动会在 COM2 上找到 Microsoft 串口鼠标。
 
 **Windows 3.0 使用鼠标**：Windows 安装程序检测不到串口鼠标。安装时在硬件列表里把 Mouse 改成 **Mouse Systems (or VisiOn) connected to COM2:**；已经装好的，在 Windows 的"Windows Setup"程序里用 Options → Change System Settings 修改。注意安装盘上的驱动程序是压缩过的，要由安装程序展开，不能直接复制。
 
