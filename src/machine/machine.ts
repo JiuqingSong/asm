@@ -138,6 +138,7 @@ export class Machine {
     this.cpuModel = id;
     this.clocksPerInstr = s.clocks;
     this.cpu.is286 = s.is286;
+    this.cpu.setFlags(this.cpu.flags); // 位 12-15：8086 为 1，286 为 0
   }
   com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => (on ? this.pic.raise(4) : this.pic.lower(4)));
   com2 = new UART('COM2', 0x2f8, 3, () => this.clock, on => (on ? this.pic.raise(3) : this.pic.lower(3)));
@@ -206,6 +207,7 @@ export class Machine {
       },
     };
     cpu.trap = (n) => this.hle.handle(n);
+    cpu.onUnsupported = msg => { this.fatal = msg; };
     this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
     this.video.planar.onWrite = (a, old) => { if (this.history.enabled) this.history.write(0x100000 + a, old); };
@@ -230,7 +232,8 @@ export class Machine {
           case 0x3d5: return this.crtc[this.crtcIndex & 31];
           case 0x3da: this.retrace ^= 0x09; this.video.resetAttrFlip(); return this.retrace;
           case 0xf0: case 0xf1: return 0xff; // 数学协处理器（没有）
-          case 0x3c6: case 0x3c7: case 0x3c8: case 0x3c9: case 0x3d9: return this.video.in8(port);
+          case 0x3c0: case 0x3c1: case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7: case 0x3c8: case 0x3c9:
+          case 0x3cc: case 0x3ce: case 0x3cf: case 0x3d9: return this.video.in8(port);
         }
         this.unknownPort(port, '读');
         return 0xff;
@@ -336,7 +339,7 @@ export class Machine {
     this.cpu.r.fill(0);
     this.cpu.s.fill(0);
     this.cpu.ip = 0;
-    this.cpu.flags = 0xf002;
+    this.cpu.setFlags(0x0002);
     this.history.clear();
     this.breakpoints.clear();
   }
@@ -453,9 +456,10 @@ export class Machine {
     cpu.s[CS] = 0; cpu.ip = 0x7c00;
     cpu.s[SS] = 0; cpu.r[SP] = 0x7c00;
     cpu.r[DX] = drive;
-    cpu.flags = 0xf202;
+    cpu.setFlags(0x0202);
     cpu.halted = false;
     cpu.waiting = false;
+    cpu.msw = 0xfff0;
     for (const x of this.drives) if (x) x.changed = true;
   }
 
@@ -475,6 +479,9 @@ export class Machine {
     this.exit(0, message);
     this.poweredOff = true;
   }
+
+  /** CPU 遇到了模拟器不支持的情况（例如进入保护模式），下一次检查时停机 */
+  private fatal = '';
 
   /** 已经关机（关机后要重新启动才能运行） */
   poweredOff = false;
@@ -529,7 +536,7 @@ export class Machine {
     cpu.r[SP] = program.stack.sp;
     cpu.s[DS] = program.pspSeg;
     cpu.s[ES] = program.pspSeg;
-    cpu.flags = 0xf202;
+    cpu.setFlags(0x0202);
     cpu.halted = false;
     cpu.waiting = false;
     if (program.format === 'com') {
@@ -628,6 +635,12 @@ export class Machine {
   private checkStop(): StopReason | null {
     const cpu = this.cpu;
     if (this.status === 'exited') return 'exit';
+    if (this.fatal) {
+      this.status = 'error';
+      this.message = this.fatal;
+      this.fatal = '';
+      return 'error';
+    }
     if (cpu.waiting && !this.busy && !this.kbd.queue.length && !(cpu.irq!.pending() && cpu.flags & IF)) {
       this.status = 'waiting';
       this.message = '程序正在等待键盘输入（点击屏幕后直接打字）';

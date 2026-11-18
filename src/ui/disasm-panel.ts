@@ -107,7 +107,7 @@ export class DisasmPanel {
       const target = this.shown[Math.min(n, this.shown.length - 1)];
       off = n < this.shown.length ? target.offset : (target.offset + target.length) & 0xffff;
     } else {
-      off = disassembleAround(read, first, -n, 1)[0].offset;
+      off = disassembleAround(read, first, -n, 1, this.m!.cpu.is286)[0].offset;
       if (off === first) off = (first - 1) & 0xffff; // 回溯不到对齐的起点时至少退一个字节
     }
     this.view = { seg, off };
@@ -127,7 +127,7 @@ export class DisasmPanel {
     const seg = following ? cpu.s[CS] : this.view!.seg;
     const read = this.reader(m, seg);
     const rows = this.rowsFit();
-    const list = (following ? disassembleAround(read, cpu.ip, 8, rows) : disassembleAround(read, this.view!.off, 0, rows))
+    const list = (following ? disassembleAround(read, cpu.ip, 8, rows, cpu.is286) : disassembleAround(read, this.view!.off, 0, rows, cpu.is286))
       .map(i => trapAware(read, seg, i));
     this.shown = list; this.shownSeg = seg;
     if (document.activeElement !== this.input) this.input.value = following ? `${h4(cpu.s[CS])}:${h4(cpu.ip)}` : `${h4(seg)}:${h4(list[0].offset)}`;
@@ -174,5 +174,5 @@ function trapAware(read: (o: number) => number, cs: number, ins: Instruction): I
 export function currentInstruction(m: Machine): Instruction {
   const cs = m.cpu.s[CS];
   const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
-  return trapAware(read, cs, disassemble(read, m.cpu.ip));
+  return trapAware(read, cs, disassemble(read, m.cpu.ip, m.cpu.is286));
 }

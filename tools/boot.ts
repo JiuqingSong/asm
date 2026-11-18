@@ -2,6 +2,9 @@
 // 用法：node tools/boot.ts <A: 映像> [C: 映像 或 -] [百万条指令数] [按键...]
 //   按键：普通文字直接写；{F3} {ENTER} {ESC} {Y} 之类表示特殊键；每段按键之间运行一段时间
 //   C: 写 new:64 表示新建一个 64MB 的空白硬盘；写 - 表示没有硬盘
+//   {PNG} 把图形画面存成 PNG（文件名前缀用环境变量 PNG 指定）；CPU=8088/286/386 选 CPU
+//   调试：WATCH=1 跑飞（执行 00 00 或跑到 A000 段以上）时打印之前的指令和最近的换段；WATCHAT=段:偏移 第一次执行到这里时打印；
+//         DUMPAT=段:偏移 同时反汇编那里的代码；VIDEO=1 打印显卡状态；STATE=1 打印 CPU 状态；VEC=33 打印中断向量；DIS=段:偏移 反汇编
 //   环境变量 BOOT=C 表示从硬盘启动；DISKS="映像2;映像3" 是依次换进 A: 的软盘，按键里写 {SWAP} 换下一张，{EJECT} 取出 A:
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename } from 'node:path';
@@ -10,10 +13,11 @@ import { Disk, blankHardDisk } from '../src/machine/disk.ts';
 import { scanForChar } from '../src/machine/devices.ts';
 import { CP437 } from '../src/ui/screen.ts';
 import { bootProgram } from '../src/machine/boot.ts';
+import { saveScreenPng } from './png.ts';
 
 const [a, c = '-', millionsArg = '200', ...keys] = process.argv.slice(2);
 const m = new Machine();
-m.setCpu('386');
+m.setCpu((process.env.CPU as '8088' | '286' | '386') || '386');
 if (a && a !== '-') m.drives[0] = new Disk(basename(a), new Uint8Array(readFileSync(a)), true);
 if (c.startsWith('new:')) m.drives[2] = new Disk('C.IMG', blankHardDisk(+c.slice(4)), false);
 else if (c !== '-') m.drives[2] = new Disk(basename(c), new Uint8Array(readFileSync(c)), false);
@@ -28,6 +32,42 @@ m.hle.handle = (n: number) => {
   return hle(n);
 };
 m.load(bootProgram(process.env.BOOT === 'C' ? 0x80 : 0));
+// WATCH=1：CPU 第一次跑到 A000 段以上（又不是 BIOS 的 F000 段）时，打印最近执行过的 40 条指令的位置
+if (process.env.WATCH) {
+  const cpu = m.cpu as unknown as { step(): void; s: Uint16Array; ip: number };
+  const orig = cpu.step.bind(cpu);
+  const recent: string[] = [];
+  let reported = false, zeros = 0;
+  const watchAt = process.env.WATCHAT ? process.env.WATCHAT.split(':').map(x => parseInt(x, 16)) : null;
+  const { disassemble } = await import('../src/cpu/disasm.ts');
+  cpu.step = () => {
+    const cs = cpu.s[1], ip = cpu.ip;
+    const lin = ((cs << 4) + ip) & 0xfffff;
+    zeros = m.mem[lin] === 0 && m.mem[lin + 1] === 0 ? zeros + 1 : 0;
+    if (!reported && ((cs >= 0xa000 && cs !== 0xf000) || zeros >= 4 || (watchAt && cs === watchAt[0] && ip === watchAt[1]))) {
+      reported = true;
+      console.log(`跑到了 ${cs.toString(16)}:${ip.toString(16)}，之前执行的指令：\n` + recent.slice(0, recent.length - 3).join('\n'));
+      if (process.env.DUMPAT) { const [ds, dofs] = process.env.DUMPAT.split(':').map(x => parseInt(x, 16)); const rd = (o: number) => m.mem[((ds << 4) + (o & 0xffff)) & 0xfffff]; let o = dofs; const out: string[] = []; for (let k = 0; k < 16; k++) { const ins = disassemble(rd, o); out.push(`  ${ds.toString(16)}:${o.toString(16)}  ${ins.bytes.map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(18)} ${ins.text}`); o += ins.length; } console.log('触发时的代码：\n' + out.join('\n')); }
+      const r = m.cpu.r, s = m.cpu.s;
+      console.log(`寄存器：AX=${r[0].toString(16)} BX=${r[3].toString(16)} CX=${r[1].toString(16)} DX=${r[2].toString(16)} SP=${r[4].toString(16)} BP=${r[5].toString(16)} SI=${r[6].toString(16)} DI=${r[7].toString(16)} ES=${s[0].toString(16)} CS=${s[1].toString(16)} SS=${s[2].toString(16)} DS=${s[3].toString(16)}`);
+    }
+    const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
+    const text = disassemble(read, ip).text;
+    recent.push(`${cs.toString(16).padStart(4, '0')}:${ip.toString(16).padStart(4, '0')}  ${text}`);
+    if (recent.length > 60) recent.shift();
+    tailLog.length = 0; tailLog.push(...recent);
+    orig();
+    if (cpu.s[1] !== cs && !reported) {
+      jumps.push(`${cs.toString(16)}:${ip.toString(16)} ${text} -> ${cpu.s[1].toString(16)}:${cpu.ip.toString(16)}`);
+      if (jumps.length > 30) jumps.shift();
+    }
+    if (reported && !shownJumps) { shownJumps = true; console.log('最近 30 次换代码段：\n' + jumps.join('\n')); }
+  };
+}
+let shownJumps = false;
+const tailLog: string[] = [];
+(globalThis as { __tail?: string[] }).__tail = tailLog;
+const jumps: string[] = [];
 
 const SPECIAL: Record<string, [number, number]> = {
   ENTER: [0x1c, 13], ESC: [0x01, 27], TAB: [0x0f, 9], BS: [0x0e, 8], SPACE: [0x39, 32],
@@ -51,6 +91,7 @@ const screen = () => {
   }
   return rows.join('\n').replace(/\n+$/, '');
 };
+let pngNo = 0;
 const swaps = (process.env.DISKS ?? '').split(';').filter(Boolean);
 const t0 = Date.now();
 run(+millionsArg);
@@ -59,6 +100,7 @@ for (const k of keys) {
     const sp = /^\{([A-Z0-9]+)\}$/.exec(part);
     if (part === '{SWAP}') { const p = swaps.shift()!; m.drives[0] = new Disk(basename(p), new Uint8Array(readFileSync(p)), true); console.log('换盘：', basename(p)); continue; }
     if (part === '{EJECT}') { m.drives[0] = null; console.log('取出 A: 的软盘'); continue; }
+    if (part === '{PNG}') { const f = `${process.env.PNG ?? 'screen'}-${++pngNo}.png`; console.log(saveScreenPng(m, f) ? '截图：' + f : '（文本模式，没有截图）'); continue; }
     if (part === '{SHOT}') { console.log('屏幕：\n' + screen()); continue; }
     if (sp && SPECIAL[sp[1]]) { m.pressKey({ scan: SPECIAL[sp[1]][0], ascii: SPECIAL[sp[1]][1], release: false }); m.pressKey({ scan: SPECIAL[sp[1]][0] | 0x80, ascii: 0, release: true }); }
     else m.typeText(part, scanForChar);
@@ -81,3 +123,18 @@ if (process.env.VEC) {
   const n = parseInt(process.env.VEC, 16), off = m.mem[n * 4] | (m.mem[n * 4 + 1] << 8), seg = m.mem[n * 4 + 2] | (m.mem[n * 4 + 3] << 8);
   console.log(`INT ${n.toString(16)}h -> ${seg.toString(16)}:${off.toString(16)}，开头的字节：${[...m.mem.subarray(seg * 16 + off, seg * 16 + off + 8)].map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
 }
+if (process.env.VIDEO) {
+  const v = m.video, pl = v.planar;
+  const nz = pl.planes.map(p => p.reduce((n, b) => n + (b ? 1 : 0), 0));
+  console.log('平面里非零字节：', nz.join(' / '), '；属性寄存器：', [...v.attr].map(x => x.toString(16)).join(' '));
+  console.log('DAC 前 16 色：', Array.from({ length: 16 }, (_, i) => [...v.dac.subarray(i * 3, i * 3 + 3)].join(',')).join(' | '));
+  console.log('图形控制器：', [...pl.gc.subarray(0, 9)].map(x => x.toString(16)).join(' '), '；定序器：', [...pl.seq.subarray(0, 5)].map(x => x.toString(16)).join(' '), '；PEL 屏蔽', v.pelMask.toString(16));
+}
+if (process.env.STATE) {
+  const c = m.cpu;
+  console.log(`CPU：halted=${c.halted} waiting=${c.waiting} IF=${(c.flags >> 9) & 1} FLAGS=${c.flags.toString(16)}；状态 ${m.status} ${m.message}`);
+  const lin = (c.s[1] << 4) + c.ip;
+  console.log('CS:IP 处的字节：', [...m.mem.subarray(lin, lin + 16)].map(b => b.toString(16).padStart(2, '0')).join(' '));
+}
+
+if (process.env.WATCH) console.log('最后执行的指令：\n' + ((globalThis as { __tail?: string[] }).__tail ?? []).slice(-40).join('\n'));

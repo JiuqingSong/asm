@@ -137,9 +137,17 @@ export class CPU {
   }
 
   setFlags(v: number): void {
-    // 8086：位 12-15 恒为 1，位 1 恒为 1，位 3、5 恒为 0
-    this.flags = (v & 0x0fd5) | 0xf002;
+    // 8086：位 12-15 恒为 1；286 的实模式：位 12-15 恒为 0（程序用这一点区分 8086 和 286）。位 1 恒为 1，位 3、5 恒为 0
+    this.flags = (v & 0x0fd5) | (this.is286 ? 0x0002 : 0xf002);
   }
+
+  // ----- 286 的机器状态字和描述符表寄存器（实模式下只能读写，不能真的进入保护模式） -----
+  /** 机器状态字（MSW）：286 上没用的高位读出来是 1 */
+  msw = 0xfff0;
+  gdtr = { base: 0, limit: 0xffff };
+  idtr = { base: 0, limit: 0x3ff };
+  /** 程序做了模拟器不支持的事（例如进入保护模式）：调用者据此停机并说明原因 */
+  onUnsupported: ((message: string) => void) | null = null;
   private setF(mask: number, on: boolean | number): void {
     if (on) this.flags |= mask; else this.flags &= ~mask;
   }
@@ -287,6 +295,7 @@ export class CPU {
   /** 移位/循环移位：0 ROL 1 ROR 2 RCL 3 RCR 4 SHL 5 SHR 6 SETMO 7 SAR */
   private shift(op: number, v: number, count: number, w: boolean): number {
     if (count === 0) return v;
+    if (op === 6 && this.is286) op = 4; // 186 以后：/6 是 SHL 的别名（8086 上是未公开的 SETMO）
     const mask = w ? 0xffff : 0xff, sign = w ? 0x8000 : 0x80;
     let cf = this.flags & CF ? 1 : 0;
     for (let i = 0; i < count; i++) {
@@ -313,6 +322,7 @@ export class CPU {
   }
 
   private divideError(): void {
+    if (this.is286) this.ip = this.startIP; // 286 以后：返回地址指向出错的那条指令
     this.interrupt(0);
   }
 
@@ -406,6 +416,86 @@ export class CPU {
     return cc & 1 ? !res : res;
   }
 
+  // ================= 186/286 的新指令 =================
+
+  /** 无效操作码（286）：6 号中断，返回地址指向这条指令 */
+  private invalidOpcode(): void {
+    this.ip = this.startIP;
+    this.interrupt(6);
+  }
+
+  private exec186(op: number): void {
+    const r = this.r;
+    switch (op) {
+      case 0x60: { // PUSHA
+        const sp = r[SP];
+        this.push(r[AX]); this.push(r[CX]); this.push(r[DX]); this.push(r[BX]);
+        this.push(sp); this.push(r[BP]); this.push(r[SI]); this.push(r[DI]);
+        return;
+      }
+      case 0x61: // POPA（跳过 SP）
+        r[DI] = this.pop(); r[SI] = this.pop(); r[BP] = this.pop(); this.pop();
+        r[BX] = this.pop(); r[DX] = this.pop(); r[CX] = this.pop(); r[AX] = this.pop();
+        return;
+      case 0x62: { // BOUND r16, m16&16：超出范围时产生 5 号中断
+        this.modrm();
+        if (this.mod === 3) { this.invalidOpcode(); return; }
+        const v = (r[this.reg] << 16) >> 16;
+        const lo = (this.rw(this.eaSeg, this.eaOff) << 16) >> 16, hi = (this.rw(this.eaSeg, this.eaOff + 2) << 16) >> 16;
+        if (v < lo || v > hi) { this.ip = this.startIP; this.interrupt(5); }
+        return;
+      }
+      case 0x68: this.push(this.fetch16()); return;            // PUSH imm16
+      case 0x6a: this.push(this.fetchS8() & 0xffff); return;   // PUSH imm8（符号扩展）
+      case 0x69: case 0x6b: { // IMUL r16, r/m16, 立即数
+        this.modrm();
+        const a = (this.getRM16() << 16) >> 16;
+        const b = op === 0x69 ? (this.fetch16() << 16) >> 16 : this.fetchS8();
+        const res = a * b;
+        const low = res & 0xffff;
+        r[this.reg] = low;
+        const fits = ((low << 16) >> 16) === res;
+        this.setF(CF, !fits); this.setF(OF, !fits);
+        this.szp16(low);
+        return;
+      }
+      case 0x6c: case 0x6d: case 0x6e: case 0x6f: this.stringOp(op); return; // INS / OUTS
+      default: this.invalidOpcode(); return; // 63h ARPL（只在保护模式下有效），64h~67h 是 386 的前缀
+    }
+  }
+
+  /** 0F 开头的两字节指令（286）：实模式下能用的只有 SMSW、LMSW、SGDT/SIDT/LGDT/LIDT、CLTS */
+  private exec0F(): void {
+    const op2 = this.fetch8();
+    if (op2 === 0x01) {
+      this.modrm();
+      const reg = this.reg;
+      if (reg === 4) { this.setRM16(this.msw); return; } // SMSW
+      if (reg === 6) { // LMSW：PE 位一旦置 1 就进入保护模式
+        const v = this.getRM16();
+        this.msw = (this.msw & 0xfff0) | (v & 0x0f) | (this.msw & 1);
+        if (this.msw & 1) this.onUnsupported?.('程序要进入 286 保护模式（LMSW 把 PE 位置 1），本模拟器只支持实模式');
+        return;
+      }
+      if (this.mod === 3 || reg > 3) { this.invalidOpcode(); return; }
+      const t = reg === 0 || reg === 2 ? this.gdtr : this.idtr;
+      const seg = this.eaSeg, off = this.eaOff;
+      if (reg < 2) { // SGDT / SIDT：界限 2 字节 + 基址 3 字节 + 一个 FFh（286）
+        this.ww(seg, off, t.limit);
+        this.ww(seg, off + 2, t.base & 0xffff);
+        this.wb(seg, off + 4, t.base >> 16);
+        this.wb(seg, off + 5, 0xff);
+      } else { // LGDT / LIDT
+        t.limit = this.rw(seg, off);
+        t.base = this.rw(seg, off + 2) | (this.rb(seg, off + 4) << 16);
+      }
+      return;
+    }
+    if (op2 === 0x06) { this.msw &= ~8; return; } // CLTS
+    if (op2 === 0x05) { this.onUnsupported?.('程序执行了 286 的未公开指令 LOADALL（HIMEM.SYS 等用它访问 1MB 以上的内存），本模拟器不支持'); return; }
+    this.invalidOpcode(); // 0F 00（LLDT 等）在实模式下无效；其余是 386 以后的指令
+  }
+
   // ================= 串操作 =================
 
   private stringOp(op: number): void {
@@ -436,6 +526,18 @@ export class CPU {
         if (w) r[AX] = this.rw(srcSeg, r[SI]); else this.setR8(0, this.rb(srcSeg, r[SI]));
         r[SI] += d;
         break;
+      case 0x6c: // INSB / INSW（186 以后）
+        if (w) this.ww(es, r[DI], this.io.in8(r[DX]) | (this.io.in8((r[DX] + 1) & 0xffff) << 8));
+        else this.wb(es, r[DI], this.io.in8(r[DX]));
+        r[DI] += d;
+        break;
+      case 0x6e: { // OUTSB / OUTSW
+        const v = w ? this.rw(srcSeg, r[SI]) : this.rb(srcSeg, r[SI]);
+        this.io.out8(r[DX], v & 0xff);
+        if (w) this.io.out8((r[DX] + 1) & 0xffff, v >> 8);
+        r[SI] += d;
+        break;
+      }
       case 0xae:
         if (w) this.alu(7, r[AX], this.rw(es, r[DI]), true);
         else this.alu(7, r[AX] & 0xff, this.rb(es, r[DI]), false);
@@ -507,6 +609,31 @@ export class CPU {
 
   private exec(op: number): void {
     const r = this.r, s = this.s;
+    if (this.is286) {
+      // 286：这些操作码在 8086 上是别的指令（POP CS、条件跳转和 RET 的别名），在 186/286 上是新指令
+      if (op === 0x0f) { this.exec0F(); return; }
+      if (op >= 0x60 && op <= 0x6f) { this.exec186(op); return; }
+      if (op === 0xc0 || op === 0xc1) { // 移位，次数是立即数
+        const w = op === 0xc1;
+        this.modrm();
+        const v = this.getRM(w);
+        this.setRM(w, this.shift(this.reg, v, this.fetch8() & 0x1f, w));
+        return;
+      }
+      if (op === 0xc8) { // ENTER 栈帧大小, 嵌套层数
+        const size = this.fetch16(), level = this.fetch8() & 0x1f;
+        this.push(r[BP]);
+        const frame = r[SP];
+        if (level > 0) {
+          for (let k = 1; k < level; k++) { r[BP] -= 2; this.push(this.rw(s[SS], r[BP])); }
+          this.push(frame);
+        }
+        r[BP] = frame;
+        r[SP] -= size;
+        return;
+      }
+      if (op === 0xc9) { r[SP] = r[BP]; r[BP] = this.pop(); return; } // LEAVE
+    }
     switch (op) {
       // ---- 00-3F：算术逻辑运算 ----
       case 0x00: case 0x01: case 0x02: case 0x03: case 0x08: case 0x09: case 0x0a: case 0x0b:

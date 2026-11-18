@@ -66,8 +66,12 @@
 
 ### 7. 运行更多 DOS 程序
 
-- 80186 指令（很多"286 程序"实际只用到 186 指令）；SingleStepTests 也有 286 的测试集。
-- 缺少的 DOS 功能按需补：查找文件（4Eh/4Fh）、执行子程序（4Bh）、磁盘剩余空间（36h）等。运行 `node tools/run-exe.ts <文件>` 可以列出程序用到的中断、端口和没实现的功能。
+- 186/286 实模式指令已完成（CPU 选 286/386 时）。可以下载 SingleStepTests 的 80286 测试集逐条验证（目前只有单元测试和真软件验证）。
+- **Windows 3.0**：选 286/386 时可以安装并运行（实模式，到 Program Manager）。用户的映像在 D:\Downloads\Microsoft Windows 3.0 (5.25 1.2MB)，不提交。
+  - 选 8088 时 Windows 走 8086 专用的路线，显示驱动编译出来的 BitBlt 代码跑飞（tools/boot.ts 的 WATCH/WATCHAT 可以跟踪），原因还没查清；怀疑和 8088 的指令预取队列（自修改代码）有关。
+  - Windows 的鼠标驱动：安装时检测到"没有鼠标"，还没试过 Windows 3.0 的鼠标驱动能不能借用 INT 33h。
+  - 下一步：286 保护模式 + A20 + 1MB 以上内存 + CMOS 复位恢复 → 原版 HIMEM.SYS、Windows 标准模式；再往后是 386（EMM386、增强模式）。
+- 缺少的 DOS 功能按需补：执行子程序（4Bh）等。运行 `node tools/run-exe.ts <文件>` 可以列出程序用到的中断、端口和没实现的功能。
 - 图形模式（见第 2 项）。
 - 中文显示的制表符识别是启发式规则（`src/ui/screen.ts` 的 `layoutGbk`），遇到识别错的屏幕，把它加进 `tests/screen.test.ts` 再调规则。
 

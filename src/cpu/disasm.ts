@@ -45,7 +45,8 @@ export interface Instruction {
 
 export type ReadByte = (offset: number) => number;
 
-export function disassemble(read: ReadByte, start: number): Instruction {
+/** cpu286 为 true 时按 186/286 解释 0Fh、60h~6Fh、C0h/C1h、C8h/C9h 等操作码 */
+export function disassemble(read: ReadByte, start: number, cpu286 = false): Instruction {
   let p = start & 0xffff;
   const bytes: number[] = [];
   const next = () => { const b = read(p) & 0xff; bytes.push(b); p = (p + 1) & 0xffff; return b; };
@@ -113,6 +114,50 @@ export function disassemble(read: ReadByte, start: number): Instruction {
   }
   const rel8 = () => { const d = sx8(next()); return (p + d) & 0xffff; };
   const rel16 = () => { const d = next16(); return (p + d) & 0xffff; };
+
+  if (cpu286) {
+    switch (op) {
+      case 0x0f: {
+        const op2 = next();
+        if (op2 === 0x01) {
+          modrm();
+          const names = ['SGDT', 'SIDT', 'LGDT', 'LIDT', 'SMSW', '', 'LMSW', ''];
+          if (!names[reg] || (reg < 4 && mod === 3)) break;
+          return finish(names[reg], [reg >= 4 ? rmOp(true, false) : memText]);
+        }
+        if (op2 === 0x00) {
+          modrm();
+          const names = ['SLDT', 'STR', 'LLDT', 'LTR', 'VERR', 'VERW', '', ''];
+          if (!names[reg]) break;
+          return finish(names[reg], [rmOp(true, false)]);
+        }
+        if (op2 === 0x06) return finish('CLTS', []);
+        if (op2 === 0x05) return finish('LOADALL', [], { undocumented: true });
+        break;
+      }
+      case 0x60: return finish('PUSHA', []);
+      case 0x61: return finish('POPA', []);
+      case 0x62: modrm(); return finish('BOUND', [R16[reg], memText]);
+      case 0x68: return finish('PUSH', [hexNum(next16(), 4)]);
+      case 0x6a: return finish('PUSH', [signedImm(sx8(next()))]);
+      case 0x69: case 0x6b: {
+        modrm();
+        const a = rmOp(true, false);
+        return finish('IMUL', [R16[reg], a, op === 0x69 ? hexNum(next16(), 4) : signedImm(sx8(next()))]);
+      }
+      case 0x6c: case 0x6d: return finish(op & 1 ? 'INSW' : 'INSB', []);
+      case 0x6e: case 0x6f: return finish(op & 1 ? 'OUTSW' : 'OUTSB', []);
+      case 0xc0: case 0xc1: {
+        const w = op === 0xc1;
+        modrm();
+        const target = rmOp(w, true);
+        return finish(SHIFT[reg === 6 ? 4 : reg], [target, hexNum(next(), 2)]);
+      }
+      case 0xc8: { const size = next16(); const level = next(); return finish('ENTER', [hexNum(size, 4), hexNum(level, 2)]); }
+      case 0xc9: return finish('LEAVE', []);
+    }
+    if (op === 0x0f || (op >= 0x60 && op <= 0x6f)) return finish('DB', bytes.map(b => hexNum(b, 2)), { undocumented: true }); // 无效操作码
+  }
 
   // ---- 00-3F：算术逻辑运算 ----
   if (op < 0x40 && (op & 7) < 6) {
@@ -287,14 +332,14 @@ function signedImm(v: number): string {
  * 反汇编一段代码，使 at 处的指令包含在里面：向前回溯若干字节找一个能"对齐"到 at 的起点，
  * 再向后连续反汇编 count 条。
  */
-export function disassembleAround(read: ReadByte, at: number, before: number, count: number): Instruction[] {
+export function disassembleAround(read: ReadByte, at: number, before: number, count: number, cpu286 = false): Instruction[] {
   at &= 0xffff;
   let bestStart = at, bestN = 0;
   for (let back = Math.min(before * 6, at); back > 0; back--) {
     const s = (at - back) & 0xffff;
     let p = s, n = 0;
     while (((at - p) & 0xffff) > 0 && ((at - p) & 0xffff) <= back && n < 64) {
-      const ins = disassemble(read, p);
+      const ins = disassemble(read, p, cpu286);
       p = (p + ins.length) & 0xffff;
       n++;
     }
@@ -304,7 +349,7 @@ export function disassembleAround(read: ReadByte, at: number, before: number, co
   const out: Instruction[] = [];
   let p = bestStart;
   while (out.length < count) {
-    const ins = disassemble(read, p);
+    const ins = disassemble(read, p, cpu286);
     out.push(ins);
     p = (p + ins.length) & 0xffff;
   }
