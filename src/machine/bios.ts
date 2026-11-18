@@ -310,7 +310,16 @@ export class Hle {
     const r = this.cpu.r;
     switch (this.ah) {
       case 0x4f: this.retFlag(CF, true); return true;          // 键盘拦截：照常处理这个键
-      case 0x88: r[AX] = 0; this.retFlag(CF, false); return true; // 扩展内存 KB 数
+      case 0x88: r[AX] = this.cpu.is286 ? 15360 : 0; this.retFlag(CF, false); return true; // 扩展内存 KB 数（286 时 15MB）
+      case 0x87: { // 在扩展内存之间搬数据：ES:SI 指向 GDT（第 2、3 项是源和目标），CX 个字
+        if (!this.cpu.is286) break;
+        const cpu = this.cpu, gdt = (cpu.s[ES] << 4) + r[SI];
+        const base = (o: number) => cpu.mem[gdt + o + 2] | (cpu.mem[gdt + o + 3] << 8) | (cpu.mem[gdt + o + 4] << 16);
+        const src = base(0x10), dst = base(0x18), n = r[CX] * 2;
+        for (let k = 0; k < n; k++) cpu.writeLin((dst + k) & 0xffffff, cpu.readLin((src + k) & 0xffffff));
+        this.ah = 0; this.retFlag(CF, false); this.retFlag(ZF, true);
+        return true;
+      }
       case 0x90: case 0x91: this.ah = 0; this.retFlag(CF, false); return true; // 设备忙 / 中断完成
       case 0x86: this.retFlag(CF, false); return true;          // 等待 CX:DX 微秒：不等
       case 0x53: return this.apm();

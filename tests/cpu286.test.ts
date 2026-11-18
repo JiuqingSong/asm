@@ -50,12 +50,6 @@ describe('286 指令（CPU 选 286/386 时）', () => {
     expect(c.r[BX] & 0xf000).toBe(0);
   });
 
-  it('LMSW 进入保护模式时报告"不支持"', () => {
-    let msg = '';
-    run([0xb8, 0x01, 0x00, 0x0f, 0x01, 0xf0], true, 2, c => { c.onUnsupported = m => { msg = m; }; });
-    expect(msg).toMatch(/保护模式/);
-  });
-
   it('无效操作码产生 6 号中断，返回地址指向这条指令', () => {
     const c = run([0x0f, 0xff], true, 1, c => { c.mem[6 * 4] = 0x00; c.mem[6 * 4 + 1] = 0x05; c.mem[6 * 4 + 2] = 0x00; c.mem[6 * 4 + 3] = 0x40; });
     expect([c.s[CS], c.ip]).toEqual([0x4000, 0x0500]);

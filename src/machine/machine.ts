@@ -1,5 +1,5 @@
 // 虚拟 PC：CPU + 内存 + 中断控制器 + 定时器 + 键盘 + BIOS/DOS，以及调试功能
-import { CPU, CS, DS, ES, SS, SP, DX, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
+import { CPU, CS, DS, ES, SS, SP, DX, AX, BX, CX, BP, SI, DI, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
 import { Disk } from './disk.ts';
 import { SerialMouse } from './serial-mouse.ts';
 import type { Program } from '../asm/types.ts';
@@ -90,7 +90,7 @@ class History {
     for (let w = this.wpos - 1; w >= start; w--) {
       const j = w % this.wcap;
       const a = this.waddr[j];
-      if (a >= 0x100000) restore(a - 0x100000, this.wold[j]); // 显卡平面里的字节
+      if (a >= PLANAR_HISTORY) restore(a - PLANAR_HISTORY, this.wold[j]); // 显卡平面里的字节
       else cpu.mem[a] = this.wold[j];
     }
     this.wpos = start;
@@ -106,6 +106,8 @@ class History {
 }
 
 const H_VISIBLE = 1;
+/** 历史记录里显卡平面字节的地址从这里开始（内存是 16MB，不会和它重叠） */
+const PLANAR_HISTORY = 0x1000000;
 
 export interface MachineEvents {
   log?(msg: string): void;
@@ -184,6 +186,11 @@ export class Machine {
   private crtcIndex = 0;
   private crtc = new Uint8Array(32);
   private cmosIndex = 0;
+  /** CMOS 的 128 字节（时间以外的部分）：关机原因（0Fh）、软驱和硬盘类型、内存大小等 */
+  cmos = new Uint8Array(128);
+  private kbcOutputPending = false;
+  private kbcWriteOutput = false;
+  private port92 = 0;
   private retrace = 0;
   private unknownPorts = new Set<number>();
 
@@ -211,9 +218,10 @@ export class Machine {
     };
     cpu.trap = (n) => this.hle.handle(n);
     cpu.onUnsupported = msg => { this.fatal = msg; };
+    cpu.onShutdown = () => this.cpuReset(); // 三重错误：主板复位 CPU
     this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
-    this.video.planar.onWrite = (a, old) => { if (this.history.enabled) this.history.write(0x100000 + a, old); };
+    this.video.planar.onWrite = (a, old) => { if (this.history.enabled) this.history.write(PLANAR_HISTORY + a, old); };
     this.com1.onWarn = this.com2.onWarn = msg => this.log(msg);
     this.com2.peer = this.serialMouse;
   }
@@ -228,9 +236,12 @@ export class Machine {
         switch (port) {
           case 0x20: case 0x21: return this.pic.in8(port);
           case 0x40: case 0x41: case 0x42: case 0x43: return this.pit.in8(port);
-          case 0x60: return this.kbd.in60();
+          case 0x60:
+            if (this.kbcOutputPending) { this.kbcOutputPending = false; return this.kbcOutputPort(); } // 命令 D0h 的回答
+            return this.kbd.in60();
           case 0x61: return (this.port61 & 0xcf) | ((Math.floor(this.clock / 18) & 1) << 4); // 位 4：内存刷新，约每 15 微秒翻转一次（AT 机上程序用它计时）
-          case 0x64: return this.kbd.queue.length ? 0x15 : 0x14;
+          case 0x64: return this.kbd.queue.length || this.kbcOutputPending ? 0x15 : 0x14;
+          case 0x92: return this.cpu.a20Enabled ? 0x02 : 0x00;
           case 0x71: return this.cmosRead();
           case 0x3d4: return this.crtcIndex;
           case 0x3d5: return this.crtc[this.crtcIndex & 31];
@@ -254,8 +265,33 @@ export class Machine {
           }
           case 0x40: case 0x41: case 0x42: case 0x43: this.pit.out8(port, v); return;
           case 0x61: this.port61 = v; this.updateSpeaker(); return;
-          case 0x64: if (v === 0xfe) this.reboot(); return; // 键盘控制器命令 FEh：复位 CPU（重新启动）
-          case 0x60: return; // 发给键盘的命令（设置指示灯等）：接受但不模拟
+          case 0x64: // 键盘控制器（8042）的命令
+            switch (v) {
+              case 0xd0: this.kbcOutputPending = true; return;  // 读输出端口：下一次读 60h 得到
+              case 0xd1: this.kbcWriteOutput = true; return;    // 写输出端口：下一次写 60h 的字节
+              case 0xdd: this.cpu.setA20(false); return;
+              case 0xdf: this.cpu.setA20(true); return;
+              case 0xfe: this.cpuReset(); return;               // 复位 CPU
+            }
+            if (v >= 0xf0 && !(v & 1)) this.cpuReset();         // F0h~FEh：脉冲输出端口，位 0 为 0 时复位 CPU
+            return;
+          case 0x60:
+            if (this.kbcWriteOutput) {
+              // 输出端口：位 1 是 A20 门，位 0 为 0 时复位 CPU
+              this.kbcWriteOutput = false;
+              this.cpu.setA20((v & 2) !== 0);
+              if (!(v & 1)) this.cpuReset();
+              return;
+            }
+            return; // 发给键盘的命令（设置指示灯等）：接受但不模拟
+          case 0x92: { // "快速 A20"端口：位 1 是 A20，位 0 从 0 变 1 时复位 CPU
+            this.cpu.setA20((v & 2) !== 0);
+            const reset = v & 1 && !(this.port92 & 1);
+            this.port92 = v;
+            if (reset) this.cpuReset();
+            return;
+          }
+          case 0x71: this.cmosWrite(v); return;
           case 0x70: this.cmosIndex = v & 0x7f; return;
           case 0xf0: case 0xf1: return; // 数学协处理器的复位端口：Turbo Pascal 等检测协处理器时会写
           case 0x3d4: this.crtcIndex = v; return;
@@ -280,6 +316,63 @@ export class Machine {
     this.log(`程序${what}了端口 ${port.toString(16).toUpperCase()}h，该端口没有模拟的设备${what === '读' ? '（读到 FFh）' : '（写入被忽略）'}`);
   }
 
+  private kbcOutputPort(): number {
+    return 0xdd | (this.cpu.a20Enabled ? 0x02 : 0);
+  }
+
+  private cmosWrite(v: number): void {
+    const i = this.cmosIndex;
+    if ([0x00, 0x02, 0x04, 0x06, 0x07, 0x08, 0x09, 0x32].includes(i)) return; // 时间、日期跟着电脑的时钟走
+    this.cmos[i] = v;
+  }
+
+  /** CMOS 的初始内容：1.44MB 软驱、640KB 常规内存、扩展内存（286 时 15MB） */
+  private initCmos(): void {
+    const c = this.cmos;
+    c.fill(0);
+    c[0x10] = 0x40;                        // A: 1.44MB
+    c[0x14] = 0x01 | (this.drives[1] ? 0x40 : 0); // 设备字节
+    c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
+    const ext = this.cpu.is286 ? 15360 : 0;
+    c[0x17] = c[0x30] = ext & 0xff; c[0x18] = c[0x31] = ext >> 8;
+  }
+
+  /**
+   * CPU 被复位（键盘控制器命令、端口 92h、三重错误）。AT 机上程序用这个办法从 286 的保护模式回到实模式：
+   * 先在 CMOS 的 0Fh 写"关机原因"、在 0040:0067 放好返回地址，再复位 CPU。BIOS 开机时看到原因是
+   * 05h 或 0Ah 就不重新开机，而是直接跳到 0040:0067（05h 还要先给中断控制器发 EOI）
+   */
+  cpuReset(): void {
+    const code = this.cmos[0x0f];
+    this.cmos[0x0f] = 0;
+    const cpu = this.cpu;
+    if (code === 0x05 || code === 0x0a || code === 0x09) {
+      cpu.resetProtected();
+      cpu.setFlags(0x0002);
+      cpu.halted = false;
+      cpu.waiting = false;
+      if (code === 0x05) this.pic.out8(0x20, 0x20);
+      const m = this.mem;
+      const off = m[0x467] | (m[0x468] << 8), seg = m[0x469] | (m[0x46a] << 8);
+      if (code === 0x09) {
+        // "从 INT 15h 87h（搬移扩展内存）返回"：0040:0067 存的是 SS:SP。AT 机 BIOS 的做法是
+        // 换回这个堆栈，弹出 DS、ES，再 POPA、IRET（Windows 3.0 标准模式的 DOSX 就是按这个顺序准备堆栈的）
+        const r = cpu.r;
+        cpu.s[SS] = seg; r[SP] = off;
+        cpu.s[DS] = cpu.pop();
+        cpu.s[ES] = cpu.pop();
+        r[DI] = cpu.pop(); r[SI] = cpu.pop(); r[BP] = cpu.pop(); cpu.pop();
+        r[BX] = cpu.pop(); r[DX] = cpu.pop(); r[CX] = cpu.pop(); r[AX] = cpu.pop();
+        cpu.ip = cpu.pop(); cpu.s[CS] = cpu.pop(); cpu.setFlags(cpu.pop());
+        return;
+      }
+      cpu.ip = off;
+      cpu.s[CS] = seg;
+      return;
+    }
+    this.reboot();
+  }
+
   private cmosRead(): number {
     const d = new Date();
     const bcd = (v: number) => ((Math.floor(v / 10) % 10) << 4) | (v % 10);
@@ -296,7 +389,7 @@ export class Machine {
       case 0x0d: return 0x80;
       case 0x32: return bcd(Math.floor(d.getFullYear() / 100));
     }
-    return 0;
+    return this.cmos[this.cmosIndex];
   }
 
   // ======================= 事件 =======================
@@ -432,6 +525,11 @@ export class Machine {
     this.clock = 0;
     this.video.reset();
     cpu.mmio = null;
+    cpu.resetProtected();
+    cpu.setA20(false);
+    this.kbcOutputPending = this.kbcWriteOutput = false;
+    this.port92 = 0;
+    this.initCmos();
     this.mouse.powerOn();
     this.com1.reset();
     this.com2.reset();
@@ -581,7 +679,7 @@ export class Machine {
 
   // ======================= 执行 =======================
 
-  get linearIP(): number { return ((this.cpu.s[CS] << 4) + this.cpu.ip) & 0xfffff; }
+  get linearIP(): number { return this.cpu.linearIP; }
   inBios(): boolean { return this.cpu.s[CS] === BIOS_SEG; }
 
   private inCode(lin: number): boolean {

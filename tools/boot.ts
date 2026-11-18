@@ -69,7 +69,7 @@ if (process.env.WATCH) {
   const { disassemble } = await import('../src/cpu/disasm.ts');
   cpu.step = () => {
     const cs = cpu.s[1], ip = cpu.ip;
-    const lin = ((cs << 4) + ip) & 0xfffff;
+    const cbase = m.cpu.segBase(1), lin = (cbase + ip) & 0xffffff;
     zeros = m.mem[lin] === 0 && m.mem[lin + 1] === 0 ? zeros + 1 : 0;
     if (!reported && ((cs >= 0xa000 && cs !== 0xf000) || zeros >= 4 || (watchAt && cs === watchAt[0] && ip === watchAt[1]) || (watchInt && m.mem[lin] === 0xcd && m.mem[lin + 1] === watchInt[0] && (m.cpu.r[0] >> 8) === watchInt[1]))) {
       reported = true;
@@ -78,7 +78,7 @@ if (process.env.WATCH) {
       const r = m.cpu.r, s = m.cpu.s;
       console.log(`寄存器：AX=${r[0].toString(16)} BX=${r[3].toString(16)} CX=${r[1].toString(16)} DX=${r[2].toString(16)} SP=${r[4].toString(16)} BP=${r[5].toString(16)} SI=${r[6].toString(16)} DI=${r[7].toString(16)} ES=${s[0].toString(16)} CS=${s[1].toString(16)} SS=${s[2].toString(16)} DS=${s[3].toString(16)}`);
     }
-    const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
+    const read = (o: number) => m.mem[(cbase + (o & 0xffff)) & 0xffffff];
     const text = disassemble(read, ip).text;
     recent.push(`${cs.toString(16).padStart(4, '0')}:${ip.toString(16).padStart(4, '0')}  ${text}`);
     if (recent.length > 60) recent.shift();
@@ -162,7 +162,7 @@ if (process.env.VIDEO) {
 }
 if (process.env.STATE) {
   const c = m.cpu;
-  console.log(`CPU：halted=${c.halted} waiting=${c.waiting} IF=${(c.flags >> 9) & 1} FLAGS=${c.flags.toString(16)}；状态 ${m.status} ${m.message}`);
+  console.log(`CPU：halted=${c.halted} waiting=${c.waiting} IF=${(c.flags >> 9) & 1} FLAGS=${c.flags.toString(16)} 保护模式=${c.protectedMode} CPL=${c.cpl} 中断次数=${c.interrupts} A20=${c.a20Enabled}；状态 ${m.status} ${m.message}`);
   const lin = (c.s[1] << 4) + c.ip;
   console.log('CS:IP 处的字节：', [...m.mem.subarray(lin, lin + 16)].map(b => b.toString(16).padStart(2, '0')).join(' '));
 }
