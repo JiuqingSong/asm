@@ -43,6 +43,26 @@ if (process.env.PORTS) {
     out8: (p, v) => { if ((p & 0xfff8) === 0x2f8 || (p & 0xfff8) === 0x3f8) log.push(`OUT ${p.toString(16)},${v.toString(16)}`); io.out8(p, v); },
   };
 }
+// PORTLOG=3c0-3df,a0-a1：记录这些端口的读写（只记保护模式下的；PORTLOGALL=1 时都记），最后打印最近的 PORTLOGN 条
+if (process.env.PORTLOG) {
+  const ranges = process.env.PORTLOG.split(',').map(r => r.split('-').map(x => parseInt(x, 16))).map(([a, b]) => [a, b ?? a]);
+  const io = m.cpu.io;
+  const log: string[] = [];
+  (globalThis as { __portlog?: string[] }).__portlog = log;
+  const want = (p: number) => (process.env.PORTLOGALL || m.cpu.protectedMode) && ranges.some(([a, b]) => p >= a && p <= b);
+  const at = () => `${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}${m.cpu.v86 ? 'v' : ''}`;
+  m.cpu.io = {
+    in8: p => { const v = io.in8(p); if (want(p)) log.push(`${at()} IN ${p.toString(16)}=${v.toString(16)}`); return v; },
+    out8: (p, v) => { if (want(p)) log.push(`${at()} OUT ${p.toString(16)},${v.toString(16)}`); io.out8(p, v); },
+  };
+}
+if (process.env.ATTRWATCH) { // 谁写了属性控制器的 10h（模式控制）寄存器
+  const v = m.video, orig = v.setAttr.bind(v), origLoad = v.loadModeRegs.bind(v);
+  v.setAttr = (i: number, x: number) => { if (i === 0x10) console.log(`attr[10h] = ${x.toString(16)} 于 ${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}`); orig(i, x); };
+  v.loadModeRegs = (mode: number) => { console.log(`loadModeRegs(${mode.toString(16)}) 于 ${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}`); origLoad(mode); };
+  const origReset = v.reset.bind(v);
+  v.reset = () => { console.log(`video.reset 于 ${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}`); origReset(); };
+}
 if (process.env.INT6) {
   const hle = m.hle.handle.bind(m.hle);
   let shown = 0;
@@ -92,6 +112,39 @@ if (process.env.WATCH) {
       if (jumps.length > 30) jumps.shift();
     }
     if (reported && !shownJumps) { shownJumps = true; console.log('最近 30 次换代码段：\n' + jumps.join('\n')); }
+  };
+}
+// TRACEFROM=段:偏移（十六进制，偏移可以是 32 位）：执行到这里以后记录接下来的 TRACEN 条指令（含 32 位寄存器），最后打印
+const traceLog: string[] = [];
+if (process.env.TRACEFROM) {
+  const [tcs, tip] = process.env.TRACEFROM.split(':').map(x => parseInt(x, 16));
+  const n = +(process.env.TRACEN ?? 2000);
+  const cpu = m.cpu;
+  const orig = cpu.step.bind(cpu);
+  const { disassemble } = await import('../src/cpu/disasm.ts');
+  let on = false;
+  const h = (v: number) => (v >>> 0).toString(16);
+  cpu.step = () => {
+    if (!on && cpu.s[1] === tcs && cpu.ip === tip) {
+      on = true;
+      // TRACEDIS=起点-终点（当前代码段里的偏移）：开始跟踪时反汇编这一段
+      if (process.env.TRACEDIS) {
+        const [d0, d1] = process.env.TRACEDIS.split('-').map(x => parseInt(x, 16));
+        const base = cpu.segBase(1);
+        let o = d0;
+        while (o < d1) {
+          const ins = disassemble(q => cpu.peekLin(base + (q >>> 0)), o, { is386: true, code32: cpu.code32 });
+          traceLog.push(`  ${h(o)}  ${ins.bytes.map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(24)} ${ins.text}`);
+          o += ins.length;
+        }
+      }
+    }
+    if (on && traceLog.length < n) {
+      const base = cpu.segBase(1), mask = cpu.code32 ? 0xffffffff : 0xffff;
+      const ins = disassemble(o => cpu.peekLin(base + ((o & mask) >>> 0)), cpu.ip, { is386: cpu.is386, code32: cpu.code32 });
+      traceLog.push(`${h(cpu.s[1])}:${h(cpu.ip).padStart(8, '0')} ${ins.text.padEnd(36)} eax=${h(cpu.r32(0))} ebx=${h(cpu.r32(3))} ecx=${h(cpu.r32(1))} edx=${h(cpu.r32(2))} esi=${h(cpu.r32(6))} edi=${h(cpu.r32(7))} f=${h(cpu.flags)}`);
+    }
+    orig();
   };
 }
 let shownJumps = false;
@@ -179,7 +232,9 @@ if (process.env.STATE) {
   console.log('CS:IP 处的字节：', [...m.mem.subarray(lin, lin + 16)].map(b => b.toString(16).padStart(2, '0')).join(' '));
 }
 
+if (process.env.TRACEFROM) console.log('跟踪：\n' + traceLog.join('\n'));
 if (process.env.WATCH) console.log('最后执行的指令：\n' + ((globalThis as { __tail?: string[] }).__tail ?? []).slice(-40).join('\n'));
 
+if (process.env.PORTLOG) { const l = (globalThis as { __portlog?: string[] }).__portlog ?? []; const n = +(process.env.PORTLOGN ?? 300); console.log(`端口访问（共 ${l.length} 次，最后 ${n} 次）：\n` + l.slice(-n).join('\n')); }
 if (process.env.PORTS) { const l = (globalThis as { __ports?: string[] }).__ports ?? []; console.log('串口访问（共 ' + l.length + ' 次）：' + l.slice(0, 200).join(' ')); }
 if (process.env.CONSOLE) console.log('输出的文字：' + JSON.stringify(m.console.slice(-600)));

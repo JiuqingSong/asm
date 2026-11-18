@@ -166,7 +166,13 @@ export class CPU {
   /** 地址掩码：8086 为 FFFFFh；286 为 FFFFFFh；386 为 FFFFFFFFh（A20 关闭时去掉第 20 位） */
   private addrMask = 0xfffff;
   /** 分页的 TLB：页号 → 页框地址 | 有效的 U/S、R/W 位 | 已写过（40h） */
-  private tlb = new Map<number, number>();
+  private tlb = new Int32Array(1 << 20);
+  /** TLB 里填过的页号（清空时只清这些） */
+  private tlbUsed = new Int32Array(8192);
+  private tlbCount = 0;
+  /** 取指令用的页缓存：线性页号 × 4 + CPL → 物理页的起始地址（-1 表示没有） */
+  private fetchKey = -1;
+  private fetchBase = 0;
   /** 程序做了模拟器不支持的事：调用者据此停机并说明原因 */
   onUnsupported: ((message: string) => void) | null = null;
   /** 停机（异常处理时连续出错，"三重错误"）：真机上主板会复位 CPU */
@@ -219,10 +225,10 @@ export class CPU {
     this.overrideMask = 0;
     this.cpl = 0;
     this.flags &= 0xffff;
-    this.tlb.clear();
+    this.flushTlb();
   }
 
-  setA20(on: boolean): void { this.a20 = on; this.updateAddrMask(); }
+  setA20(on: boolean): void { this.a20 = on; this.updateAddrMask(); this.fetchKey = -1; }
   get a20Enabled(): boolean { return this.a20; }
   private updateAddrMask(): void {
     this.addrMask = this.model === 0 ? 0xfffff : this.model === 1 ? (this.a20 ? 0xffffff : 0xefffff) : (this.a20 ? 0xffffffff : 0xffefffff);
@@ -312,8 +318,8 @@ export class CPU {
   private translate(lin: number, write: boolean): number {
     const page = lin >>> 12;
     const user = this.cpl === 3;
-    let e = this.tlb.get(page);
-    if (e === undefined || (write && !(e & 0x40))) e = this.walk(lin, write, user);
+    let e = this.tlb[page];
+    if (e === 0 || (write && !(e & 0x40))) e = this.walk(lin, write, user);
     else if (user && (!(e & 4) || (write && !(e & 2)))) this.pageFault(lin, write, user, true);
     return ((e & 0xfffff000) | (lin & 0xfff)) >>> 0;
   }
@@ -331,9 +337,13 @@ export class CPU {
     if (!(pde & 0x20)) wr(pdeA, pde | 0x20);
     const npte = pte | 0x20 | (write ? 0x40 : 0);
     if (npte !== pte) wr(pteA, npte);
-    if (this.tlb.size > 4096) this.tlb.clear();
     const e = ((pte & 0xfffff000) | u | w | (npte & 0x40)) >>> 0;
-    this.tlb.set(lin >>> 12, e);
+    const page = lin >>> 12;
+    if (this.tlb[page] === 0) {
+      if (this.tlbCount === this.tlbUsed.length) this.flushTlb();
+      this.tlbUsed[this.tlbCount++] = page;
+    }
+    this.tlb[page] = e | 1; // 位 0：有效
     return e;
   }
   private pageFault(lin: number, write: boolean, user: boolean, present: boolean): never {
@@ -358,17 +368,42 @@ export class CPU {
   get code32(): boolean { return this.cBig[CS] !== 0 && (this.msw & 1) !== 0 && !(this.flags & VM); }
 
   /** 清空 TLB（写 CR3、开关分页、任务切换时） */
-  flushTlb(): void { this.tlb.clear(); }
+  flushTlb(): void {
+    this.fetchKey = -1;
+    const t = this.tlb, u = this.tlbUsed;
+    for (let k = 0; k < this.tlbCount; k++) t[u[k]] = 0;
+    this.tlbCount = 0;
+  }
 
-  /** 实模式风格的访问：段值 × 16 + 偏移（给 BIOS/DOS 的高层模拟和测试用；物理地址） */
+  /**
+   * 实模式风格的访问：段值 × 16 + 偏移（给 BIOS/DOS 的高层模拟和测试用）。分页打开时（例如 Windows 386 增强模式下
+   * 在虚拟 8086 模式里调用 BIOS）这是线性地址，要经过页表；没有映射的页读出 FFh、写入忽略，不产生缺页异常
+   */
   rb(seg: number, off: number): number {
-    return this.readLin(((seg << 4) + (off & 0xffff)) & this.addrMask);
+    const lin = (seg << 4) + (off & 0xffff);
+    if (this.msw & 0x80000000) { const a = this.physQuiet(lin, false); return a < 0 ? 0xff : this.readLin(a); }
+    return this.readLin(lin & this.addrMask);
   }
   rw(seg: number, off: number): number {
     return this.rb(seg, off) | (this.rb(seg, off + 1) << 8);
   }
   wb(seg: number, off: number, v: number): void {
-    this.writeLin(((seg << 4) + (off & 0xffff)) & this.addrMask, v);
+    const lin = (seg << 4) + (off & 0xffff);
+    if (this.msw & 0x80000000) { const a = this.physQuiet(lin, true); if (a >= 0) this.writeLin(a, v); return; }
+    this.writeLin(lin & this.addrMask, v);
+  }
+  /** 分页时把线性地址换成物理地址，不产生异常（不存在的页返回 -1）；按系统级访问，设置已访问位和脏位 */
+  private physQuiet(lin: number, write: boolean): number {
+    const cr2 = this.cr2;
+    try {
+      const saved = this.cpl;
+      this.cpl = 0;
+      try { const a = this.phys(lin, write); return a < MEM_SIZE ? a : -1; } finally { this.cpl = saved; }
+    } catch (e) {
+      if (!(e instanceof CpuFault)) throw e;
+      this.cr2 = cr2;
+      return -1;
+    }
   }
   ww(seg: number, off: number, v: number): void {
     this.wb(seg, off, v);
@@ -457,7 +492,15 @@ export class CPU {
     const ip = this.ip;
     if (this.model === 2) {
       if (ip > this.cLimit[CS]) throw gp(0);
-      const v = this.rl(this.segBase(CS) + ip);
+      const lin = (this.segBase(CS) + ip) >>> 0;
+      const key = (lin >>> 12) * 4 + this.cpl;
+      let v: number;
+      if (key === this.fetchKey) v = this.mem[this.fetchBase + (lin & 0xfff)];
+      else {
+        const a = this.phys(lin, false);
+        if (a < MEM_SIZE && (a >>> 16) !== 0xa) { this.fetchKey = key; this.fetchBase = a - (a & 0xfff); }
+        v = a < MEM_SIZE ? this.readLin(a) : 0xff;
+      }
       this.ip = ip + 1;
       return v;
     }
@@ -901,7 +944,7 @@ export class CPU {
     let nflags: number, sels: number[], nldt: number;
     if (is32) {
       const cr3 = this.rdL(nb + 0x1c);
-      if (this.msw & 0x80000000 && cr3 !== this.cr3) { this.cr3 = cr3; this.tlb.clear(); }
+      if (this.msw & 0x80000000 && cr3 !== this.cr3) { this.cr3 = cr3; this.flushTlb(); }
       this.ip = this.rdL(nb + 0x20);
       nflags = this.rdL(nb + 0x24);
       for (let k = 0; k < 8; k++) this.setR32(k, this.rdL(nb + 0x28 + k * 4));
@@ -1592,7 +1635,7 @@ export class CPU {
           if (n === 0) this.setR32(g, this.msw); else if (n === 2) this.setR32(g, this.cr2); else if (n === 3) this.setR32(g, this.cr3); else throw ud();
         } else if (op2 === 0x22) {
           const v = this.r32(g);
-          if (n === 0) this.setCr0(v); else if (n === 2) this.cr2 = v; else if (n === 3) { this.cr3 = v; this.tlb.clear(); } else throw ud();
+          if (n === 0) this.setCr0(v); else if (n === 2) this.cr2 = v; else if (n === 3) { this.cr3 = v; this.flushTlb(); } else throw ud();
         } else if (op2 === 0x21) this.setR32(g, this.dr[n]);
         else if (op2 === 0x23) this.dr[n] = this.r32(g);
         else if (op2 === 0x24) this.setR32(g, this.trr[n]);
@@ -1701,7 +1744,7 @@ export class CPU {
     this.msw = v;
     if (v & 1 && !(old & 1)) this.enterProtected();
     else if (!(v & 1) && old & 1) this.exitProtected();
-    if ((v ^ old) & 0x80000000) this.tlb.clear();
+    if ((v ^ old) & 0x80000000) this.flushTlb();
   }
 
   /** PE 位刚置 1：段描述符缓存保留实模式下的基址 */

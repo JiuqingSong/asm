@@ -6,6 +6,7 @@
 import { AX, BX, CX, DX, SI, DI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
 import { MOUSE_STUB } from './mouse.ts';
+import { VGA_TABLE, VGA_FLAG } from './vgarom.ts';
 import { PIT_HZ } from './uart.ts';
 import { modeInfo, SUPPORTED_MODES, type ModeInfo } from './video.ts';
 
@@ -637,6 +638,11 @@ export class Hle {
     else if (mode === 0x13) video.reset();
     else if (mode === 0x04 || mode === 0x05) video.cgaColor = 0x30;
     else if (mode === 0x06) video.cgaColor = 0x3f;
+    video.loadModeRegs(mode);
+    // 让 ROM 里的桩代码再用 OUT 指令把寄存器写一遍（Windows 386 增强模式的显卡驱动靠截获端口来跟踪显卡状态）
+    const tbl = video.modeRegTable();
+    for (let k = 0; k < tbl.length; k++) cpu.wb(0xf000, VGA_TABLE + k, tbl[k]);
+    cpu.wb(0xf000, VGA_FLAG, 1);
     video.version++;
     this.m.mouse.modeChanged(mode);
     if (!(al & 0x80)) this.clearScreen(); else this.setCursor(0, 0);
@@ -745,16 +751,17 @@ export class Hle {
       case 0x00: v.setAttr(bl, r[BX] >> 8); return true;               // 设一个调色板寄存器
       case 0x01: v.setAttr(0x11, r[BX] >> 8); return true;             // 边框色
       case 0x02: {                                                      // 16 个调色板寄存器 + 边框色
-        for (let k = 0; k < 17; k++) v.setAttr(k, cpu.rb(cpu.s[ES], r[DX] + k));
+        for (let k = 0; k < 17; k++) v.setAttr(k < 16 ? k : 0x11, cpu.rb(cpu.s[ES], r[DX] + k)); // 第 17 个字节是边框色（11h）
         return true;
       }
       case 0x07: cpu.setR8(7, v.attr[bl & 0x1f] ?? 0); return true;    // 读一个调色板寄存器
       case 0x08: cpu.setR8(7, v.attr[0x11]); return true;
       case 0x09: {
-        for (let k = 0; k < 17; k++) cpu.wb(cpu.s[ES], r[DX] + k, v.attr[k]);
+        for (let k = 0; k < 17; k++) cpu.wb(cpu.s[ES], r[DX] + k, v.attr[k < 16 ? k : 0x11]);
         return true;
       }
-      case 0x03: case 0x13: case 0x1a: return true;
+      case 0x03: v.setAttr(0x10, (v.attr[0x10] & ~0x08) | (bl ? 0x08 : 0)); return true; // 闪烁 / 高亮背景
+      case 0x13: case 0x1a: return true;
     }
     this.warnOnce(`INT 10h AX=10${hex(this.al)}h 暂未实现`);
     return true;

@@ -29,6 +29,7 @@ export type StopReason = 'step' | 'breakpoint' | 'exit' | 'wait' | 'budget' | 'e
 const STUB_SIZE = 8;
 const STUB_INT8 = 0x0800;
 const STUB_INT9 = 0x0810;
+import { STUB_INT10, int10Stub } from './vgarom.ts';
 /** 软盘参数表、硬盘参数表在 F000 段里的位置（与 IBM AT BIOS 相同） */
 const DPT_OFF = 0xefc7;
 const FDPT_OFF = 0xe401;
@@ -185,8 +186,6 @@ export class Machine {
   private port61 = 0;
   /** PC 喇叭当前的频率（Hz），0 表示不响 */
   speakerFreq = 0;
-  private crtcIndex = 0;
-  private crtc = new Uint8Array(32);
   private cmosIndex = 0;
   /** CMOS 的 128 字节（时间以外的部分）：关机原因（0Fh）、软驱和硬盘类型、内存大小等 */
   cmos = new Uint8Array(128);
@@ -245,12 +244,10 @@ export class Machine {
           case 0x64: return this.kbd.queue.length || this.kbcOutputPending ? 0x15 : 0x14;
           case 0x92: return this.cpu.a20Enabled ? 0x02 : 0x00;
           case 0x71: return this.cmosRead();
-          case 0x3d4: return this.crtcIndex;
-          case 0x3d5: return this.crtc[this.crtcIndex & 31];
           case 0x3da: this.retrace ^= 0x09; this.video.resetAttrFlip(); return this.retrace;
           case 0xf0: case 0xf1: return 0xff; // 数学协处理器（没有）
           case 0x3c0: case 0x3c1: case 0x3c4: case 0x3c5: case 0x3c6: case 0x3c7: case 0x3c8: case 0x3c9:
-          case 0x3cc: case 0x3ce: case 0x3cf: case 0x3d9: return this.video.in8(port);
+          case 0x3cc: case 0x3ce: case 0x3cf: case 0x3d9: case 0x3ca: case 0x3c3: case 0x3d4: case 0x3d5: return this.video.in8(port);
         }
         this.unknownPort(port, '读');
         return 0xff;
@@ -296,11 +293,12 @@ export class Machine {
           case 0x71: this.cmosWrite(v); return;
           case 0x70: this.cmosIndex = v & 0x7f; return;
           case 0xf0: case 0xf1: return; // 数学协处理器的复位端口：Turbo Pascal 等检测协处理器时会写
-          case 0x3d4: this.crtcIndex = v; return;
+          case 0x3d4: this.video.crtcIndex = v; return;
           case 0x3d5: {
-            this.crtc[this.crtcIndex & 31] = v;
-            if ((this.crtcIndex === 0x0e || this.crtcIndex === 0x0f) && !this.cpu.mmio && this.mem[0x449] <= 3) {
-              const pos = (this.crtc[0x0e] << 8) | this.crtc[0x0f];
+            const vc = this.video, ci = vc.crtcIndex & 31;
+            vc.crtc[ci] = v;
+            if ((ci === 0x0e || ci === 0x0f) && !this.cpu.mmio && this.mem[0x449] <= 3) {
+              const pos = (vc.crtc[0x0e] << 8) | vc.crtc[0x0f];
               this.hle.setCursor(Math.floor(pos / 80) % 25, pos % 80);
             }
             return;
@@ -454,6 +452,7 @@ export class Machine {
       let off = n * STUB_SIZE;
       if (n === 8) off = STUB_INT8;
       else if (n === 9) off = STUB_INT9;
+      else if (n === 0x10) off = STUB_INT10;
       mem[n * 4] = off & 0xff; mem[n * 4 + 1] = off >> 8;
       mem[n * 4 + 2] = BIOS_SEG & 0xff; mem[n * 4 + 3] = BIOS_SEG >> 8;
       const a = bios + n * STUB_SIZE;
@@ -469,6 +468,8 @@ export class Machine {
     mem[MOUSE_VECTOR * 4 + 2] = BIOS_SEG & 0xff; mem[MOUSE_VECTOR * 4 + 3] = BIOS_SEG >> 8;
     // INT 9：读键盘 -> 放入缓冲区 -> EOI
     mem.set([TRAP_OPCODE, 0x09, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
+    // INT 10h：陷阱，切换显示模式后再用 OUT 指令写 VGA 寄存器（见 vgarom.ts）
+    mem.set(int10Stub(0x10), bios + STUB_INT10);
     // 复位向量：跳到 F000:E05B（IBM PC 的开机入口），那里的陷阱重新启动机器
     mem.set([0xea, 0x5b, 0xe0, 0x00, 0xf0], 0xffff0);
     mem.set([TRAP_OPCODE, 0x19, 0xcf], bios + 0xe05b);
@@ -526,6 +527,7 @@ export class Machine {
     this.kbd.clear();
     this.clock = 0;
     this.video.reset();
+    this.video.loadModeRegs(3);
     cpu.mmio = null;
     cpu.resetProtected();
     cpu.setA20(false);
@@ -577,6 +579,7 @@ export class Machine {
     const mem = this.mem;
     this.cpu.mmio = null;
     this.video.reset();
+    this.video.loadModeRegs(3);
     mem[0x449] = 3;
     for (let o = 0; o < 4000; o += 2) { mem[0xb8000 + o] = 0x20; mem[0xb8000 + o + 1] = 0x07; }
     mem[0x450] = 0; mem[0x451] = 0;
