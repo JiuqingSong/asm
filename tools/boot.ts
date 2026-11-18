@@ -77,3 +77,7 @@ if (process.env.DIS) {
   const read = (o: number) => m.mem[((seg << 4) + (o & 0xffff)) & 0xfffff];
   for (let i = 0; i < 40; i++) { const ins = disassemble(read, off); console.log(`${seg.toString(16)}:${off.toString(16).padStart(4, '0')}  ${ins.bytes.map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(20)} ${ins.text}`); off += ins.length; }
 }
+if (process.env.VEC) {
+  const n = parseInt(process.env.VEC, 16), off = m.mem[n * 4] | (m.mem[n * 4 + 1] << 8), seg = m.mem[n * 4 + 2] | (m.mem[n * 4 + 3] << 8);
+  console.log(`INT ${n.toString(16)}h -> ${seg.toString(16)}:${off.toString(16)}，开头的字节：${[...m.mem.subarray(seg * 16 + off, seg * 16 + off + 8)].map(b => b.toString(16).padStart(2, '0')).join(' ')}`);
+}

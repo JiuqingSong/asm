@@ -3,6 +3,7 @@
 import type { Machine } from '../machine/machine.ts';
 import { Disk, blankHardDisk, blankFloppy, isFloppySize } from '../machine/disk.ts';
 import { FatVolume } from '../machine/fat.ts';
+import { UTILITIES, buildUtility } from '../dos/utilities.ts';
 
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
 const LETTERS = ['A:', 'B:', 'C:'];
@@ -204,6 +205,29 @@ export class DrivesPanel {
         });
         return;
       }
+      case 'fs-util': {
+        const u = UTILITIES.find(x => x.name === name)!;
+        const bytes = buildUtility(u);
+        const base = u.name.replace(/\.COM$/, '');
+        // 放进 AUTOEXEC.BAT：开机时自动运行
+        let auto = false;
+        const vol = this.volume();
+        if (typeof vol !== 'string' && b.k === 2 && vol.v.list('').some(e => e.name === 'AUTOEXEC.BAT')) {
+          const text = new TextDecoder('latin1').decode(vol.v.readFile('', 'AUTOEXEC.BAT'));
+          if (!new RegExp(`(^|[\\\\\\s])${base}(\\.COM)?\\s*$`, 'im').test(text)) auto = confirm(`把 ${u.name} 放进 ${where} 后，要不要同时加到 C:\\AUTOEXEC.BAT 里，每次启动 DOS 时自动运行？`);
+        }
+        this.modify(`把 ${u.name} 放进 ${where}${auto ? '，并加到 AUTOEXEC.BAT' : ''}`, v => {
+          const n = v.writeFile(b.path, u.name, bytes);
+          if (auto) {
+            let text = new TextDecoder('latin1').decode(v.readFile('', 'AUTOEXEC.BAT')).replace(/\x1a+$/, '');
+            if (text && !/\r?\n$/.test(text)) text += '\r\n';
+            text += `${LETTERS[b.k]}${b.path}\\${n}\r\n`;
+            v.writeFile('', 'AUTOEXEC.BAT', Uint8Array.from(text, c => c.charCodeAt(0) & 0xff));
+          }
+          return `${n} 已放进 ${where}（${bytes.length} 字节）。${auto ? '已加到 AUTOEXEC.BAT，以后启动时会自动加载。' : `在 DOS 里运行 ${base} 就会加载。`}`;
+        });
+        return;
+      }
       case 'fs-get': {
         const vol = this.volume();
         if (typeof vol === 'string') return;
@@ -252,7 +276,8 @@ export class DrivesPanel {
       : `<div class="file-row"><span class="fn">${esc(e.name)}</span><span class="note">${e.size.toLocaleString()} 字节</span><span class="note">${date(e.date)}</span><button data-act="fs-get" data-name="${esc(e.name)}">下载</button><button data-act="fs-del" data-name="${esc(e.name)}">删除</button></div>`);
     return `<div class="fs-box">${head}<span class="note">${v.fat16 ? 'FAT16' : 'FAT12'}${v.label ? '，卷标 ' + esc(v.label) : ''}，剩余 ${kb(v.freeBytes())}</span></div>` +
       `<div class="mem-bar">${b.path ? '<button data-act="fs-up">↑ 上一级</button>' : ''}<button data-act="fs-upload" title="选择电脑上的文件放进这个目录（文件名会换成 DOS 的 8.3 格式）">上传文件到这里</button>` +
-      `<button data-act="fs-mkdir">新建目录</button><button data-act="fs-copy" title="把下面"文件"列表里的全部文件复制到这个目录">复制"文件"列表到这里</button></div>` +
+      `<button data-act="fs-mkdir">新建目录</button><button data-act="fs-copy" title="把下面"文件"列表里的全部文件复制到这个目录">复制"文件"列表到这里</button>` +
+      UTILITIES.map(u => `<button data-act="fs-util" data-name="${u.name}" title="${esc(u.description)}">放入${u.name === 'MOUSE.COM' ? '鼠标驱动 ' : ''}${u.name}</button>`).join('') + '</div>' +
       (rows.length ? rows.join('') : '<div class="empty">这个目录是空的</div>') + '</div>';
   }
 
