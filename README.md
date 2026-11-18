@@ -1,5 +1,7 @@
 # AsmPerfect 86
 
+**在线使用：https://jiuqingsong.github.io/asm/** （打开网页就能用，不需要安装）
+
 在浏览器里编写、汇编、运行和**单步调试** 8086 汇编程序。CPU、汇编器、BIOS/DOS 都是用 TypeScript 写的，不依赖 DOSBox，因此调试器能看到并回退每一条指令的效果。
 
 ## 运行
