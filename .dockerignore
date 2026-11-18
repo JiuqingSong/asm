@@ -1,9 +1,0 @@
-# Only what the image needs (deploy/Dockerfile): the app's sources and the page server.
-*
-!package.json
-!package-lock.json
-!index.html
-!tsconfig.json
-!vite.config.ts
-!src/
-!deploy/server.py

@@ -4,7 +4,7 @@
 
 ## 现状
 
-线上地址：http://192.168.0.120:8075/ （家庭首页 8060 上也有），代码：https://github.com/JiuqingSong/asm
+线上地址：https://jiuqingsong.github.io/asm/ ，代码：https://github.com/JiuqingSong/asm
 
 已经完成：
 
@@ -16,7 +16,7 @@
 | 调试 | 单步进入/跳过、后退（单机）、断点、按每秒 1~100 步动画执行、悬停显示值 | 测试 + 浏览器检查脚本 |
 | 双机 | 两台机器的 COM1 用虚拟交叉线连接，按虚拟时间同步；三种接线、真实 8250 / 虚拟串口 | 2003 年的 send.asm/receive.asm 原样传输成功 |
 | 速度 | 原机速度（默认，虚拟时间与真实时间同步）、全速、动画 | 浏览器实测：5 秒的程序用 5.1 秒 |
-| 部署 | 家庭服务器 Docker，`release.bat` 一键发布 | 发布脚本核对线上版本号 |
+| 发布 | GitHub Pages（推送到 main 后由 GitHub Actions 自动测试、编译、发布） | Actions 的运行结果 |
 | 调试器 | 反汇编视图（真机测试集 96,900 条指令长度全对；往返对照）、跳出、运行到光标处、修改寄存器和标志位 | 测试 + 浏览器检查脚本 `tools/ui-debug.mjs` |
 | 图形模式 | VGA 13h（256 色、调色板端口）、CGA 04h/05h/06h、BIOS 写点/读点、图形模式下的文字（内置 8×8 点阵） | 示例"VGA 256 色""画线"；`tools/ui-gfx.mjs` |
 | EGA/VGA 平面模式 | 0Dh、0Eh、10h、12h：4 个平面在 `Video.planar` 里，CPU 读写 A000 段经 `cpu.mmio` 交给图形控制器；属性控制器调色板 → DAC；反向执行能撤销平面写入；鼠标范围随模式变化。用户的 Turbo Pascal + EGAVGA.BGI 程序（中文界面、鼠标）能正常运行 | 测试 + `tools/ui-bgi.mjs`、`tools/run-exe.ts <EXE> "" <条数> <截图.png>` |
@@ -60,7 +60,7 @@
 
 ### 6. 两台真实电脑互连
 
-- 用 WebRTC DataChannel 当串口线：两个浏览器各运行一台机器，信令通过服务器（server.py 加一个简单的配对接口，或用房间号）。
+- 用 WebRTC DataChannel 当串口线：两个浏览器各运行一台机器，信令需要一个简单的配对服务（或用房间号）。
 - 难点：两边的虚拟时间无法严格同步。可以只在"虚拟串口"模式下支持（发送缓冲 + 硬件流控本来就能容忍延迟），真实 8250 模式不支持。
 - 完成标准：两台电脑分别运行 send.asm 和 receive.asm，文件传输成功。
 
@@ -92,7 +92,7 @@ src/cpu/cpu.ts          CPU（改动后必须跑 npm run test:cpu）
 src/asm/                汇编器：lexer、assembler（伪指令、宏、多遍扫描、段布局）、encoder（指令编码）
 src/machine/            devices（8259/8253/键盘）、uart（8250、串口线）、bios（BIOS/DOS 陷阱）、machine（装载、执行、调试、历史记录、虚拟时钟）、dual（双机调度）
 src/ui/                 main（会话、运行控制）、editor（Monaco）、panels、screen、speaker、examples、help
-deploy/                 Dockerfile、server.py、docker-compose、服务器脚本
+.github/workflows/      GitHub Pages 的发布流程
 tools/                  测试和检查脚本（见下）
 ```
 
@@ -126,7 +126,7 @@ tools/                  测试和检查脚本（见下）
 
 ### 发布
 
-提交并推送，然后双击 `release.bat`（服务器拉代码、重建、核对版本号）。只改文档时不需要发布。
+提交并推送到 main，GitHub Actions 会运行测试、编译并更新 GitHub Pages 上的网页。
 
 ### 需要记住的坑
 

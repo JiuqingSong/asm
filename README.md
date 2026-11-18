@@ -70,31 +70,3 @@ tools/                  CPU 测试运行器、ML 对照工具、浏览器界面�
 ```
 
 BIOS 和 DOS 功能通过"陷阱"实现：中断向量指向 F000 段里的桩代码 `F1 nn CF`，CPU 执行到 `F1` 时调用 JS 处理函数。因此用户程序读取、替换、串接中断向量的行为和真机一致。
-
-## Releasing (family server)
-
-AsmPerfect 86 runs on the family server at **http://192.168.0.120:8075/** and appears on the
-family front page (http://192.168.0.120:8060/).
-
-1. Commit and push.
-2. Double-click `release.bat`. It refuses unless everything is pushed; then the server pulls from
-   GitHub, rebuilds the image (`deploy/Dockerfile`: Node builds the app, a small Python server
-   serves it) and restarts the container, and the script checks that the page reports this commit.
-
-The version shown in the app (hover the title) is `0.<number of commits>`. The app keeps no data on
-the server: programs, settings and the virtual disks stay in each browser.
-
-### Setting up the server (once)
-
-On the server (`ssh songthin@192.168.0.120`), with a read-only deploy key for this repo:
-
-```bash
-ssh-keygen -q -t ed25519 -C "asmperfect-server" -f ~/.ssh/github_asmperfect -N ""
-printf '\nHost github-asmperfect\n    HostName github.com\n    User git\n    IdentityFile ~/.ssh/github_asmperfect\n    IdentitiesOnly yes\n' >> ~/.ssh/config
-cat ~/.ssh/github_asmperfect.pub   # add it: repo -> Settings -> Deploy keys, "Allow write access" unticked
-ssh -o StrictHostKeyChecking=accept-new -T git@github-asmperfect
-git clone git@github-asmperfect:JiuqingSong/asm.git ~/asmperfect
-~/asmperfect/deploy/setup-server.sh
-```
-
-Never commit or edit inside the server's clone; `git pull --ff-only` must keep working.

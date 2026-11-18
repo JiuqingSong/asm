@@ -2,4 +2,9 @@ node_modules/
 dist/
 test-data/
 *.log
-deploy/.env
+
+# 部署到家庭服务器的部分只放在本机（仓库是公开的），见 deploy/NOTES.md
+deploy/
+release.bat
+release.ps1
+.dockerignore
