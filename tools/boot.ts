@@ -24,7 +24,49 @@ if (c.startsWith('new:')) m.drives[2] = new Disk('C.IMG', blankHardDisk(+c.slice
 else if (c !== '-') m.drives[2] = new Disk(basename(c), new Uint8Array(readFileSync(c)), false);
 // ISO=光盘映像：放进 D:（变成只读的 FAT16 硬盘）
 if (process.env.ISO) m.drives[3] = new Disk(basename(process.env.ISO), new Uint8Array(0), false, await IsoDisk.open(new BytesSource(new Uint8Array(readFileSync(process.env.ISO))), basename(process.env.ISO)));
+if (process.env.CD) m.cdrom.insert(new BytesSource(new Uint8Array(readFileSync(process.env.CD))), basename(process.env.CD)); // CD=光盘映像：放进光驱（IDE 第二通道的 ATAPI 光驱）
 const logs: string[] = [];
+// PROF=1：统计异常（按向量和发生的位置）、端口访问次数，并抽样 CPU 在哪里（V86 / 保护模式环 0~3）；每次按键之间打印一次后清零
+const prof = process.env.PROF ? { faults: new Map<string, number>(), where: new Map<string, number>(), ports: new Map<number, number>(), hot: new Map<number, number>() } : null;
+if (prof) {
+  const cpu = m.cpu as unknown as { deliverFault(f: { vector: number; code: number }): void };
+  const orig = cpu.deliverFault.bind(cpu);
+  cpu.deliverFault = f => {
+    const lin = m.cpu.linearIP, op = [0, 1, 2].map(k => m.cpu.peekLin(lin + k).toString(16).padStart(2, '0')).join(' ');
+    const key = `#${f.vector} ${m.cpu.v86 ? 'V86' : 'PM'} ${lin.toString(16)} [${op}]`;
+    prof.faults.set(key, (prof.faults.get(key) ?? 0) + 1);
+    orig(f);
+  };
+  const io = m.cpu.io, in8 = io.in8, out8 = io.out8, in16 = io.in16!, out16 = io.out16!;
+  const cnt = (p: number) => prof.ports.set(p, (prof.ports.get(p) ?? 0) + 1);
+  io.in8 = p => { cnt(p); return in8(p); };
+  io.out8 = (p, v) => { cnt(p); out8(p, v); };
+  io.in16 = p => { cnt(p | 0x10000); return in16(p); };
+  io.out16 = (p, v) => { cnt(p | 0x10000); out16(p, v); };
+}
+const hotBase = new Map<number, [number, boolean]>();
+const profReport = async (title: string) => {
+  if (!prof) return;
+  const top = (mp: Map<string, number>, n: number) => [...mp].sort((a, b) => b[1] - a[1]).slice(0, n).map(([k, v]) => `  ${k} ×${v}`).join('\n');
+  console.log(`== 统计（${title}）==
+异常：
+${top(prof.faults, 15)}
+位置（抽样）：
+${top(prof.where, 15)}`);
+  console.log('端口：', [...prof.ports].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([p, n]) => `${p > 0xffff ? 'W' : ''}${(p & 0xffff).toString(16)}h×${n}`).join('，'));
+  const { disassemble } = await import('../src/cpu/disasm.ts');
+  for (const [ip, n] of [...prof.hot].sort((a, b) => b[1] - a[1]).slice(0, 4)) {
+    console.log(`热点 ${ip.toString(16)} ×${n}：`);
+    const [base, code32] = hotBase.get(ip)!;
+    let a = ip - base - 20;
+    for (let k = 0; k < 14; k++) {
+      const d = disassemble(x => m.cpu.peekLin(base + x), a, { is286: true, is386: true, code32 });
+      console.log(`  ${a === ip - base ? '>' : ' '}${a.toString(16)}  ${d.text}`);
+      a += d.length;
+    }
+  }
+  prof.faults.clear(); prof.where.clear(); prof.ports.clear(); prof.hot.clear();
+};
 m.events.log = s => logs.push(s);
 const ints = new Map<string, number>();
 const hle = m.hle.handle.bind(m.hle);
@@ -176,7 +218,8 @@ const SPECIAL: Record<string, [number, number]> = {
 const run = (millions: number) => {
   const end = m.instructions + millions * 1e6;
   while (m.instructions < end) {
-    const r = m.run(500_000);
+    const r = m.run(prof ? 50_000 : 500_000);
+    if (prof) { const k = `${m.cpu.v86 ? 'V86' : 'PM' + m.cpu.cpl} ${m.cpu.linearIP.toString(16).padStart(8, '0').slice(0, 5)}xxx`; prof.where.set(k, (prof.where.get(k) ?? 0) + 1); const ip = m.cpu.linearIP; prof.hot.set(ip, (prof.hot.get(ip) ?? 0) + 1); hotBase.set(ip, [ip - m.cpu.ip, m.cpu.code32]); }
     if (r === 'exit' || r === 'error') { console.log('停止：', r, m.message); return false; }
   }
   return true;
@@ -217,6 +260,7 @@ for (const k of keys) {
     else m.typeText(part, scanForChar);
   }
   run(+millionsArg);
+  await profReport(k);
 }
 console.log(`执行了 ${(m.instructions / 1e6).toFixed(1)} 百万条指令（${((Date.now() - t0) / 1000).toFixed(1)} 秒），虚拟时间 ${(m.clock / 1193182).toFixed(1)} 秒，CS:IP=${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}，模式 ${m.video.hardwareMode().toString(16)}h（BIOS 数据区 ${m.mem[0x449].toString(16)}h）`);
 console.log('BIOS/DOS 调用：', [...ints].sort((x, y) => y[1] - x[1]).slice(0, 30).map(([k, v]) => `${k}×${v}`).join('，'));
