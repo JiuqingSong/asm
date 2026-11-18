@@ -40,6 +40,6 @@ describe('DOS 小工具', () => {
     expect(m.poweredOff).toBe(true);
     expect(m.status).toBe('exited');
     expect(m.message).toMatch(/APM/);
-    expect(m.mem[0xb8000]).toBe(0x20);   // 屏幕清空
+    expect(m.video.peek(0xb8000)).toBe(0x20);   // 屏幕清空
   });
 });

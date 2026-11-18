@@ -176,6 +176,12 @@ export class Planar {
     this.writes++;
   }
 
+  /** 清空 4 个平面 */
+  clear(): void {
+    for (const p of this.planes) p.fill(0);
+    this.writes++;
+  }
+
   /** 恢复反向执行记录的旧值 */
   restore(addr: number, old: number): void {
     this.planes[(addr >> 16) & 3][addr & 0xffff] = old;
@@ -301,6 +307,62 @@ export class Video {
   static modeTable(mode: number): number[] {
     const t = VGA_MODE_REGS[mode] ?? T80;
     return [t.misc, ...t.seq, ...t.crtc, ...t.gc, ...t.attr];
+  }
+
+  // ---------- 显存（A0000~BFFFF，CPU 的 mmio） ----------
+  /**
+   * CPU 看到的显存窗口：图形控制器 6 的位 2~3 选择 A0000~BFFFF（128KB）、A0000~AFFFF、B0000~B7FFF 或 B8000~BFFFF。
+   * 返回窗口里的偏移，不在窗口里返回 -1
+   */
+  private window(off: number): number {
+    switch ((this.planar.gc[6] >> 2) & 3) {
+      case 0: return off;
+      case 1: return off < 0x10000 ? off : -1;
+      case 2: return off >= 0x10000 && off < 0x18000 ? off - 0x10000 : -1;
+      default: return off >= 0x18000 ? off - 0x18000 : -1;
+    }
+  }
+  /**
+   * CPU 读显存（off 是相对 A0000 的偏移）。地址怎么落到平面上由定序器 4 决定：
+   * 链式（256 色模式 13h）：平面 = 地址的低 2 位；奇偶（文本、CGA 模式）：偶地址在平面 0、奇地址在平面 1；
+   * 其余是 4 个平面并行（16 色模式，经过图形控制器的读写模式和锁存器）
+   */
+  read(off: number): number {
+    const o = this.window(off);
+    if (o < 0) return 0xff;
+    const pl = this.planar, s4 = pl.seq[4];
+    if (s4 & 8) return pl.planes[o & 3][(o >> 2) & 0xffff];
+    if (!(s4 & 4)) return pl.planes[o & 1][o & 0xfffe];
+    return pl.read(o & 0xffff);
+  }
+  write(off: number, v: number): void {
+    const o = this.window(off);
+    if (o < 0) return;
+    const pl = this.planar, s4 = pl.seq[4], mask = pl.seq[2];
+    if (s4 & 8) { const p = o & 3; if (mask & (1 << p)) pl.setByte((o >> 2) & 0xffff, p, v & 0xff); return; }
+    if (!(s4 & 4)) { const p = o & 1; if (mask & (1 << p)) pl.setByte(o & 0xfffe, p, v & 0xff); return; }
+    pl.write(o & 0xffff, v & 0xff);
+  }
+  /** 按物理地址（A0000~BFFFF）看显存里的一个字节，和 CPU 读到的一样但不改变锁存器（界面、截图用） */
+  peek(addr: number): number {
+    const o = this.window(addr - 0xa0000);
+    if (o < 0) return 0xff;
+    const pl = this.planar, s4 = pl.seq[4];
+    if (s4 & 8) return pl.planes[o & 3][(o >> 2) & 0xffff];
+    if (!(s4 & 4)) return pl.planes[o & 1][o & 0xfffe];
+    return pl.planes[pl.gc[4] & 3][o & 0xffff];
+  }
+  /** 文本模式的字符和属性（第 i 个字符格，从 CRTC 的起始地址算起） */
+  textCell(i: number): [number, number] {
+    const start = ((this.crtc[0x0c] << 8) | this.crtc[0x0d]) * 2;
+    const o = (start + i * 2) & 0xfffe;
+    return [this.planar.planes[0][o], this.planar.planes[1][o]];
+  }
+  /** 开机时的空白文本屏幕（空格、灰字黑底） */
+  clearText(): void {
+    const p0 = this.planar.planes[0], p1 = this.planar.planes[1];
+    for (let i = 0; i < 4000; i += 2) { p0[i] = 0x20; p1[i] = 0x07; }
+    this.planar.writes++;
   }
 
   /** 显存映射可能变了（A0000 段是否按 4 个平面访问）：机器据此设置 CPU 的 mmio */

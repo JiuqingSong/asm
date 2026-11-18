@@ -55,7 +55,7 @@ describe('运行程序', () => {
     expect(m.exitCode).toBe(0);
     // 屏幕第一行
     let line = '';
-    for (let c = 0; c < 12; c++) line += String.fromCharCode(m.mem[0xb8000 + c * 2]);
+    for (let c = 0; c < 12; c++) line += String.fromCharCode(m.video.peek(0xb8000 + c * 2));
     expect(line).toBe('Hello, 8086!');
   });
 
@@ -471,7 +471,7 @@ describe('图形模式', () => {
     for (const [n, k] of [...keys].entries()) {
       // 第一个键：运行到程序等待按键；之后（程序在循环里查询键盘）只运行一小段
       for (let i = 0; i < (n === 0 ? 400 : 20) && m.run(100_000) === 'budget'; i++) { /* */ }
-      snaps.push(m.mem.slice(0xa0000, 0xa0000 + 64000));
+      snaps.push(Uint8Array.from({ length: 64000 }, (_, i) => m.video.peek(0xa0000 + i)));
       m.typeText(k, scanForChar);
     }
     runToEnd(m);
@@ -519,7 +519,7 @@ start:  mov ax, 0004h
 end start`);
     runToEnd(m);
     expect(m.exitCode).toBe(3);                 // 读回的颜色
-    expect(m.mem[0xb8000 + 0x2000 + (10 >> 2)]).toBe(0b00001100); // x=10 是这个字节的第 3 个像素（位 3、2）
+    expect(m.video.peek(0xb8000 + 0x2000 + (10 >> 2))).toBe(0b00001100); // x=10 是这个字节的第 3 个像素（位 3、2）
   });
 });
 
@@ -543,9 +543,9 @@ start:  mov ax, @data
 end start`);
     runToEnd(m);
     // "A" 的点阵第 0 行是 01110（放在第 1~5 列），颜色 15
-    const row0 = Array.from(m.mem.subarray(0xa0000, 0xa0000 + 8));
+    const row0 = Array.from({ length: 8 }, (_, i) => m.video.peek(0xa0000 + i));
     expect(row0).toEqual([0, 0, 15, 15, 15, 0, 0, 0]);
-    const row4 = Array.from(m.mem.subarray(0xa0000 + 4 * 320, 0xa0000 + 4 * 320 + 8));
+    const row4 = Array.from({ length: 8 }, (_, i) => m.video.peek(0xa0000 + 4 * 320 + i));
     expect(row4).toEqual([0, 15, 15, 15, 15, 15, 0, 0]); // 横杠 11111
   });
 });
@@ -640,7 +640,7 @@ describe('鼠标画图示例', () => {
     m.load(assemble(EXAMPLES.find(e => e.id === 'mouse')!.source));
     m.run(200_000);
     expect(m.mouse.visible).toBe(0);
-    const at = (x: number, y: number) => m.mem[0xa0000 + y * 320 + x];
+    const at = (x: number, y: number) => m.video.peek(0xa0000 + y * 320 + x);
     m.mouse.moveTo(100, 50); m.mouse.setButtons(1); m.run(50_000);
     m.mouse.moveTo(120, 50); m.run(50_000);
     m.mouse.setButtons(0); m.run(50_000);
@@ -1005,7 +1005,7 @@ end start`);
     m.drives[0] = new Disk('BOOT.IMG', img, true);
     m.load(bootProgram(0));
     m.run(10_000);
-    expect(String.fromCharCode(m.mem[0xb8000], m.mem[0xb8002])).toBe('AK');
+    expect(String.fromCharCode(m.video.peek(0xb8000), m.video.peek(0xb8002))).toBe('AK');
   });
 
   it('空白硬盘不能启动，给出说明', async () => {
@@ -1030,11 +1030,11 @@ end start`);
     m.drives[0] = new Disk('BOOT.IMG', img, true);
     m.load(bootProgram(0));
     m.run(20_000);
-    m.mem[0xb8002] = 0x58;                  // 在屏幕上做个记号：重新开机会清屏
+    m.cpu.writeLin(0xb8002, 0x58);                  // 在屏幕上做个记号：重新开机会清屏
     m.sendCtrlAltDel();
     for (let k = 0; k < 20; k++) m.run(20_000);
     expect(logs.join()).toContain('Ctrl+Alt+Del');
-    expect(m.mem[0xb8000]).toBe(0x31);       // 重新开机后又显示了 '1'
-    expect(m.mem[0xb8002]).toBe(0x20);       // 记号没了
+    expect(m.video.peek(0xb8000)).toBe(0x31);       // 重新开机后又显示了 '1'
+    expect(m.video.peek(0xb8002)).toBe(0x20);       // 记号没了
   });
 });

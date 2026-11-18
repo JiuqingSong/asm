@@ -218,8 +218,8 @@ export class Machine {
       },
     };
     cpu.trap = (n) => this.hle.handle(n);
-    // A0000 段是否按平面访问，跟着显卡寄存器走
-    this.video.onMapChange = () => { cpu.mmio = this.video.planarMapped ? this.video.planar : null; };
+    // A0000~BFFFF 的显存都在显卡的 4 个平面里
+    cpu.mmio = this.video;
     cpu.onUnsupported = msg => { this.fatal = msg; };
     cpu.onShutdown = () => this.cpuReset(); // 三重错误：主板复位 CPU
     this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
@@ -518,7 +518,6 @@ export class Machine {
     w16(bda + 0x63, 0x3d4);
     w16(bda + 0x80, 0x1e); w16(bda + 0x82, 0x3e);
     mem[bda + 0x84] = 24;
-    for (let o = 0; o < 4000; o += 2) { mem[0xb8000 + o] = 0x20; mem[0xb8000 + o + 1] = 0x07; }
     if (program.format === 'boot') this.loadBootSector(program.bootDrive ?? 0);
     else this.loadProgram(program, cmdline, name);
     // 设备
@@ -531,7 +530,8 @@ export class Machine {
     this.clock = 0;
     this.video.reset();
     this.video.loadModeRegs(3);
-    cpu.mmio = null;
+    this.video.clearText();
+    cpu.mmio = this.video;
     cpu.resetProtected();
     cpu.setA20(false);
     this.kbcOutputPending = this.kbcWriteOutput = false;
@@ -580,11 +580,11 @@ export class Machine {
   /** 关机：屏幕变黑，喇叭不响，程序停止（磁盘映像的内容保留） */
   powerOff(message = '已关机'): void {
     const mem = this.mem;
-    this.cpu.mmio = null;
+    this.cpu.mmio = this.video;
     this.video.reset();
     this.video.loadModeRegs(3);
     mem[0x449] = 3;
-    for (let o = 0; o < 4000; o += 2) { mem[0xb8000 + o] = 0x20; mem[0xb8000 + o + 1] = 0x07; }
+    this.video.clearText();
     mem[0x450] = 0; mem[0x451] = 0;
     mem[0x460] = 0x20; mem[0x461] = 0x20; // 光标形状：位 5 = 不显示光标
     this.mouse.visible = -1;

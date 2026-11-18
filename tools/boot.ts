@@ -169,7 +169,7 @@ const screen = () => {
   const rows: string[] = [];
   for (let r = 0; r < 25; r++) {
     let line = '';
-    for (let col = 0; col < 80; col++) line += CP437[m.mem[0xb8000 + (r * 80 + col) * 2]];
+    for (let col = 0; col < 80; col++) line += CP437[m.video.textCell(r * 80 + col)[0]];
     rows.push(line.trimEnd());
   }
   return rows.join('\n').replace(/\n+$/, '');

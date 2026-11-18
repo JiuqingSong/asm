@@ -49,7 +49,7 @@ console.log('提示：', logs.join(' | ') || '无');
 const rows: string[] = [];
 for (let r = 0; r < 25; r++) {
   let line = '';
-  for (let c = 0; c < 80; c++) line += CP437[m.mem[0xb8000 + (r * 80 + c) * 2]];
+  for (let c = 0; c < 80; c++) line += CP437[m.video.textCell(r * 80 + c)[0]];
   rows.push(line.trimEnd());
 }
 console.log('屏幕：\n' + rows.join('\n').replace(/\n+$/, ''));

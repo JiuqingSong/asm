@@ -48,7 +48,7 @@ await page.click(`#drives button[data-act="boot"][data-from="${process.env.FROM 
 const screenText = () => page.evaluate(() => {
   if (!window.__app) return document.querySelector('.screen').innerText.split(/\n/).filter(s => s.trim()).slice(0, 8).join(' / ');
   const m = window.__app.cur.m, rows = [];
-  for (let r = 0; r < 25; r++) { let s = ''; for (let c = 0; c < 80; c++) s += String.fromCharCode(m.mem[0xb8000 + (r * 80 + c) * 2] || 32); rows.push(s.trimEnd()); }
+  for (let r = 0; r < 25; r++) { let s = ''; for (let c = 0; c < 80; c++) s += String.fromCharCode(m.video.textCell(r * 80 + c)[0] || 32); rows.push(s.trimEnd()); }
   return rows.filter(Boolean).slice(0, 8).join(' / ');
 });
 await sleep(8000);

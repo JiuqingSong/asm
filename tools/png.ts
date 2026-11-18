@@ -16,9 +16,9 @@ export function saveScreenPng(m: Machine, file: string): boolean {
     for (let x = 0; x < w; x++) {
       let c: number[];
       if (vi.planar) c = rgb(v.dacIndex(v.planar.pixel(y * (w >> 3) + (x >> 3), x & 7)));
-      else if (vi.bpp === 8) c = rgb(m.mem[0xa0000 + y * 320 + x]);
+      else if (vi.bpp === 8) c = rgb(v.peek(0xa0000 + y * 320 + x));
       else {
-        const ppb = 8 / vi.bpp, b = m.mem[0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb)];
+        const ppb = 8 / vi.bpp, b = v.peek(0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb));
         const idx = (b >> ((ppb - 1 - (x % ppb)) * vi.bpp)) & ((1 << vi.bpp) - 1);
         c = [idx * 85, idx * 85, idx * 85];
       }

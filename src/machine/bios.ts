@@ -6,7 +6,7 @@
 import { AX, BX, CX, DX, SI, DI, BP, DS, ES, CF, ZF, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from './machine.ts';
 import { MOUSE_STUB } from './mouse.ts';
-import { VGA_TABLE, VGA_FLAG } from './vgarom.ts';
+import { VGA_TABLE, VGA_FLAG, VGA_CLEAR } from './vgarom.ts';
 import { PIT_HZ } from './uart.ts';
 import { modeInfo, SUPPORTED_MODES, Video, type ModeInfo } from './video.ts';
 
@@ -612,9 +612,7 @@ export class Hle {
   clearScreen(): void {
     const vi = this.vinfo;
     if (vi.planar) {
-      const pl = this.m.video.planar;
-      for (let k = 0; k < 4; k++) pl.planes[k].fill(0);
-      pl.writes++;
+      this.m.video.planar.clear();
     } else if (vi.graphics) {
       const size = this.mode === 0x13 ? 64000 : 0x4000;
       for (let o = 0; o < size; o++) this.cpu.wb(vi.seg, o, 0);
@@ -649,10 +647,13 @@ export class Hle {
     // 在 DOS 窗口里只改那个虚拟机的显卡状态，不会动到真正显示着的 Windows 画面
     const tbl = Video.modeTable(mode);
     for (let k = 0; k < tbl.length; k++) cpu.wb(0xf000, VGA_TABLE + k, tbl[k]);
-    cpu.wb(0xf000, VGA_FLAG, 1);
+    // 清屏也由桩代码在换好寄存器以后做（REP STOSW）：段、字数、填充值
+    const words = vi.planar ? ((vi.width >> 3) * vi.height) >> 1 : mode === 0x13 ? 32000 : vi.graphics ? 0x2000 : vi.cols * vi.rows;
+    cpu.ww(0xf000, VGA_CLEAR, vi.seg); cpu.ww(0xf000, VGA_CLEAR + 2, words); cpu.ww(0xf000, VGA_CLEAR + 4, vi.graphics ? 0 : 0x0720);
+    cpu.wb(0xf000, VGA_FLAG, al & 0x80 ? 1 : 3);
     video.version++;
     this.m.mouse.modeChanged(mode);
-    if (!(al & 0x80)) this.clearScreen(); else this.setCursor(0, 0);
+    this.setCursor(0, 0);
   }
 
   private video(): boolean {

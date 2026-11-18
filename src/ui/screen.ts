@@ -228,7 +228,8 @@ export class Screen {
     if (this.graphicsMode >= 0) this.leaveGraphics();
     // 文本模式的鼠标光标：把光标所在格子的 (属性<<8 | 字符) 先和屏幕掩码"与"、再和光标掩码"异或"（只改显示，不改显存）
     const vram = this.vramView;
-    vram.set(mem.subarray(0xb8000, 0xb8000 + COLS * ROWS * 2));
+    if (video) for (let i = 0; i < COLS * ROWS; i++) { const [c, a] = video.textCell(i); vram[i * 2] = c; vram[i * 2 + 1] = a; }
+    else vram.set(mem.subarray(0xb8000, 0xb8000 + COLS * ROWS * 2));
     if (showMouse) {
       const col = Math.min(COLS - 1, mouse!.x >> 3), row = Math.min(ROWS - 1, mouse!.y >> 3);
       const i = (row * COLS + col) * 2;
@@ -327,9 +328,10 @@ export class Screen {
     }
     const px = new Uint32Array(this.image.data.buffer);
     const { width, height } = info;
+    const planes = video.planar.planes;
     if (mode === 0x13) {
-      const base = 0xa0000;
-      for (let i = 0; i < 64000; i++) px[i] = this.rgba[mem[base + i]];
+      // 链式：第 i 个像素在平面 i & 3 的 i >> 2 处
+      for (let i = 0; i < 64000; i++) px[i] = this.rgba[planes[i & 3][i >> 2]];
     } else if (info.planar) {
       // 4 个平面的同一位拼成颜色号；每个字节 8 个像素，最高位在左边
       const [p0, p1, p2, p3] = video.planar.planes, rgba = this.rgba;
@@ -339,12 +341,13 @@ export class Screen {
         for (let s = 7; s >= 0; s--) px[i++] = rgba[((b0 >> s) & 1) | (((b1 >> s) & 1) << 1) | (((b2 >> s) & 1) << 2) | (((b3 >> s) & 1) << 3)];
       }
     } else {
-      const base = 0xb8000;
+      // CGA 模式：4 色是奇偶方式（偶地址在平面 0、奇地址在平面 1），2 色只用平面 0
       const ppb = mode === 0x06 ? 8 : 4, bits = mode === 0x06 ? 1 : 2, mask = (1 << bits) - 1;
+      const byteAt = mode === 0x06 ? (o: number) => planes[0][o] : (o: number) => planes[o & 1][o & 0xfffe];
       for (let y = 0; y < height; y++) {
-        const row = base + (y & 1) * 0x2000 + (y >> 1) * 80;
+        const row = (y & 1) * 0x2000 + (y >> 1) * 80;
         for (let x = 0; x < width; x++) {
-          const b = mem[row + Math.floor(x / ppb)];
+          const b = byteAt(row + Math.floor(x / ppb));
           px[y * width + x] = this.rgba[(b >> ((ppb - 1 - (x % ppb)) * bits)) & mask];
         }
       }
@@ -376,11 +379,11 @@ export class Screen {
         const s = (mouse.gfxScreen[r] >> (15 - c)) & 1, k = (mouse.gfxCursor[r] >> (15 - c)) & 1;
         if (s && !k) continue;
         let idx: number;
-        if (mode === 0x13) idx = mem[0xa0000 + y * 320 + x];
+        if (mode === 0x13) idx = video.peek(0xa0000 + y * 320 + x);
         else if (planar) idx = video.planar.pixel(y * (width >> 3) + (x >> 3), x & 7);
         else {
           const ppb = mode === 0x06 ? 8 : 4, bits = mode === 0x06 ? 1 : 2;
-          const b = mem[0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb)];
+          const b = video.peek(0xb8000 + (y & 1) * 0x2000 + (y >> 1) * 80 + Math.floor(x / ppb));
           idx = (b >> ((ppb - 1 - (x % ppb)) * bits)) & ((1 << bits) - 1);
         }
         idx = (s ? idx : 0) ^ (k ? white : 0);

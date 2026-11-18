@@ -109,7 +109,7 @@ export class CPU {
   trap: TrapHandler | null = null;
   /** 内存写入钩子（用于反向执行的历史记录）：参数为物理地址和写入前的旧值 */
   onWrite: ((addr: number, old: number) => void) | null = null;
-  /** 显卡显存（EGA/VGA 平面模式时 A0000~AFFFF 的读写交给它；参数是段内偏移） */
+  /** 显卡显存（A0000~BFFFF 的读写交给它；参数是相对 A0000 的偏移） */
   mmio: { read(off: number): number; write(off: number, v: number): void } | null = null;
 
   halted = false;
@@ -121,6 +121,8 @@ export class CPU {
   /** 选 386 时为 true（32 位寄存器和指令、分页等） */
   get is386(): boolean { return this.model === 2; }
   set is386(v: boolean) { this.model = v ? 2 : Math.min(this.model, 1); this.modelChanged(); }
+  /** 正在执行陷阱处理函数（BIOS 的高层模拟） */
+  private inTrap = false;
   /** 陷阱处理函数要求等待（如等待按键），CPU 停在陷阱处 */
   waiting = false;
   /** 上一步是一个尚未完成的 REP 串操作迭代 */
@@ -296,11 +298,11 @@ export class CPU {
 
   /** 按物理地址读写（已经过 A20 处理；地址必须小于 16MB） */
   readLin(a: number): number {
-    if (this.mmio !== null && (a >>> 16) === 0xa) return this.mmio.read(a & 0xffff);
+    if (this.mmio !== null && (a >>> 17) === 5) return this.mmio.read(a - 0xa0000);
     return this.mem[a];
   }
   writeLin(a: number, v: number): void {
-    if (this.mmio !== null && (a >>> 16) === 0xa) { this.mmio.write(a & 0xffff, v & 0xff); return; }
+    if (this.mmio !== null && (a >>> 17) === 5) { this.mmio.write(a - 0xa0000, v & 0xff); return; }
     if (this.onWrite) this.onWrite(a, this.mem[a]);
     this.mem[a] = v & 0xff;
   }
@@ -394,6 +396,9 @@ export class CPU {
   }
   /** 分页时把线性地址换成物理地址，不产生异常（不存在的页返回 -1）；按系统级访问，设置已访问位和脏位 */
   private physQuiet(lin: number, write: boolean): number {
+    // 在虚拟 8086 模式下进入的 BIOS 陷阱里：和真的 CPU 一样产生缺页异常（监控程序装入这一页后重新执行陷阱指令）。
+    // Windows 增强模式靠它知道 DOS 窗口的显存被写过、需要重画
+    if (this.inTrap && this.flags & VM) { const a = this.phys(lin, write); return a < MEM_SIZE ? a : -1; }
     const cr2 = this.cr2;
     try {
       const saved = this.cpl;
@@ -498,7 +503,7 @@ export class CPU {
       if (key === this.fetchKey) v = this.mem[this.fetchBase + (lin & 0xfff)];
       else {
         const a = this.phys(lin, false);
-        if (a < MEM_SIZE && (a >>> 16) !== 0xa) { this.fetchKey = key; this.fetchBase = a - (a & 0xfff); }
+        if (a < MEM_SIZE && (a >>> 17) !== 5) { this.fetchKey = key; this.fetchBase = a - (a & 0xfff); }
         v = a < MEM_SIZE ? this.readLin(a) : 0xff;
       }
       this.ip = ip + 1;
@@ -1895,7 +1900,10 @@ export class CPU {
           if (this.trap && this.s[CS] === BIOS_SEG && (!(this.msw & 1) || this.flags & VM)) {
             const n = this.fetch8();
             const before = this.s.slice();
-            if (!this.trap(n)) {
+            this.inTrap = true;
+            let done: boolean;
+            try { done = this.trap(n); } finally { this.inTrap = false; }
+            if (!done) {
               this.ip = this.startIP;
               this.waiting = true;
             } else {
