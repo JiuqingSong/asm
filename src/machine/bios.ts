@@ -373,6 +373,12 @@ export class Hle {
       return true;
     }
     if (k.release) return true;
+    // Ctrl+Alt+Del：热启动（BIOS 在 0040:0072 写 1234h 表示"不做内存检测"，然后重新开机）
+    if (sc === 0x53 && (shift & 0x0c) === 0x0c) {
+      cpu.ww(BDA, 0x72, 0x1234);
+      this.m.ctrlAltDel();
+      return true;
+    }
     const head = cpu.rw(BDA, 0x1a), tail = cpu.rw(BDA, 0x1c);
     let next = tail + 2;
     if (next >= 0x3e) next = 0x1e;

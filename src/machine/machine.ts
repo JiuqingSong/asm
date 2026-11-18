@@ -602,6 +602,19 @@ export class Machine {
 
   disksChanged(): void { this.events.disksChanged?.(); }
 
+  /** BIOS 收到 Ctrl+Alt+Del：从磁盘启动时热启动；运行普通程序时只提示 */
+  ctrlAltDel(): void {
+    if (this.program?.format === 'boot') { this.log('Ctrl+Alt+Del：重新启动'); this.reboot(); return; }
+    this.log('Ctrl+Alt+Del：只有从磁盘启动时才会重新启动；要重新运行程序请点"重启"');
+  }
+
+  /** 依次按下 Ctrl、Alt、Del 再松开（工具栏按钮用：浏览器收不到真的 Ctrl+Alt+Del） */
+  sendCtrlAltDel(): void {
+    const keys = [0x1d, 0x38, 0x53];
+    for (const scan of keys) this.pressKey({ scan, ascii: 0, release: false });
+    for (const scan of [...keys].reverse()) this.pressKey({ scan: scan | 0x80, ascii: 0, release: true });
+  }
+
   /** BIOS 驱动器号对应的磁盘映像（0、1 软驱，80h、81h 硬盘） */
   driveFor(drive: number): Disk | null {
     if (drive === 0 || drive === 1) return this.drives[drive];

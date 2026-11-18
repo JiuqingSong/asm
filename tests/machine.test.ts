@@ -1016,4 +1016,25 @@ end start`);
     expect(() => m.load(bootProgram(0x80))).toThrow(/55AAh/);
     expect(m.drives[2]!.geo).toEqual({ cylinders: 65, heads: 16, sectors: 63 });
   });
+
+  it('Ctrl+Alt+Del：从磁盘启动时热启动', async () => {
+    const { Disk, blankFloppy } = await import('../src/machine/disk.ts');
+    const { bootProgram } = await import('../src/machine/boot.ts');
+    const img = blankFloppy();
+    // 引导扇区：把 0000:0500 处的计数加 1 显示出来（热启动时内存会被清掉，所以每次都是 '1'），然后等按键
+    img.set([0xfe, 0x06, 0x00, 0x05, 0xa0, 0x00, 0x05, 0x04, 0x30, 0xb4, 0x0e, 0xcd, 0x10, 0xb4, 0x00, 0xcd, 0x16, 0xeb, 0xfa], 0);
+    img[510] = 0x55; img[511] = 0xaa;
+    const m = new Machine();
+    const logs: string[] = [];
+    m.events.log = t => logs.push(t);
+    m.drives[0] = new Disk('BOOT.IMG', img, true);
+    m.load(bootProgram(0));
+    m.run(20_000);
+    m.mem[0xb8002] = 0x58;                  // 在屏幕上做个记号：重新开机会清屏
+    m.sendCtrlAltDel();
+    for (let k = 0; k < 20; k++) m.run(20_000);
+    expect(logs.join()).toContain('Ctrl+Alt+Del');
+    expect(m.mem[0xb8000]).toBe(0x31);       // 重新开机后又显示了 '1'
+    expect(m.mem[0xb8002]).toBe(0x20);       // 记号没了
+  });
 });

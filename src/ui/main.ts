@@ -217,6 +217,13 @@ class App {
     $('btn-back').onclick = () => this.back();
     $('btn-reset').onclick = () => this.restart();
     $('btn-power').onclick = () => this.powerOff();
+    $('btn-cad').onclick = () => {
+      const s = this.cur;
+      if (!s.program || s.m.status === 'empty') { this.setStatus('虚拟机没有在运行', ''); return; }
+      s.m.sendCtrlAltDel();
+      this.afterKey(s);
+      s.screen.focus();
+    };
     $<HTMLSelectElement>('speed').onchange = e => {
       store.set('speed', (e.target as HTMLSelectElement).value);
       if (this.run !== 'idle') { this.stop(); this.start(); }
