@@ -36,6 +36,11 @@ if (process.env.HD) {
   await chooser.accept([process.env.HD]);
   await sleep(1000);
 } else await page.select('#drives select[data-act="newhd"]', '64');
+if (process.env.CD) { // 光盘映像放进光驱
+  const [chooser] = await Promise.all([page.waitForFileChooser(), page.click('#drives button[data-act="cd-insert"]')]);
+  await chooser.accept([process.env.CD]);
+  await sleep(1000);
+}
 if (process.env.ISO) { // 光盘映像放进 D:
   const [chooser] = await Promise.all([page.waitForFileChooser(), page.click('#drives button[data-act="insert"][data-drive="3"]')]);
   await chooser.accept([process.env.ISO]);

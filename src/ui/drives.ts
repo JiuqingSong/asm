@@ -9,6 +9,8 @@ import { UTILITIES, buildUtility } from '../dos/utilities.ts';
 
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
 const LETTERS = ['A:', 'B:', 'C:', 'D:'];
+/** 选文件时表示"放进光驱" */
+const CD = -1;
 
 // ----- IndexedDB：每台机器每个驱动器一条记录 -----
 const DB = 'asm86-disks', STORE = 'drives';
@@ -99,6 +101,9 @@ export class DrivesPanel {
             else if (v?.data) m.drives[k] = new Disk(v.name, new Uint8Array(v.data), v.floppy);
           } catch { /* 坏的记录：跳过 */ }
         }
+        const cd = await dbGet(`${i}:cd`);
+        if (cd?.iso) m.cdrom.insert(new BlobSource(cd.iso), cd.name);
+        m.cdrom.onChange = () => this.render(); // 程序弹出光盘时刷新
       }
     } catch { /* 浏览器不允许使用 IndexedDB：映像只保存在内存里 */ }
     this.render();
@@ -140,6 +145,14 @@ export class DrivesPanel {
     const b = (e.target as HTMLElement).closest('button[data-act]') as HTMLButtonElement | null;
     if (!b) return;
     if (b.dataset.act!.startsWith('fs-')) { this.fsAction(b); return; }
+    if (b.dataset.act === 'cd-insert') { this.target = { i: +b.dataset.i!, k: CD }; this.input.click(); return; }
+    if (b.dataset.act === 'cd-eject') {
+      const i = +b.dataset.i!;
+      this.machine(i).cdrom.eject();
+      dbPut(`${i}:cd`, null).catch(() => { /* 不要紧 */ });
+      this.render();
+      return;
+    }
     if (!b.dataset.drive && b.dataset.act !== 'boot') return;
     const i = +b.dataset.i!, k = +(b.dataset.drive ?? 0), m = this.machine(i);
     switch (b.dataset.act) {
@@ -317,6 +330,16 @@ export class DrivesPanel {
     this.input.value = '';
     if (!f || !this.target) return;
     const { i, k } = this.target;
+    if (k === CD) {
+      const m = this.machine(i);
+      m.cdrom.insert(new BlobSource(f), f.name);
+      dbPut(`${i}:cd`, { name: f.name, floppy: false, iso: f }).catch(() => { /* 存不下就算了 */ });
+      const iso = await isIsoFile(f);
+      this.host.message('ok', `光驱里放入了 ${f.name}${iso ? '' : '（这个文件不像 ISO9660 光盘映像，DOS 可能读不出来）'}。DOS 下要在 CONFIG.SYS 里装光驱驱动（例如 DEVICE=OAKCDROM.SYS /D:MSCD001），` +
+        `AUTOEXEC.BAT 里运行 MSCDEX /D:MSCD001；Windows 95 会自己认出光驱。映像不会读进内存，读到哪里才从文件里读哪一段`, i);
+      this.render();
+      return;
+    }
     try {
       const floppy = k < 2;
       if (!floppy && await isIsoFile(f)) {
@@ -350,7 +373,7 @@ export class DrivesPanel {
   }
 
   render(): void {
-    const parts: string[] = ['<div class="drives-head">磁盘映像：放入软盘或硬盘的映像文件（.img），可以从磁盘启动真的 DOS；D: 还可以放光盘映像（.iso）</div>'];
+    const parts: string[] = ['<div class="drives-head">磁盘映像：放入软盘或硬盘的映像文件（.img），可以从磁盘启动真的 DOS；光盘映像（.iso）可以放进光驱，也可以放在 D:（变成只读硬盘，DOS 不用装光驱驱动）</div>'];
     for (const { m, tag, i } of this.host.machines()) {
       if (this.host.dual()) parts.push(`<div class="pane-head sub">${tag} 机</div>`);
       for (let k = 0; k < 4; k++) {
@@ -373,6 +396,11 @@ export class DrivesPanel {
         parts.push(`<div class="file-row drive-row"><b class="dl">${LETTERS[k]}</b>${info}<span class="spacer"></span>${btns}</div>`);
         if (this.browse && this.browse.i === i && this.browse.k === k) parts.push(this.renderBrowser());
       }
+      const disc = m.cdrom.discName;
+      parts.push(`<div class="file-row drive-row"><b class="dl" title="IDE 第二通道上的 ATAPI 光驱">光驱</b>` +
+        (disc ? `<span class="fn" title="${esc(disc)}">${esc(disc)}</span><span class="note">${Math.round(m.cdrom.discSize / 1024 / 1024)}MB</span>` : '<span class="note">（没有光盘）</span>') +
+        `<span class="spacer"></span><button data-act="cd-insert" data-i="${i}" title="选择一个光盘映像文件（.iso）放进光驱">${disc ? '换光盘' : '放入光盘'}</button>` +
+        (disc ? `<button data-act="cd-eject" data-i="${i}" title="取出光盘">弹出</button>` : '') + '</div>');
       parts.push(`<div class="drive-boot"><button data-act="boot" data-i="${i}" data-from="0" ${m.drives[0] ? '' : 'disabled'} title="像开机一样从 A: 的软盘启动">从 A: 启动</button>` +
         `<button data-act="boot" data-i="${i}" data-from="128" ${m.drives[2] ? '' : 'disabled'} title="从 C: 硬盘启动（A: 里有软盘时也从 C: 启动）">从 C: 启动</button></div>`);
     }

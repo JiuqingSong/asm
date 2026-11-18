@@ -32,6 +32,10 @@ export const RF = 0x10000, VM = 0x20000;
 export interface IOBus {
   in8(port: number): number;
   out8(port: number, value: number): void;
+  /** 16 位宽的端口（例如 IDE 的数据端口）：字、双字的读写按 16 位进行，不拆成两个字节 */
+  wide?(port: number): boolean;
+  in16?(port: number): number;
+  out16?(port: number, value: number): void;
 }
 
 export interface IrqSource {
@@ -1477,12 +1481,16 @@ export class CPU {
   }
   private inN(port: number, size: number): number {
     this.ioCheck(port, size);
+    const io = this.io;
+    if (size > 1 && io.wide && io.wide(port)) return size === 2 ? io.in16!(port) : (io.in16!(port) | (io.in16!(port) << 16)) >>> 0;
     let v = 0;
     for (let k = 0; k < size; k++) v |= this.io.in8((port + k) & 0xffff) << (8 * k);
     return v >>> 0;
   }
   private outN(port: number, size: number, v: number): void {
     this.ioCheck(port, size);
+    const io = this.io;
+    if (size > 1 && io.wide && io.wide(port)) { io.out16!(port, v & 0xffff); if (size === 4) io.out16!(port, v >>> 16); return; }
     for (let k = 0; k < size; k++) this.io.out8((port + k) & 0xffff, (v >>> (8 * k)) & 0xff);
   }
 

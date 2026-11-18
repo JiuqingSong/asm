@@ -4,6 +4,7 @@ import { Disk } from './disk.ts';
 import { SerialMouse } from './serial-mouse.ts';
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, DMA, Keyboard, type KeyEvent } from './devices.ts';
+import { AtapiCdrom } from './atapi.ts';
 import { Hle } from './bios.ts';
 import { UART, type NullModem } from './uart.ts';
 import { DosMemory, MEM_TOP } from './dosmem.ts';
@@ -128,6 +129,8 @@ export class Machine {
   /** AT 机的第二个中断控制器（IRQ8~15，接在主片的 IRQ2 上） */
   pic2 = new PIC();
   dma = new DMA();
+  /** IDE 第二通道上的 ATAPI 光驱（IRQ15） */
+  cdrom = new AtapiCdrom(() => this.pic2.raise(7));
   // ---- 实时钟的中断（IRQ8）：CMOS 寄存器 A 的周期中断、每秒一次的更新结束中断；寄存器 C 是中断标志 ----
   private rtcFlags = 0;
   private rtcNextPeriodic = Infinity;
@@ -264,9 +267,13 @@ export class Machine {
           case 0x3cc: case 0x3ce: case 0x3cf: case 0x3d9: case 0x3ca: case 0x3c3: case 0x3d4: case 0x3d5: return this.video.in8(port);
         }
         if (DMA.owns(port)) return this.dma.in8(port);
+        if (AtapiCdrom.owns(port)) return this.cdrom.in8(port);
         this.unknownPort(port, '读');
         return 0xff;
       },
+      wide: (port) => port === 0x170,
+      in16: () => this.cdrom.in16(),
+      out16: (_port, v) => this.cdrom.out16(v),
       out8: (port, v) => {
         if (port >= 0x3f8 && port <= 0x3ff) { this.com1.out8(port - 0x3f8, v); return; }
         if (port >= 0x2f8 && port <= 0x2ff) { this.com2.out8(port - 0x2f8, v); return; }
@@ -322,6 +329,7 @@ export class Machine {
           default: if (this.video.out8(port, v)) return;
         }
         if (DMA.owns(port)) { this.dma.out8(port, v); return; }
+        if (AtapiCdrom.owns(port)) { this.cdrom.out8(port, v); return; }
         this.unknownPort(port, '写');
       },
     };
@@ -578,6 +586,7 @@ export class Machine {
     this.pic.reset(8, 0xb8);
     this.pic2.reset(0x70, 0xff);
     this.dma.reset();
+    this.cdrom.reset();
     this.rtcFlags = 0;
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
@@ -796,6 +805,7 @@ export class Machine {
     this.clock += dt;
     this.pit.advance(dt);
     if (this.clock >= this.rtcNext) this.rtcEvent();
+    if (this.cdrom.pending) this.cdrom.poll();
     this.com1.tick(this.clock);
     this.com2.tick(this.clock);
     this.mouse.tick(this.clock);
