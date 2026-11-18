@@ -33,4 +33,13 @@ describe('DOS 小工具', () => {
     expect(vec33(un)).toEqual([0x019a, 0xf000]);
     expect(un.console).toMatch(/removed/);
   });
+
+  it('SHUTDOWN.COM：写回缓冲区后通过 APM 关机', () => {
+    const com = buildUtility(UTILITIES.find(u => u.name === 'SHUTDOWN.COM')!);
+    const m = runCom(com, () => { /* */ });
+    expect(m.poweredOff).toBe(true);
+    expect(m.status).toBe('exited');
+    expect(m.message).toMatch(/APM/);
+    expect(m.mem[0xb8000]).toBe(0x20);   // 屏幕清空
+  });
 });

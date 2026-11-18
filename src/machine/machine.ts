@@ -430,6 +430,7 @@ export class Machine {
     this.console = '';
     this.instructions = 0;
     this.status = 'ready';
+    this.poweredOff = false;
     this.loadTail();
   }
 
@@ -457,6 +458,26 @@ export class Machine {
     cpu.waiting = false;
     for (const x of this.drives) if (x) x.changed = true;
   }
+
+  /** 关机：屏幕变黑，喇叭不响，程序停止（磁盘映像的内容保留） */
+  powerOff(message = '已关机'): void {
+    const mem = this.mem;
+    this.cpu.mmio = null;
+    this.video.reset();
+    mem[0x449] = 3;
+    for (let o = 0; o < 4000; o += 2) { mem[0xb8000 + o] = 0x20; mem[0xb8000 + o + 1] = 0x07; }
+    mem[0x450] = 0; mem[0x451] = 0;
+    mem[0x460] = 0x20; mem[0x461] = 0x20; // 光标形状：位 5 = 不显示光标
+    this.mouse.visible = -1;
+    this.mouse.used = false;
+    this.port61 = 0;
+    this.updateSpeaker();
+    this.exit(0, message);
+    this.poweredOff = true;
+  }
+
+  /** 已经关机（关机后要重新启动才能运行） */
+  poweredOff = false;
 
   /** INT 19h 或复位：从原来的启动盘重新启动；普通程序调用时忽略 */
   reboot(): void {

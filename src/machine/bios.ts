@@ -313,8 +313,27 @@ export class Hle {
       case 0x88: r[AX] = 0; this.retFlag(CF, false); return true; // 扩展内存 KB 数
       case 0x90: case 0x91: this.ah = 0; this.retFlag(CF, false); return true; // 设备忙 / 中断完成
       case 0x86: this.retFlag(CF, false); return true;          // 等待 CX:DX 微秒：不等
+      case 0x53: return this.apm();
     }
     this.ah = 0x86; this.retFlag(CF, true); // 不支持（C0h 系统配置、87h 扩展内存搬移、24h A20 等）
+    return true;
+  }
+
+  /** INT 15h AH=53h：APM 高级电源管理（1.2 版），只支持关机 */
+  private apm(): boolean {
+    const r = this.cpu.r;
+    switch (this.al) {
+      case 0x00: // 安装检查：AH/AL = 版本 1.2，BX = 'PM'，CX = 标志（支持 16 位和 32 位保护模式接口）
+        r[AX] = 0x0102; r[BX] = 0x504d; r[CX] = 0x0003; this.retFlag(CF, false); return true;
+      case 0x01: case 0x04: case 0x08: case 0x0d: case 0x0f: this.retFlag(CF, false); return true; // 连接、断开、允许
+      case 0x0e: r[AX] = 0x0102; this.retFlag(CF, false); return true; // 驱动程序版本
+      case 0x07: // 设置电源状态：CX = 3 关机
+        if (r[CX] === 3) { this.m.powerOff('已关机（程序通过 APM 关闭了电源）'); this.retFlag(CF, false); return true; }
+        this.retFlag(CF, false); // 待机、挂起：当作已经恢复
+        return true;
+      case 0x0a: r[BX] = 0x01ff; r[CX] = 0x80ff; this.retFlag(CF, false); return true; // 电源状态：交流电，没有电池
+    }
+    this.ah = 0x86; this.retFlag(CF, true);
     return true;
   }
 

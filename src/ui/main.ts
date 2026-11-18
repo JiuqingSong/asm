@@ -206,6 +206,7 @@ class App {
     $('btn-out').onclick = () => this.step('out');
     $('btn-back').onclick = () => this.back();
     $('btn-reset').onclick = () => this.restart();
+    $('btn-power').onclick = () => this.powerOff();
     $<HTMLSelectElement>('speed').onchange = e => {
       store.set('speed', (e.target as HTMLSelectElement).value);
       if (this.run !== 'idle') { this.stop(); this.start(); }
@@ -876,10 +877,26 @@ class App {
     this.updateButtons();
   }
 
+  /** 关机：停止运行，屏幕变黑，磁盘映像马上存进浏览器 */
+  private powerOff(): void {
+    const on = this.live.filter(s => s.program && !s.m.poweredOff && s.m.status !== 'empty');
+    if (!on.length) { this.setStatus('虚拟机没有在运行', ''); return; }
+    if (on.some(s => s.program!.format === 'boot' && s.m.status !== 'exited') &&
+        !confirm('DOS 可能还有没写进磁盘的数据（DOS 的缓冲区、SMARTDRV 的写缓存），直接关机可能丢失或损坏文件，和真机拔电源一样。\n\n更安全的做法：在 DOS 里运行 SHUTDOWN（磁盘映像的"文件"浏览器里可以放入 SHUTDOWN.COM），它会先写回缓冲区再关机。\n\n仍然直接关机吗？')) return;
+    this.stop();
+    for (const s of on) s.m.powerOff();
+    for (const s of on) this.drives?.flushAll(s.i);
+    this.setStatus('已关机。点"重启"或"从 A:/C: 启动"可以重新开机', '');
+    this.addMessage('info', '已关机', this.active);
+    this.render(true);
+  }
+
   restart(): void {
     this.stop();
     if (this.live.some(s => !s.binary && (s.dirty || !s.program))) { this.assembleAll(true); return; }
     this.loadAll();
+    // 从磁盘启动的系统：重启就是重新开机，直接运行起来
+    if (this.live.every(s => s.program?.format === 'boot')) { this.start(); this.cur.screen.focus(); }
   }
 
   private stopped(r: StopReason, who: number): void {
@@ -898,6 +915,12 @@ class App {
     const m = s.m;
     switch (r) {
       case 'exit': {
+        if (m.poweredOff) {
+          this.drives?.flushAll(s.i);
+          this.setStatus(tag + m.message + '。点"重启"或"从 A:/C: 启动"可以重新开机', '');
+          this.addMessage('info', m.message, s.i);
+          break;
+        }
         if (this.mode === 'dual') {
           this.setStatus(this.sessions.map(x => `${x.tag} 机：${x.m.status === 'exited' ? x.m.message : statusName(x.m.status)}`).join('；'), '');
           for (const x of this.sessions) if (x.m.status === 'exited') this.addMessage('info', `${x.m.message}（共执行 ${x.m.instructions.toLocaleString()} 条指令）`, x.i);

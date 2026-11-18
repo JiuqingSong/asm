@@ -105,6 +105,14 @@ export class DrivesPanel {
     this.render();
   }
 
+  /** 关机时：马上把改过的映像存进浏览器（不等定时器） */
+  flushAll(i: number): void {
+    for (let k = 0; k < 3; k++) {
+      const key = `${i}:${k}`;
+      if (this.saveTimers.has(key)) { clearTimeout(this.saveTimers.get(key)); this.saveTimers.delete(key); this.persist(i, k); }
+    }
+  }
+
   private persist(i: number, k: number): void {
     const m = this.host.machines().find(x => x.i === i)?.m;
     if (!m) return;
@@ -212,7 +220,7 @@ export class DrivesPanel {
         // 放进 AUTOEXEC.BAT：开机时自动运行
         let auto = false;
         const vol = this.volume();
-        if (typeof vol !== 'string' && b.k === 2 && vol.v.list('').some(e => e.name === 'AUTOEXEC.BAT')) {
+        if (typeof vol !== 'string' && u.autoexec && b.k === 2 && vol.v.list('').some(e => e.name === 'AUTOEXEC.BAT')) {
           const text = new TextDecoder('latin1').decode(vol.v.readFile('', 'AUTOEXEC.BAT'));
           if (!new RegExp(`(^|[\\\\\\s])${base}(\\.COM)?\\s*$`, 'im').test(text)) auto = confirm(`把 ${u.name} 放进 ${where} 后，要不要同时加到 C:\\AUTOEXEC.BAT 里，每次启动 DOS 时自动运行？`);
         }
@@ -277,7 +285,7 @@ export class DrivesPanel {
     return `<div class="fs-box">${head}<span class="note">${v.fat16 ? 'FAT16' : 'FAT12'}${v.label ? '，卷标 ' + esc(v.label) : ''}，剩余 ${kb(v.freeBytes())}</span></div>` +
       `<div class="mem-bar">${b.path ? '<button data-act="fs-up">↑ 上一级</button>' : ''}<button data-act="fs-upload" title="选择电脑上的文件放进这个目录（文件名会换成 DOS 的 8.3 格式）">上传文件到这里</button>` +
       `<button data-act="fs-mkdir">新建目录</button><button data-act="fs-copy" title="把下面"文件"列表里的全部文件复制到这个目录">复制"文件"列表到这里</button>` +
-      UTILITIES.map(u => `<button data-act="fs-util" data-name="${u.name}" title="${esc(u.description)}">放入${u.name === 'MOUSE.COM' ? '鼠标驱动 ' : ''}${u.name}</button>`).join('') + '</div>' +
+      UTILITIES.map(u => `<button data-act="fs-util" data-name="${u.name}" title="${esc(u.description)}">放入${u.name === 'MOUSE.COM' ? '鼠标驱动 ' : u.name === 'SHUTDOWN.COM' ? '关机程序 ' : ''}${u.name}</button>`).join('') + '</div>' +
       (rows.length ? rows.join('') : '<div class="empty">这个目录是空的</div>') + '</div>';
   }
 

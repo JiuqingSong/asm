@@ -3,6 +3,7 @@
 import { assemble } from '../asm/assembler.ts';
 import { comFile } from './com.ts';
 import mouseAsm from './mouse.asm?raw';
+import shutdownAsm from './shutdown.asm?raw';
 
 export { comFile };
 
@@ -10,10 +11,13 @@ export interface DosUtility {
   name: string;
   description: string;
   source: string;
+  /** 放进磁盘时，问要不要加到 AUTOEXEC.BAT */
+  autoexec?: boolean;
 }
 
 export const UTILITIES: DosUtility[] = [
-  { name: 'MOUSE.COM', description: '鼠标驱动：让 INT 33h 重新指向虚拟 PC 内置的鼠标驱动（DOS 启动后需要运行一次）', source: mouseAsm },
+  { name: 'MOUSE.COM', description: '鼠标驱动：让 INT 33h 重新指向虚拟 PC 内置的鼠标驱动（DOS 启动后需要运行一次）', source: mouseAsm, autoexec: true },
+  { name: 'SHUTDOWN.COM', description: '关机：先把 DOS 和 SMARTDRV 缓冲区里的数据写进磁盘，再通过 APM 关闭电源', source: shutdownAsm },
 ];
 
 export function buildUtility(u: DosUtility): Uint8Array {
