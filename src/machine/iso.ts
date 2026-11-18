@@ -35,6 +35,9 @@ export class BlobSource implements IsoSource {
   private chunks = new Map<number, Uint8Array>();
   private pending = new Map<number, Promise<void>>();
   readonly blob: Blob;
+  /** 读文件出错时调用（界面显示出来）。出错的块下次用到时会再读，读不出来虚拟机就一直等着，所以一定要让用户知道 */
+  static onError: ((msg: string) => void) | null = null;
+  private reported = false;
   constructor(blob: Blob) { this.blob = blob; }
   get size(): number { return this.blob.size; }
 
@@ -47,7 +50,15 @@ export class BlobSource implements IsoSource {
         this.chunks.set(i, new Uint8Array(b));
         this.pending.delete(i);
         while (this.chunks.size > BlobSource.KEEP) this.chunks.delete(this.chunks.keys().next().value!);
-      }, () => { this.pending.delete(i); });
+      }, (e: unknown) => {
+        this.pending.delete(i);
+        if (this.reported) return;
+        this.reported = true;
+        const name = (this.blob as File).name ?? '光盘映像';
+        const msg = `读 ${name} 出错（第 ${i * C} 字节处）：${(e as Error)?.message ?? e}。文件可能被移动、改名或修改过了，虚拟机会一直等这段数据。请重新放入这个文件`;
+        console.error(msg, e);
+        BlobSource.onError?.(msg);
+      });
       this.pending.set(i, p);
     }
     return p;

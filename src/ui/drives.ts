@@ -71,6 +71,7 @@ export class DrivesPanel {
 
   constructor(el: HTMLElement, host: DriveHost) {
     this.el = el; this.host = host;
+    BlobSource.onError = msg => this.host.message('error', msg, 0);
     this.input = document.createElement('input');
     this.input.type = 'file';
     this.input.accept = '.img,.ima,.vfd,.dsk,.bin,.iso';
