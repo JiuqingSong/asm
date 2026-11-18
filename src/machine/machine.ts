@@ -1,6 +1,7 @@
 // 虚拟 PC：CPU + 内存 + 中断控制器 + 定时器 + 键盘 + BIOS/DOS，以及调试功能
 import { CPU, CS, DS, ES, SS, SP, DX, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
 import { Disk } from './disk.ts';
+import { SerialMouse } from './serial-mouse.ts';
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, Keyboard, type KeyEvent } from './devices.ts';
 import { Hle } from './bios.ts';
@@ -148,6 +149,8 @@ export class Machine {
   dosmem = new DosMemory(this.cpu);
   video = new Video();
   mouse = new Mouse();
+  /** COM2 上的 Microsoft 串口鼠标（给 Windows 等直接操作串口的鼠标驱动用） */
+  serialMouse = new SerialMouse(this.mouse);
   /** 8×8 字库（256 个字符 × 8 字节），装载程序时写进 BIOS ROM；默认是内置点阵，界面会用浏览器字体补全其余字符 */
   static font: Uint8Array | null = builtinFont();
   history = new History();
@@ -212,6 +215,7 @@ export class Machine {
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
     this.video.planar.onWrite = (a, old) => { if (this.history.enabled) this.history.write(0x100000 + a, old); };
     this.com1.onWarn = this.com2.onWarn = msg => this.log(msg);
+    this.com2.peer = this.serialMouse;
   }
 
   // ======================= 端口 =======================
@@ -628,6 +632,7 @@ export class Machine {
       t = Math.min(t, u.nextEvent());
       if (this.link && (u === this.link.a || u === this.link.b)) t = Math.min(t, this.link.nextArrival(u));
     }
+    t = Math.min(t, this.serialMouse.nextArrival());
     return t;
   }
 

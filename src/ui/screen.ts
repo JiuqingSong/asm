@@ -100,6 +100,13 @@ export class Screen {
   onKey: ((e: KeyEvent) => void) | null = null;
   /** 鼠标：显示区域内的相对位置（0~1）和按键（位 0 左、位 1 右、位 2 中） */
   onMouse: ((fx: number, fy: number, buttons: number) => void) | null = null;
+  /** 相对移动（鼠标被捕获时）：dx、dy 是虚拟屏幕上的像素（水平按 640 宽计） */
+  onMouseRel: ((dx: number, dy: number, buttons: number) => void) | null = null;
+  /** 程序在用串口鼠标（它自己画光标、只要相对移动量）：单击屏幕时捕获鼠标 */
+  relative = false;
+  /** 捕获状态变化（界面据此提示"按 Esc 释放鼠标"） */
+  onCapture: ((captured: boolean) => void) | null = null;
+  private get captured(): boolean { return document.pointerLockElement === this.el; }
   private rows: HTMLElement[] = [];
   private vramView = new Uint8Array(COLS * ROWS * 2);
   /** 中文显示：像 UCDOS 那样把 GBK 编码显示成汉字 */
@@ -145,13 +152,29 @@ export class Screen {
     this.ctx = this.canvas.getContext('2d');
     const mouse = (e: MouseEvent) => {
       if (!this.onMouse) return;
+      if (this.captured) {
+        // 被捕获时只有相对移动量；屏幕显示得比 640 像素窄时按比例放大
+        const r = this.displayRect();
+        const kx = 640 / Math.max(1, r.width), ky = this.virtualHeight / Math.max(1, r.height);
+        this.onMouseRel?.(e.movementX * kx, e.movementY * ky, e.buttons & 7);
+        return;
+      }
       const r = this.displayRect();
       const fx = Math.max(0, Math.min(0.9999, (e.clientX - r.left) / r.width));
       const fy = Math.max(0, Math.min(0.9999, (e.clientY - r.top) / r.height));
       this.onMouse(fx, fy, e.buttons & 7);
     };
     el.addEventListener('mousemove', mouse);
-    el.addEventListener('mousedown', e => { mouse(e); if (e.button !== 0) e.preventDefault(); });
+    el.addEventListener('mousedown', e => {
+      if (this.relative && !this.captured && e.button === 0) {
+        // 程序用的是串口鼠标：捕获鼠标（浏览器的光标消失，移动量全部交给程序），按 Esc 释放
+        try { void (this.el.requestPointerLock() as unknown as Promise<void> | undefined)?.catch?.(() => { /* 不允许捕获 */ }); } catch { /* 不支持 */ }
+        return;
+      }
+      mouse(e);
+      if (e.button !== 0) e.preventDefault();
+    });
+    document.addEventListener('pointerlockchange', () => this.onCapture?.(this.captured));
     el.addEventListener('mouseup', mouse);
     el.addEventListener('contextmenu', e => { if (this.onMouse) e.preventDefault(); });
     el.addEventListener('keydown', e => this.key(e, false));
@@ -185,6 +208,12 @@ export class Screen {
     if (r.width) { this.cellW = r.width; this.cellH = (s.parentElement as HTMLElement).getBoundingClientRect().height; }
     this.prev.fill(-1);
   }
+
+  /** 虚拟屏幕高度（串口鼠标的纵向比例用） */
+  private get virtualHeight(): number { return this.graphicsMode >= 0 ? modeInfo(this.graphicsMode).height : 200; }
+
+  /** 释放鼠标捕获 */
+  release(): void { if (this.captured) document.exitPointerLock(); }
 
   /** 从显存渲染 */
   render(mem: Uint8Array, cursorRow: number, cursorCol: number, cursorShape: number, video?: Video, mouse?: Mouse): void {

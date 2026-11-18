@@ -167,26 +167,34 @@ export class DrivesPanel {
   }
 
   /**
-   * 修改映像里的文件。DOS 正在运行时会缓存磁盘的 FAT 表和目录，从外面改了它不知道，
-   * 继续用旧的缓存分配空间会把文件写坏，所以先问一下，改完重新启动虚拟机
+   * 修改映像里的文件（不重启虚拟机）。DOS 正在运行时：软盘发出"换过盘"的信号让 DOS 重新读；
+   * 硬盘只能提醒用户，DOS 缓存着原来的目录和 FAT 表
    */
-  private modify(what: string, fn: (v: FatVolume) => string): void {
+  private modify(_what: string, fn: (v: FatVolume) => string): void {
     const b = this.browse!;
     const m = this.machine(b.i);
-    const booted = m.program?.format === 'boot' && m.status !== 'empty';
-    if (booted && !confirm(`${what}\n\n虚拟机正在运行从磁盘启动的系统。DOS 在内存里缓存了磁盘的目录和 FAT 表，从外面修改磁盘后必须重新启动，否则 DOS 可能把文件写坏。\n\n修改后会自动重新启动虚拟机（没有保存的工作会丢失）。继续吗？`)) return;
+    const booted = m.program?.format === 'boot' && m.status !== 'empty' && !m.poweredOff;
     const vol = this.volume();
     if (typeof vol === 'string') { this.host.message('error', vol, b.i); return; }
     try {
-      const msg = fn(vol.v);
+      let msg = fn(vol.v);
       vol.d.dirty = true;
       this.persist(b.i, b.k);
+      if (booted) {
+        if (vol.d.floppy) {
+          // 软盘：发出"换过盘"的信号，DOS 下次访问时会重新读目录和 FAT 表
+          vol.d.changed = true;
+        } else {
+          // 硬盘：DOS 不知道磁盘被改过，内存里还缓存着原来的目录和 FAT 表
+          msg += '。DOS 正在运行：如果在 DOS 里看不到新文件，或者要在 DOS 里写文件，最好先重新启动一次（工具栏的"重启"），' +
+            '因为 DOS 缓存着原来的目录和 FAT 表，按旧的缓存写文件可能和刚放进去的文件冲突';
+        }
+      }
       this.host.message('ok', msg, b.i);
     } catch (e) {
       this.host.message('error', (e as Error).message, b.i);
     }
     this.render();
-    if (booted) this.host.boot(b.i, m.program!.bootDrive ?? 0);
   }
 
   private fsAction(btn: HTMLButtonElement): void {

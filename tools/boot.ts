@@ -31,6 +31,15 @@ m.hle.handle = (n: number) => {
   ints.set(key, (ints.get(key) ?? 0) + 1);
   return hle(n);
 };
+if (process.env.PORTS) {
+  const io = m.cpu.io;
+  const log: string[] = [];
+  (globalThis as { __ports?: string[] }).__ports = log;
+  m.cpu.io = {
+    in8: p => { const v = io.in8(p); if ((p & 0xfff8) === 0x2f8 || (p & 0xfff8) === 0x3f8) log.push(`IN ${p.toString(16)}=${v.toString(16)}`); return v; },
+    out8: (p, v) => { if ((p & 0xfff8) === 0x2f8 || (p & 0xfff8) === 0x3f8) log.push(`OUT ${p.toString(16)},${v.toString(16)}`); io.out8(p, v); },
+  };
+}
 m.load(bootProgram(process.env.BOOT === 'C' ? 0x80 : 0));
 // WATCH=1：CPU 第一次跑到 A000 段以上（又不是 BIOS 的 F000 段）时，打印最近执行过的 40 条指令的位置
 if (process.env.WATCH) {
@@ -38,13 +47,14 @@ if (process.env.WATCH) {
   const orig = cpu.step.bind(cpu);
   const recent: string[] = [];
   let reported = false, zeros = 0;
+  const watchInt = process.env.WATCHINT ? process.env.WATCHINT.split(':').map(x => parseInt(x, 16)) : null;
   const watchAt = process.env.WATCHAT ? process.env.WATCHAT.split(':').map(x => parseInt(x, 16)) : null;
   const { disassemble } = await import('../src/cpu/disasm.ts');
   cpu.step = () => {
     const cs = cpu.s[1], ip = cpu.ip;
     const lin = ((cs << 4) + ip) & 0xfffff;
     zeros = m.mem[lin] === 0 && m.mem[lin + 1] === 0 ? zeros + 1 : 0;
-    if (!reported && ((cs >= 0xa000 && cs !== 0xf000) || zeros >= 4 || (watchAt && cs === watchAt[0] && ip === watchAt[1]))) {
+    if (!reported && ((cs >= 0xa000 && cs !== 0xf000) || zeros >= 4 || (watchAt && cs === watchAt[0] && ip === watchAt[1]) || (watchInt && m.mem[lin] === 0xcd && m.mem[lin + 1] === watchInt[0] && (m.cpu.r[0] >> 8) === watchInt[1]))) {
       reported = true;
       console.log(`跑到了 ${cs.toString(16)}:${ip.toString(16)}，之前执行的指令：\n` + recent.slice(0, recent.length - 3).join('\n'));
       if (process.env.DUMPAT) { const [ds, dofs] = process.env.DUMPAT.split(':').map(x => parseInt(x, 16)); const rd = (o: number) => m.mem[((ds << 4) + (o & 0xffff)) & 0xfffff]; let o = dofs; const out: string[] = []; for (let k = 0; k < 16; k++) { const ins = disassemble(rd, o); out.push(`  ${ds.toString(16)}:${o.toString(16)}  ${ins.bytes.map(b => b.toString(16).padStart(2, '0')).join(' ').padEnd(18)} ${ins.text}`); o += ins.length; } console.log('触发时的代码：\n' + out.join('\n')); }
@@ -96,11 +106,14 @@ const swaps = (process.env.DISKS ?? '').split(';').filter(Boolean);
 const t0 = Date.now();
 run(+millionsArg);
 for (const k of keys) {
-  for (const part of k.split(/(\{[A-Z0-9]+\})/).filter(Boolean)) {
+  for (const part of k.split(/(\{[A-Z0-9:,-]+\})/).filter(Boolean)) {
     const sp = /^\{([A-Z0-9]+)\}$/.exec(part);
     if (part === '{SWAP}') { const p = swaps.shift()!; m.drives[0] = new Disk(basename(p), new Uint8Array(readFileSync(p)), true); console.log('换盘：', basename(p)); continue; }
     if (part === '{EJECT}') { m.drives[0] = null; console.log('取出 A: 的软盘'); continue; }
     if (part === '{PNG}') { const f = `${process.env.PNG ?? 'screen'}-${++pngNo}.png`; console.log(saveScreenPng(m, f) ? '截图：' + f : '（文本模式，没有截图）'); continue; }
+    const mv = /^\{MOVE:(-?\d+),(-?\d+)\}$/.exec(part);
+    if (mv) { for (let k = 0; k < 10; k++) { m.mouse.moveRel(+mv[1] / 10, +mv[2] / 10); run(1); } continue; }
+    if (part === '{CLICK}') { m.mouse.queueButtons(1, m.clock); run(2); m.mouse.queueButtons(0, m.clock); run(2); continue; }
     if (part === '{SHOT}') { console.log('屏幕：\n' + screen()); continue; }
     if (sp && SPECIAL[sp[1]]) { m.pressKey({ scan: SPECIAL[sp[1]][0], ascii: SPECIAL[sp[1]][1], release: false }); m.pressKey({ scan: SPECIAL[sp[1]][0] | 0x80, ascii: 0, release: true }); }
     else m.typeText(part, scanForChar);
@@ -138,3 +151,6 @@ if (process.env.STATE) {
 }
 
 if (process.env.WATCH) console.log('最后执行的指令：\n' + ((globalThis as { __tail?: string[] }).__tail ?? []).slice(-40).join('\n'));
+
+if (process.env.PORTS) { const l = (globalThis as { __ports?: string[] }).__ports ?? []; console.log('串口访问（共 ' + l.length + ' 次）：' + l.slice(0, 200).join(' ')); }
+if (process.env.CONSOLE) console.log('输出的文字：' + JSON.stringify(m.console.slice(-600)));

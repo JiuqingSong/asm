@@ -92,6 +92,16 @@ class App {
         cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(),
       };
       s.screen.onKey = e => this.key(s, e);
+      s.screen.onMouseRel = (dx, dy, buttons) => {
+        if (!s.program || (s.dirty && !s.binary)) return;
+        s.m.mouse.moveRel(dx, dy);
+        s.m.mouse.queueButtons(buttons, s.m.clock);
+        this.afterKey(s);
+      };
+      s.screen.onCapture = captured => {
+        if (captured) this.setStatus('鼠标已被 DOS 屏幕捕获（程序在用串口鼠标）。按 Esc 释放鼠标', 'running');
+        else if (this.run === 'run') this.setStatus(this.runText(), 'running');
+      };
       s.screen.onMouse = (fx, fy, buttons) => {
         if (!s.program || (s.dirty && !s.binary)) return;
         s.m.mouse.moveTo(fx * 640, fy * s.m.mouse.screenH);
@@ -993,6 +1003,7 @@ class App {
     this.stack.render(m, s.snap);
     for (const x of this.live) {
       const mem = x.m.mem, bda = 0x400;
+      x.screen.relative = x.m.serialMouse.active;
       x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video, x.m.mouse);
     }
     if (full || this.run === 'animate') {

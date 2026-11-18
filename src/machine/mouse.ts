@@ -79,6 +79,7 @@ export class Mouse {
   powerOn(): void {
     this.minX = 0; this.maxX = 639; this.minY = 0; this.maxY = 199; this.screenH = 200;
     this.buttons = 0;
+    this.rawDx = this.rawDy = 0; this.lastTx = this.lastTy = NaN;
     this.queue = [];
     this.lastChange = -Infinity;
     this.enabled = true;
@@ -93,10 +94,27 @@ export class Mouse {
 
   // ======================= 来自界面的输入 =======================
 
+  /** 还没有交给串口鼠标的移动量（像素，不受活动范围限制） */
+  rawDx = 0;
+  rawDy = 0;
+  private lastTx = NaN;
+  private lastTy = NaN;
+
+  /** 相对移动（鼠标被 DOS 屏幕"捕获"时）：dx、dy 是虚拟屏幕上的像素 */
+  moveRel(dx: number, dy: number): void {
+    this.rawDx += dx; this.rawDy += dy;
+    const nx = this.x + dx, ny = this.y + dy;
+    this.lastTx = NaN;
+    this.moveTo(nx, ny);
+    this.lastTx = this.x; this.lastTy = this.y;
+  }
+
   /** 鼠标移动到虚拟坐标 (x, y) */
   moveTo(x: number, y: number): void {
     if (!this.enabled) return;
     const nx = Math.round(x), ny = Math.round(y);
+    if (!Number.isNaN(this.lastTx)) { this.rawDx += nx - this.lastTx; this.rawDy += ny - this.lastTy; }
+    this.lastTx = nx; this.lastTy = ny;
     if (nx === this.x && ny === this.y) return;
     this.mickeyX += ((nx - this.x) * this.ratioX) / 8;
     this.mickeyY += ((ny - this.y) * this.ratioY) / 8;
@@ -216,7 +234,7 @@ export class Mouse {
       case 0x1e: r[BX] = 0; return true;
       case 0x1f: this.enabled = false; cpu.s[ES] = 0; r[BX] = 0; return true;
       case 0x20: this.enabled = true; r[AX] = 0xffff; return true;
-      case 0x24: r[BX] = 0x0626; r[CX] = 0x0400; return true; // 驱动版本 6.26，PS/2 鼠标
+      case 0x24: r[BX] = 0x0626; r[CX] = 0x0203; return true; // 驱动版本 6.26，串口鼠标（CH=2），IRQ 3（COM2）
       case 0x26: r[BX] = 0; r[CX] = this.maxX; r[DX] = this.maxY; return true;
     }
     return false;
