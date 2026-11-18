@@ -1,6 +1,7 @@
 // 虚拟 PC：CPU + 内存 + 中断控制器 + 定时器 + 键盘 + BIOS/DOS，以及调试功能
 import { CPU, CS, DS, ES, SS, SP, DX, AX, BX, CX, BP, SI, DI, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
 import { Disk } from './disk.ts';
+import { FloppyController } from './fdc.ts';
 import { SerialMouse } from './serial-mouse.ts';
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, DMA, Keyboard, type KeyEvent } from './devices.ts';
@@ -131,6 +132,15 @@ export class Machine {
   dma = new DMA();
   /** IDE 第二通道上的 ATAPI 光驱（IRQ15） */
   cdrom = new AtapiCdrom(() => this.pic2.raise(7));
+  /** 软驱控制器（端口 3F0h~3F7h，IRQ6，DMA 2 号通道）：给 Windows 95 这样自己操作软驱的系统用；DOS 经 INT 13h 读写 */
+  fdc = new FloppyController({
+    disk: d => this.drives[d],
+    driveExists: d => d === 0 || (d === 1 && (this.mem[0x410] & 0xc1) === 0x41),
+    now: () => this.clock,
+    irq: () => this.pic.raise(6),
+    dma: data => (this.dma.ready(2) ? this.dma.transfer(2, data, this.cpu) : null), // 方向由通道的模式决定（和真机一样）
+    written: d => { const x = this.drives[d]; if (x) x.dirty = true; this.disksChanged(); },
+  });
   // ---- 实时钟的中断（IRQ8）：CMOS 寄存器 A 的周期中断、每秒一次的更新结束中断；寄存器 C 是中断标志 ----
   private rtcFlags = 0;
   private rtcNextPeriodic = Infinity;
@@ -250,6 +260,7 @@ export class Machine {
       in8: (port) => {
         if (port >= 0x3f8 && port <= 0x3ff) return this.com1.in8(port - 0x3f8);
         if (port >= 0x2f8 && port <= 0x2ff) return this.com2.in8(port - 0x2f8);
+        if (FloppyController.owns(port)) return this.fdc.in8(port);
         switch (port) {
           case 0x20: case 0x21: return this.pic.in8(port);
           case 0xa0: case 0xa1: return this.pic2.in8(port & 0x21);
@@ -277,6 +288,7 @@ export class Machine {
       out8: (port, v) => {
         if (port >= 0x3f8 && port <= 0x3ff) { this.com1.out8(port - 0x3f8, v); return; }
         if (port >= 0x2f8 && port <= 0x2ff) { this.com2.out8(port - 0x2f8, v); return; }
+        if (FloppyController.owns(port)) { this.fdc.out8(port, v); return; }
         switch (port) {
           case 0x20: case 0x21: {
             const had = this.pic.isr & 2;
@@ -395,7 +407,7 @@ export class Machine {
     const c = this.cmos;
     c.fill(0);
     c[0x0a] = 0x26; c[0x0b] = 0x02;        // 实时钟：32768Hz 晶振、1024Hz 周期；24 小时制，周期中断关闭
-    c[0x10] = 0x40;                        // A: 1.44MB
+    c[0x10] = 0x40 | (this.drives[1] ? 0x04 : 0); // A:（和有盘时的 B:）是 1.44MB 软驱
     c[0x14] = 0x01 | (this.drives[1] ? 0x40 : 0); // 设备字节
     c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
     const ext = this.cpu.is286 ? 15360 : 0;
@@ -587,6 +599,7 @@ export class Machine {
     this.pic2.reset(0x70, 0xff);
     this.dma.reset();
     this.cdrom.reset();
+    this.fdc.reset();
     this.rtcFlags = 0;
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
@@ -787,7 +800,7 @@ export class Machine {
     }
     if (cpu.halted) {
       // HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据
-      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock)));
+      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), Math.ceil(this.fdc.next - this.clock)));
       this.advanceTime(dt);
       this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
       cpu.step();
@@ -806,6 +819,7 @@ export class Machine {
     this.pit.advance(dt);
     if (this.clock >= this.rtcNext) this.rtcEvent();
     if (this.cdrom.pending) this.cdrom.poll();
+    if (this.clock >= this.fdc.next) this.fdc.tick();
     this.com1.tick(this.clock);
     this.com2.tick(this.clock);
     this.mouse.tick(this.clock);

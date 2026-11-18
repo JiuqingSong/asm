@@ -82,23 +82,28 @@ export class PIC implements IrqSource {
 
 /**
  * DMA 控制器：AT 机的两片 8237（0~3 号通道 8 位，端口 00h~0Fh；4~7 号通道 16 位，端口 C0h~DEh）和页寄存器（80h~8Fh）。
- * 没有设备真的做 DMA 传输（软盘、硬盘都由 BIOS 高层模拟），这里只保存寄存器，让探测、编程 DMA 的程序读回合理的值
+ * 软驱控制器经 2 号通道传送数据（见 fdc.ts 和 transfer）；其他通道只保存寄存器，让探测、编程 DMA 的程序读回合理的值
  */
 export class DMA {
-  /** 各通道的地址、计数（基准值和当前值相同，因为不传输） */
+  /** 各通道的当前地址、当前计数（传送时变化；读端口得到的是它们） */
   addr = new Uint16Array(8);
   count = new Uint16Array(8);
+  /** 基准地址、基准计数（写端口时和当前值一起设置；自动初始化时恢复成它们） */
+  baseAddr = new Uint16Array(8);
+  baseCount = new Uint16Array(8);
   mode = new Uint8Array(8);
   /** 屏蔽位：位 n = 通道 n */
   mask = 0xff;
   command = [0, 0];
+  /** 状态寄存器的"到达终点"位（读状态寄存器后清掉）：位 n = 通道 n */
+  private tcBits = 0;
   private flip = [false, false];
   /** 页寄存器 80h~8Fh（80h 也是开机自检的诊断端口） */
   page = new Uint8Array(16);
 
   reset(): void {
-    this.addr.fill(0); this.count.fill(0); this.mode.fill(0);
-    this.mask = 0xff; this.command = [0, 0]; this.flip = [false, false]; this.page.fill(0);
+    this.addr.fill(0); this.count.fill(0); this.baseAddr.fill(0); this.baseCount.fill(0); this.mode.fill(0);
+    this.mask = 0xff; this.command = [0, 0]; this.flip = [false, false]; this.page.fill(0); this.tcBits = 0;
   }
 
   /** 端口是不是 DMA 控制器或页寄存器的 */
@@ -121,7 +126,7 @@ export class DMA {
       this.flip[c] = !hi;
       return hi ? v >> 8 : v & 0xff;
     }
-    if (r === 8) return 0;                                  // 状态：没有通道到达终点、没有请求
+    if (r === 8) { const v = (this.tcBits >> (c * 4)) & 0x0f; this.tcBits &= ~(0x0f << (c * 4)); return v; } // 状态：到达终点的通道
     if (r === 0x0f) return ((this.mask >> (c * 4)) & 0x0f) | 0xf0; // 屏蔽寄存器（有些芯片组可以读）
     return 0xff;
   }
@@ -131,8 +136,9 @@ export class DMA {
     if (port >= 0xc0 && port & 1) return;
     const [c, r] = this.decode(port);
     if (r < 8) {
-      const ch = c * 4 + (r >> 1), arr = r & 1 ? this.count : this.addr;
+      const ch = c * 4 + (r >> 1), arr = r & 1 ? this.count : this.addr, base = r & 1 ? this.baseCount : this.baseAddr;
       arr[ch] = this.flip[c] ? (arr[ch] & 0x00ff) | (v << 8) : (arr[ch] & 0xff00) | v;
+      base[ch] = arr[ch];
       this.flip[c] = !this.flip[c];
       return;
     }
@@ -142,12 +148,44 @@ export class DMA {
       case 0x0a: if (v & 4) this.mask |= 1 << (base + (v & 3)); else this.mask &= ~(1 << (base + (v & 3))); return; // 单个屏蔽位
       case 0x0b: this.mode[base + (v & 3)] = v; return;
       case 0x0c: this.flip[c] = false; return;                                         // 清先后触发器
-      case 0x0d: this.flip[c] = false; this.mask |= 0x0f << base; this.command[c] = 0; return; // 主清除
+      case 0x0d: this.flip[c] = false; this.mask |= 0x0f << base; this.command[c] = 0; this.tcBits &= ~(0x0f << base); return; // 主清除
       case 0x0e: this.mask &= ~(0x0f << base); return;                                // 清除全部屏蔽
       case 0x0f: this.mask = (this.mask & ~(0x0f << base)) | ((v & 0x0f) << base); return;
     }
   }
+
+  /** 通道没被屏蔽，可以传送 */
+  ready(ch: number): boolean { return !(this.mask & (1 << ch)); }
+
+  /**
+   * 外设经 0~3 号通道（8 位）传送 data.length 个字节，按通道编程的模式：写内存（外设 → 内存）、读内存
+   * （内存 → 外设，结果放进 data）或校验（不碰内存）。计数到达终点（计数从 0 再减一）时停止，返回传送的字节数和
+   * 是否到达终点；到达终点时自动初始化的通道恢复基准值。地址只在 64KB 内变化，不进位到页寄存器（和真的一样）
+   */
+  transfer(ch: number, data: Uint8Array, mem: { readLin(a: number): number; writeLin(a: number, v: number): void }): { n: number; tc: boolean } {
+    const mode = this.mode[ch], type = (mode >> 2) & 3, down = (mode & 0x20) !== 0;
+    const page = this.page[PAGE_PORT[ch]] << 16;
+    let n = 0, tc = false;
+    while (n < data.length) {
+      const a = page | this.addr[ch];
+      if (type === 1) mem.writeLin(a, data[n]);
+      else if (type === 2) data[n] = mem.readLin(a);
+      n++;
+      this.addr[ch] = this.addr[ch] + (down ? -1 : 1);
+      this.count[ch] = this.count[ch] - 1;
+      if (this.count[ch] === 0xffff) { tc = true; break; }
+    }
+    if (tc) {
+      this.tcBits |= 1 << ch;
+      if (mode & 0x10) { this.addr[ch] = this.baseAddr[ch]; this.count[ch] = this.baseCount[ch]; } // 自动初始化
+      else this.mask |= 1 << ch; // 到达终点后通道被屏蔽（单次传送）
+    }
+    return { n, tc };
+  }
 }
+
+/** 0~3 号通道的页寄存器（80h 开始的序号）：0 号是 87h、1 号 83h、2 号 81h、3 号 82h */
+const PAGE_PORT = [7, 3, 1, 2];
 
 /** 8253 可编程定时器（只模拟 0 号通道产生 IRQ0 和 2 号通道的频率设置） */
 export class PIT {

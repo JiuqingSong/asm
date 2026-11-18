@@ -130,7 +130,11 @@ export class Hle {
       case 0x2a: case 0x28: return true; // 网络、DOS 空闲：忽略
       case 0x08: return this.timerTick();
       case 0x09: return this.keyboardIrq();
-      case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0e: case 0x0f:
+      case 0x0e: // IRQ6（软驱控制器）：和 IBM BIOS 一样在 40:3E 的位 7 记下"中断来过"，直接操作控制器的程序等这一位
+        this.cpu.wb(BDA, 0x3e, this.cpu.rb(BDA, 0x3e) | 0x80);
+        this.m.pic.out8(0x20, 0x20);
+        return true;
+      case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0f:
         this.m.pic.out8(0x20, 0x20); // 默认的硬件中断处理：只发 EOI
         return true;
       case 0x70: case 0x71: case 0x72: case 0x73: case 0x76: case 0x77: // 74h、75h 是鼠标桩代码用的陷阱号
