@@ -18,7 +18,7 @@ const errors = [];
 page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); indexedDB.deleteDatabase('asm86-disks'); } catch { /* */ } });
-await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
+await page.goto(process.env.URL || 'http://localhost:5317/', { waitUntil: 'networkidle0' });
 await page.waitForSelector('.monaco-editor');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -41,6 +41,7 @@ console.log('磁盘：', await page.$$eval('#drives .drive-row', rows => rows.ma
 await page.screenshot({ path: join(out, 'boot-0-drives.png') });
 await page.click(`#drives button[data-act="boot"][data-from="${process.env.FROM === 'C' ? 128 : 0}"]`);
 const screenText = () => page.evaluate(() => {
+  if (!window.__app) return document.querySelector('.screen').innerText.split(/\n/).filter(s => s.trim()).slice(0, 8).join(' / ');
   const m = window.__app.cur.m, rows = [];
   for (let r = 0; r < 25; r++) { let s = ''; for (let c = 0; c < 80; c++) s += String.fromCharCode(m.mem[0xb8000 + (r * 80 + c) * 2] || 32); rows.push(s.trimEnd()); }
   return rows.filter(Boolean).slice(0, 8).join(' / ');

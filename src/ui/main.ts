@@ -460,6 +460,7 @@ class App {
     this.loadAll();
     this.start();
     s.screen.focus();
+    requestAnimationFrame(() => s.screen.focus()); // 点按钮之后焦点可能又回到按钮上，再设一次
   }
 
   /** 直接装载并运行虚拟磁盘上的 EXE/COM 文件（没有源码） */

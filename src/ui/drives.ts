@@ -123,7 +123,7 @@ export class DrivesPanel {
         setTimeout(() => URL.revokeObjectURL(a.href), 1000);
         return;
       }
-      case 'boot': this.host.boot(i, +b.dataset.from!); return;
+      case 'boot': b.blur(); this.host.boot(i, +b.dataset.from!); return; // 让按钮失去焦点：否则之后按回车会再按一次"启动"
     }
     this.render();
   }

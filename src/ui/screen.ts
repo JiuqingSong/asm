@@ -156,6 +156,10 @@ export class Screen {
     el.addEventListener('contextmenu', e => { if (this.onMouse) e.preventDefault(); });
     el.addEventListener('keydown', e => this.key(e, false));
     el.addEventListener('keyup', e => this.key(e, true));
+    // 切到别的窗口（例如 Alt+Tab）时，松开键的事件发生在别处，虚拟机收不到：
+    // 当作这些键都已松开，否则 BIOS 会一直以为 Alt、Ctrl、Shift 还按着
+    el.addEventListener('blur', () => this.releaseAll());
+    window.addEventListener('blur', () => this.releaseAll());
     const wrap = el.parentElement!;
     new ResizeObserver(() => this.fit(wrap)).observe(wrap);
     window.addEventListener('resize', () => this.fit(wrap));
@@ -359,6 +363,15 @@ export class Screen {
   /** 从磁盘启动时为 true：功能键全部交给虚拟机里的程序（DOS 安装程序要用 F3、F5、F8 等） */
   allKeys = false;
 
+  /** 当前按着的键（扫描码） */
+  private down = new Set<number>();
+
+  private releaseAll(): void {
+    if (!this.onKey) { this.down.clear(); return; }
+    for (const scan of this.down) this.onKey({ scan: scan | 0x80, ascii: 0, release: true });
+    this.down.clear();
+  }
+
   private key(e: KeyboardEvent, release: boolean): void {
     if (!this.onKey) return;
     if (e.ctrlKey && (e.key === 'v' || e.key === 'c')) return; // 允许复制粘贴
@@ -366,7 +379,8 @@ export class Screen {
     const scan = SCAN[e.code];
     if (scan === undefined) return;
     e.preventDefault();
-    if (release) { this.onKey({ scan: scan | 0x80, ascii: 0, release: true }); return; }
+    if (release) { this.down.delete(scan); this.onKey({ scan: scan | 0x80, ascii: 0, release: true }); return; }
+    this.down.add(scan);
     let ascii = 0;
     if (e.key.length === 1) {
       const c = e.key.charCodeAt(0);
