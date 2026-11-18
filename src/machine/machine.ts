@@ -467,7 +467,8 @@ export class Machine {
     mem[MOUSE_VECTOR * 4] = MOUSE_STUB & 0xff; mem[MOUSE_VECTOR * 4 + 1] = MOUSE_STUB >> 8;
     mem[MOUSE_VECTOR * 4 + 2] = BIOS_SEG & 0xff; mem[MOUSE_VECTOR * 4 + 3] = BIOS_SEG >> 8;
     // INT 9：读键盘 -> 放入缓冲区 -> EOI
-    mem.set([TRAP_OPCODE, 0x09, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
+    // 先用 IN AL,60h 真的读一次键盘端口（Windows 增强模式的 DOS 窗口里，键盘驱动截获这个读操作送出扫描码），再进陷阱
+    mem.set([0x50, 0xe4, 0x60, TRAP_OPCODE, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     // INT 10h：陷阱，切换显示模式后再用 OUT 指令写 VGA 寄存器（见 vgarom.ts）
     mem.set(int10Stub(0x10), bios + STUB_INT10);
     // 复位向量：跳到 F000:E05B（IBM PC 的开机入口），那里的陷阱重新启动机器

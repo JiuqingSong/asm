@@ -370,18 +370,26 @@ export class Hle {
 
   // ---------- 键盘 ----------
   private keyboardIrq(): boolean {
-    const k = this.m.kbd.current;
-    if (!k) return true;
+    // 桩代码已经用 IN AL,60h 读出了扫描码（在 Windows 的 DOS 窗口里这是键盘驱动给的，不一定是 kbd.current）
     const cpu = this.cpu;
+    const raw = cpu.r[AX] & 0xff;
+    const cur = this.m.kbd.current;
+    if (raw === 0xe0 || raw === 0) return true; // 扩展键前缀
+    const release = (raw & 0x80) !== 0;
+    const sc = raw & 0x7f;
     let shift = cpu.rb(BDA, 0x17);
-    const sc = k.scan & 0x7f;
     const bit = sc === 0x2a ? 2 : sc === 0x36 ? 1 : sc === 0x1d ? 4 : sc === 0x38 ? 8 : 0;
     if (bit) {
-      shift = k.release ? shift & ~bit : shift | bit;
+      shift = release ? shift & ~bit : shift | bit;
       cpu.wb(BDA, 0x17, shift);
       return true;
     }
-    if (k.release) return true;
+    if (release) return true;
+    if (sc === 0x3a) { cpu.wb(BDA, 0x17, shift ^ 0x40); return true; } // Caps Lock
+    if (sc === 0x45 || sc === 0x46) return true;                       // Num Lock、Scroll Lock
+    // ASCII：扫描码和浏览器送来的按键一致时用它的（含中文输入等）；否则按美式键盘自己换算
+    const ascii = cur && (cur.scan & 0x7f) === sc && !cur.release ? cur.ascii : scanToAscii(sc, shift);
+    const k = { scan: sc, ascii, release: false };
     // Ctrl+Alt+Del：热启动（BIOS 在 0040:0072 写 1234h 表示"不做内存检测"，然后重新开机）
     if (sc === 0x53 && (shift & 0x0c) === 0x0c) {
       cpu.ww(BDA, 0x72, 0x1234);
@@ -1225,3 +1233,19 @@ export class Hle {
 
 function hex(v: number): string { return v.toString(16).toUpperCase().padStart(2, '0'); }
 function range(a: number, b: number): number[] { const out: number[] = []; for (let i = a; i <= b; i++) out.push(i); return out; }
+
+/** 美式键盘：扫描码 → ASCII（不按 Shift / 按 Shift） */
+const KEYS_NORMAL = "\x00\x1b1234567890-=\b\tqwertyuiop[]\r\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
+const KEYS_SHIFT = "\x00\x1b!@#$%^&*()_+\b\tQWERTYUIOP{}\r\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?\x00*\x00 ";
+
+/** 按 BIOS 的规则把扫描码换成 ASCII（shift 是 BDA 17h 的状态字节）；功能键、方向键等返回 0 */
+function scanToAscii(sc: number, shift: number): number {
+  if (sc >= KEYS_NORMAL.length) return sc === 0x4a ? 0x2d : sc === 0x4e ? 0x2b : 0;
+  const alt = (shift & 8) !== 0, ctrl = (shift & 4) !== 0, shifted = (shift & 3) !== 0;
+  if (alt) return 0;
+  let ch = (shifted ? KEYS_SHIFT : KEYS_NORMAL).charCodeAt(sc);
+  const letter = (ch | 0x20) >= 0x61 && (ch | 0x20) <= 0x7a;
+  if (letter && shift & 0x40) ch ^= 0x20; // Caps Lock 只影响字母
+  if (ctrl) return letter ? (ch & 0x1f) : sc === 0x1c ? 0x0a : sc === 0x0e ? 0x7f : 0;
+  return ch;
+}
