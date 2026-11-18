@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:cpu": "node --experimental-strip-types tools/run-cpu-tests.ts"
+    "test:cpu": "node --experimental-strip-types tools/run-cpu-tests.ts",
+    "test:cpu386": "node --experimental-strip-types tools/run-386-tests.ts"
   },
   "devDependencies": {
     "@types/node": "^22.20.5",

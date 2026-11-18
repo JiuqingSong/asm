@@ -40,7 +40,8 @@ export function driveName(drive: number): string {
 /** 反向执行用的历史记录：每条指令执行前的寄存器 + 该指令覆盖掉的内存旧值 */
 class History {
   readonly cap = 200_000;
-  private regs = new Uint16Array(this.cap * 16);
+  /** 每条记录 18 项：8 个 32 位通用寄存器、6 个段寄存器、IP、FLAGS、停机/等待、标志 */
+  private regs = new Uint32Array(this.cap * 18);
   private wstart = new Float64Array(this.cap);
   private readonly wcap = 1 << 22;
   private waddr = new Int32Array(this.wcap);
@@ -54,14 +55,14 @@ class History {
 
   begin(cpu: CPU, flags: number): void {
     const i = this.head % this.cap;
-    const o = i * 16;
+    const o = i * 18;
     const r = this.regs;
-    for (let k = 0; k < 8; k++) r[o + k] = cpu.r[k];
-    for (let k = 0; k < 4; k++) r[o + 8 + k] = cpu.s[k];
-    r[o + 12] = cpu.ip;
-    r[o + 13] = cpu.flags;
-    r[o + 14] = (cpu.halted ? 1 : 0) | (cpu.waiting ? 2 : 0);
-    r[o + 15] = flags;
+    for (let k = 0; k < 8; k++) r[o + k] = cpu.r32(k);
+    for (let k = 0; k < 6; k++) r[o + 8 + k] = cpu.s[k];
+    r[o + 14] = cpu.ip;
+    r[o + 15] = cpu.flags;
+    r[o + 16] = (cpu.halted ? 1 : 0) | (cpu.waiting ? 2 : 0);
+    r[o + 17] = flags;
     this.wstart[i] = this.wpos;
     this.head++;
     if (this.count < this.cap) this.count++;
@@ -94,14 +95,14 @@ class History {
       else cpu.mem[a] = this.wold[j];
     }
     this.wpos = start;
-    const o = i * 16, r = this.regs;
-    for (let k = 0; k < 8; k++) cpu.r[k] = r[o + k];
-    for (let k = 0; k < 4; k++) cpu.s[k] = r[o + 8 + k];
-    cpu.ip = r[o + 12];
-    cpu.flags = r[o + 13];
-    cpu.halted = (r[o + 14] & 1) !== 0;
-    cpu.waiting = (r[o + 14] & 2) !== 0;
-    return r[o + 15];
+    const o = i * 18, r = this.regs;
+    for (let k = 0; k < 8; k++) cpu.setR32(k, r[o + k]);
+    for (let k = 0; k < 6; k++) cpu.s[k] = r[o + 8 + k];
+    cpu.ip = r[o + 14];
+    cpu.flags = r[o + 15];
+    cpu.halted = (r[o + 16] & 1) !== 0;
+    cpu.waiting = (r[o + 16] & 2) !== 0;
+    return r[o + 17];
   }
 }
 
@@ -135,12 +136,13 @@ export class Machine {
   /** DOS 正在"等磁盘"（陷阱处忙等，不是在等键盘） */
   busy = false;
 
-  /** 选择 CPU 型号：决定速度，以及 PUSH SP 等少数指令按 8086 还是 286 的方式执行 */
+  /** 选择 CPU 型号：决定速度和指令集（8088、80286、80386） */
   setCpu(id: CpuSpeedId): void {
     const s = CPU_SPEEDS.find(x => x.id === id)!;
     this.cpuModel = id;
     this.clocksPerInstr = s.clocks;
     this.cpu.is286 = s.is286;
+    this.cpu.is386 = id === '386';
     this.cpu.setFlags(this.cpu.flags); // 位 12-15：8086 为 1，286 为 0
   }
   com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => (on ? this.pic.raise(4) : this.pic.lower(4)));
@@ -566,7 +568,7 @@ export class Machine {
     cpu.setFlags(0x0202);
     cpu.halted = false;
     cpu.waiting = false;
-    cpu.msw = 0xfff0;
+    cpu.resetProtected();
     for (const x of this.drives) if (x) x.changed = true;
   }
 

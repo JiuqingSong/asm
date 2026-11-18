@@ -10,7 +10,7 @@
 
 | 部分 | 内容 | 验证方式 |
 |---|---|---|
-| CPU | 8086/8088 全部指令，含未公开指令；286/386 模式下 PUSH SP、移位次数按 286 处理 | SingleStepTests/8088 全部 3,007,000 个用例通过 |
+| CPU | 8086/8088 全部指令，含未公开指令；286 档是 80286（含保护模式）；386 档是 80386（32 位指令、32 位保护模式、分页、V86） | SingleStepTests/8088 全部 3,007,000 个用例通过；SingleStepTests/80386 实模式 1,758,699 个用例中 53 个边角情况以外全部通过（`npm run test:cpu386`）；保护模式和分页见 tests/protected.test.ts、tests/cpu386.test.ts |
 | 汇编器 | MASM 子集：简化段/完整段、宏、REPT/IRP/IRPC、条件汇编、多遍扫描、条件跳转自动扩展 | 9 个程序与 MASM 6.11（ML.EXE）逐字节一致 |
 | 虚拟 PC | 中断向量表 + BIOS 陷阱、8259、8253、键盘（IRQ1/端口 60h）、8250 串口、PC 喇叭、BIOS/DOS 常用功能、虚拟磁盘 | 34 个端到端测试 |
 | 调试 | 单步进入/跳过、后退（单机）、断点、按每秒 1~100 步动画执行、悬停显示值 | 测试 + 浏览器检查脚本 |
@@ -70,7 +70,7 @@
 - **Windows 3.0**：选 286/386 时可以安装并运行（实模式，到 Program Manager）。用户的映像在 D:\Downloads\Microsoft Windows 3.0 (5.25 1.2MB)，不提交。
   - 选 8088 时 Windows 走 8086 专用的路线，显示驱动编译出来的 BitBlt 代码跑飞（tools/boot.ts 的 WATCH/WATCHAT 可以跟踪），原因还没查清；怀疑和 8088 的指令预取队列（自修改代码）有关。
   - Windows 的鼠标驱动：安装时检测到"没有鼠标"，还没试过 Windows 3.0 的鼠标驱动能不能借用 INT 33h。
-  - 286 保护模式 + A20 + 16MB 内存 + CMOS 复位恢复已完成（tests/protected.test.ts）：原版 HIMEM.SYS、DOS=HIGH、Windows 3.0 标准模式可以运行。Windows 3.1 也已经能安装、以标准模式运行，鼠标选 Microsoft, or IBM PS/2。下一步是 386（32 位指令、分页、V86 模式 → EMM386、增强模式）。用户的 Windows 3.1 映像在 D:Windows 3.1 EN，不提交。
+  - 286 保护模式 + A20 + 16MB 内存 + CMOS 复位恢复已完成（tests/protected.test.ts）：原版 HIMEM.SYS、DOS=HIGH、Windows 3.0 标准模式可以运行。Windows 3.1 也已经能安装、以标准模式运行，鼠标选 Microsoft, or IBM PS/2。386 第一段（32 位指令、32 位保护模式、分页）已完成：HIMEM.SYS 和 Windows 3.1 标准模式在 386 档上运行正常。下一步是第二段：用 EMM386.EXE 和 Windows 3.1 的 386 增强模式（`WIN /3`）检验虚拟 8086 模式和分页（V86 模式下的 BIOS 陷阱、I/O 许可位图、V86 中断的反射等已经写了，还没用真软件验证）；然后是 Windows 95（安装文件放在 ISO 当作的 D: 盘上）。用户的 Windows 3.1 映像在 D:Windows 3.1 EN，不提交。
 - 缺少的 DOS 功能按需补：执行子程序（4Bh）等。运行 `node tools/run-exe.ts <文件>` 可以列出程序用到的中断、端口和没实现的功能。
 - 图形模式（见第 2 项）。
 - 中文显示的制表符识别是启发式规则（`src/ui/screen.ts` 的 `layoutGbk`），遇到识别错的屏幕，把它加进 `tests/screen.test.ts` 再调规则。
@@ -132,6 +132,7 @@ tools/                  测试和检查脚本（见下）
 ### 需要记住的坑
 
 - `vite.config.ts` 的构建目标必须是 `es2022`：默认目标会把类字段改写成 `defineProperty`，CPU 模拟慢 40% 左右，386 的原机速度会跟不上。
+- CPU 核心（src/cpu/cpu.ts）是 8088/286/386 共用的。改了以后三个都要跑：`npm run test:cpu`（8088，约 1 分钟）、`npm run test:cpu386`（386 实模式，约 20 秒）、`npx vitest run`（286/386 保护模式）。8088/286 的快速路径（pushN/popN、readLin 不查 16MB 边界）是为了速度特意分开的。
 - 机器的 `run()` 要按虚拟时间（`untilClock`）限制，不能只按指令条数：等磁盘、HLT 时一条"指令"可能走过很长的虚拟时间，双机会失去同步。
 - 2003 年的 send.asm/receive.asm 在仓库外（`d:\asmperfect\`），不提交；依赖它们的测试找不到文件时自动跳过。它们只有在"286/386 + 虚拟串口 + DOS 文件操作消耗时间"下才能成功，原因见 README 和提交记录。
 - 界面里的调试对象 `window.__app` 只在开发版里有，正式版没有。

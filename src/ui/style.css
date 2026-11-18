@@ -159,6 +159,9 @@ body.resizing.h { cursor: row-resize; }
 .reg b { font: 600 11px var(--ui); color: var(--muted); }
 .reg.changed { color: var(--changed); border-color: var(--changed); background: var(--changed-bg); }
 .reg.wide { grid-column: span 2; }
+.regline > * { min-width: 0; }
+.regline.e32 .reg { font-size: 11px; padding: 2px 4px; gap: 3px; overflow: hidden; }
+.regline.e32 .reg b { font-size: 10px; }
 #flags { display: grid; grid-template-columns: repeat(9, 1fr); gap: 3px; padding: 4px 10px 10px; }
 .flag { text-align: center; border-radius: 4px; border: 1px solid var(--border); padding: 1px 0 2px; font-family: var(--mono); background: var(--panel-2); cursor: help; }
 .flag b { display: block; font: 600 10.5px var(--ui); color: var(--muted); }

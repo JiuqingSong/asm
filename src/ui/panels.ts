@@ -1,11 +1,13 @@
 // 寄存器、标志位、栈、变量、内存面板
-import { AX, BX, CX, DX, SP, BP, SI, DI, ES, CS, SS, DS, type CPU } from '../cpu/cpu.ts';
+import { AX, BX, CX, DX, SP, BP, SI, DI, ES, CS, SS, DS, FS, GS, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from '../machine/machine.ts';
 import type { Program, ProgramSymbol } from '../asm/types.ts';
 
 /** 某一时刻的 CPU 状态快照（用于高亮"刚刚改变"的值） */
 export interface Snapshot {
   r: Uint16Array;
+  /** 386 寄存器的高 16 位 */
+  rh: Uint16Array;
   s: Uint16Array;
   ip: number;
   flags: number;
@@ -13,7 +15,7 @@ export interface Snapshot {
 }
 
 export function takeSnapshot(m: Machine): Snapshot {
-  return { r: m.cpu.r.slice(), s: m.cpu.s.slice(), ip: m.cpu.ip, flags: m.cpu.flags, mem: m.mem.slice() };
+  return { r: m.cpu.r.slice(), rh: m.cpu.rh.slice(), s: m.cpu.s.slice(), ip: m.cpu.ip, flags: m.cpu.flags, mem: m.mem.slice() };
 }
 
 export const h2 = (v: number) => (v & 0xff).toString(16).toUpperCase().padStart(2, '0');
@@ -42,6 +44,9 @@ const IDX: [string, number, string][] = [
 const SEGS: [string, number, string][] = [
   ['CS', CS, '代码段'], ['DS', DS, '数据段'], ['ES', ES, '附加段'], ['SS', SS, '堆栈段'],
 ];
+const SEGS386: [string, number, string][] = [['FS', FS, '附加段（386）'], ['GS', GS, '附加段（386）']];
+const E32: [string, number][] = [['EAX', AX], ['EBX', BX], ['ECX', CX], ['EDX', DX], ['ESI', SI], ['EDI', DI], ['EBP', BP], ['ESP', SP]];
+const h8 = (v: number) => (v >>> 0).toString(16).toUpperCase().padStart(8, '0');
 const FLAGS: [string, number, string][] = [
   ['OF', 0x800, '溢出标志：有符号运算结果超出范围'], ['DF', 0x400, '方向标志：串操作地址递减（1）或递增（0）'],
   ['IF', 0x200, '中断允许标志：1 时响应硬件中断'], ['TF', 0x100, '陷阱标志：单步中断'],
@@ -87,12 +92,26 @@ export class RegisterPanel {
     const ipCh = prev && prev.ip !== cpu.ip;
     const flCh = prev && prev.flags !== cpu.flags;
     const misc = el('div', 'regline');
-    const ipEl = Object.assign(el('div', 'reg wide' + (ipCh ? ' changed' : ''), `<b>IP</b><span>${h4(cpu.ip)}</span>`), { title: '指令指针：下一条要执行的指令 CS:IP' });
-    const flEl = Object.assign(el('div', 'reg wide' + (flCh ? ' changed' : ''), `<b>FLAGS</b><span>${h4(cpu.flags)}</span>`), { title: '标志寄存器' });
+    const wideIp = cpu.ip > 0xffff, wideFl = cpu.flags > 0xffff;
+    const ipEl = Object.assign(el('div', 'reg wide' + (ipCh ? ' changed' : ''), `<b>${wideIp ? 'EIP' : 'IP'}</b><span>${wideIp ? h8(cpu.ip) : h4(cpu.ip)}</span>`), { title: '指令指针：下一条要执行的指令 CS:IP' });
+    const flEl = Object.assign(el('div', 'reg wide' + (flCh ? ' changed' : ''), `<b>${wideFl ? 'EFLAGS' : 'FLAGS'}</b><span>${wideFl ? h8(cpu.flags) : h4(cpu.flags)}</span>`), { title: '标志寄存器' + (cpu.flags & 0x20000 ? '（VM = 1：虚拟 8086 模式）' : '') });
     ipEl.dataset.reg = 'ip';
     flEl.dataset.reg = 'flags';
     misc.append(ipEl, flEl);
-    this.regsEl.replaceChildren(cells, line(IDX, r, prev?.r ?? null), line(SEGS, cpu.s, prev?.s ?? null, 's'), misc);
+    const rows: HTMLElement[] = [cells, line(IDX, r, prev?.r ?? null), line(cpu.is386 ? [...SEGS, ...SEGS386] : SEGS, cpu.s, prev?.s ?? null, 's'), misc];
+    if (cpu.is386) {
+      // 386：32 位寄存器（低 16 位就是上面的 AX 等）
+      const d = el('div', 'regline e32');
+      for (const [name, i] of E32) {
+        const ch = prev && (prev.rh[i] !== cpu.rh[i] || prev.r[i] !== cpu.r[i]);
+        const e = el('div', 'reg' + (ch ? ' changed' : ''), `<b>${name}</b><span>${h8(cpu.r32(i))}</span>`);
+        e.title = `${name}：32 位寄存器，低 16 位是 ${name.slice(1)}
+${cpu.r32(i)}`;
+        d.appendChild(e);
+      }
+      rows.splice(3, 0, d);
+    }
+    this.regsEl.replaceChildren(...rows);
 
     this.flagsEl.replaceChildren();
     for (const [name, mask, tip] of FLAGS) {

@@ -105,17 +105,25 @@ export class DisasmPanel {
     let off: number;
     if (n > 0) {
       const target = this.shown[Math.min(n, this.shown.length - 1)];
-      off = n < this.shown.length ? target.offset : (target.offset + target.length) & 0xffff;
+      off = n < this.shown.length ? target.offset : (target.offset + target.length) & this.offMask(m, seg);
     } else {
-      off = disassembleAround(read, first, -n, 1, this.m!.cpu.is286)[0].offset;
-      if (off === first) off = (first - 1) & 0xffff; // 回溯不到对齐的起点时至少退一个字节
+      off = disassembleAround(read, first, -n, 1, this.mode(m, seg))[0].offset;
+      if (off === first) off = (first - 1) & this.offMask(m, seg); // 回溯不到对齐的起点时至少退一个字节
     }
     this.view = { seg, off };
     this.refresh();
   }
 
+  /** 段的基址：当前的 CS 用 CPU 里的描述符缓存（保护模式下不是 段值 × 16），其他段按实模式算 */
+  private base(m: Machine, seg: number): number {
+    return seg === m.cpu.s[CS] ? m.cpu.segBase(CS) : seg << 4;
+  }
+  private is32(m: Machine, seg: number): boolean { return seg === m.cpu.s[CS] && m.cpu.code32; }
+  private offMask(m: Machine, seg: number): number { return this.is32(m, seg) ? 0xffffffff : 0xffff; }
+  private mode(m: Machine, seg: number) { return { is286: m.cpu.is286, is386: m.cpu.is386, code32: this.is32(m, seg) }; }
   private reader(m: Machine, seg: number) {
-    return (o: number) => m.mem[((seg << 4) + (o & 0xffff)) & 0xfffff];
+    const base = this.base(m, seg), mask = this.offMask(m, seg);
+    return (o: number) => m.cpu.peekLin(base + ((o & mask) >>> 0));
   }
 
   render(m: Machine, breakpoints: Set<number>): void {
@@ -127,19 +135,22 @@ export class DisasmPanel {
     const seg = following ? cpu.s[CS] : this.view!.seg;
     const read = this.reader(m, seg);
     const rows = this.rowsFit();
-    const list = (following ? disassembleAround(read, cpu.ip, 8, rows, cpu.is286) : disassembleAround(read, this.view!.off, 0, rows, cpu.is286))
+    const mode = this.mode(m, seg), base = this.base(m, seg);
+    const hx = (v: number) => (v > 0xffff ? (v >>> 0).toString(16).toUpperCase().padStart(8, '0') : h4(v));
+    const list = (following ? disassembleAround(read, cpu.ip, 8, rows, mode) : disassembleAround(read, this.view!.off, 0, rows, mode))
       .map(i => trapAware(read, seg, i));
     this.shown = list; this.shownSeg = seg;
-    if (document.activeElement !== this.input) this.input.value = following ? `${h4(cpu.s[CS])}:${h4(cpu.ip)}` : `${h4(seg)}:${h4(list[0].offset)}`;
-    this.note.textContent = following ? '' : `当前指令在 ${h4(cpu.s[CS])}:${h4(cpu.ip)}`;
+    if (document.activeElement !== this.input) this.input.value = following ? `${h4(cpu.s[CS])}:${hx(cpu.ip)}` : `${h4(seg)}:${hx(list[0].offset)}`;
+    this.note.textContent = following ? '' : `当前指令在 ${h4(cpu.s[CS])}:${hx(cpu.ip)}`;
     // 标号和变量名：线性地址 -> 名字
     const names = new Map<number, string>();
     for (const s of p.symbols) if (s.kind !== 'const') names.set(s.segment * 16 + s.offset, s.name);
     const where = seg === 0xf000 ? '（BIOS/DOS 内部的桩代码）' : p.addrToLine.size === 0 ? '（没有源码）' : '';
-    let html = `<div class="dhead mono">CS = ${h4(seg)}${where}　双击一行：运行到那里；点左侧：设断点；滚轮翻动</div>`;
-    const curLin = ((cpu.s[CS] << 4) + cpu.ip) & 0xfffff;
+    const pm = cpu.protectedMode ? (cpu.v86 ? '，虚拟 8086 模式' : `，保护模式，基址 ${(base >>> 0).toString(16).toUpperCase()}h${mode.code32 ? '，32 位代码' : ''}`) : '';
+    let html = `<div class="dhead mono">CS = ${h4(seg)}${where}${pm}　双击一行：运行到那里；点左侧：设断点；滚轮翻动</div>`;
+    const curLin = cpu.linearIP;
     for (const ins of list) {
-      const lin = ((seg << 4) + ins.offset) & 0xfffff;
+      const lin = (base + ins.offset) >>> 0;
       const cur = lin === curLin;
       const bp = breakpoints.has(lin);
       const label = names.get(lin);
@@ -153,7 +164,7 @@ export class DisasmPanel {
       const cls = 'drow' + (cur ? ' cur' : '') + (bp ? ' bp' : '') + (ins.undocumented ? ' odd' : '');
       html += `<div class="${cls}" data-lin="${lin}">` +
         `<span class="dg" title="${bp ? '取消断点' : '设断点'}">${bp ? '●' : cur ? '➤' : ''}</span>` +
-        `<span class="da">${label ? `<b>${esc(label)}</b>` : ''}${h4(seg)}:${h4(ins.offset)}</span>` +
+        `<span class="da">${label ? `<b>${esc(label)}</b>` : ''}${h4(seg)}:${hx(ins.offset)}</span>` +
         `<span class="db">${ins.bytes.slice(0, 6).map(h2).join(' ')}${ins.bytes.length > 6 ? '…' : ''}</span>` +
         `<span class="dt">${esc(ins.text)}${note ? `<span class="dn"> ; ${esc(note)}</span>` : ''}</span>` +
         `<span class="dl">${line ? `<a data-line="${line}">第 ${line} 行</a>` : ''}</span></div>`;
@@ -172,7 +183,7 @@ function trapAware(read: (o: number) => number, cs: number, ins: Instruction): I
 
 /** 当前指令的文字（没有源码时显示在寄存器面板上方） */
 export function currentInstruction(m: Machine): Instruction {
-  const cs = m.cpu.s[CS];
-  const read = (o: number) => m.mem[((cs << 4) + (o & 0xffff)) & 0xfffff];
-  return trapAware(read, cs, disassemble(read, m.cpu.ip, m.cpu.is286));
+  const cpu = m.cpu, cs = cpu.s[CS], base = cpu.segBase(CS), mask = cpu.code32 ? 0xffffffff : 0xffff;
+  const read = (o: number) => cpu.peekLin(base + ((o & mask) >>> 0));
+  return trapAware(read, cs, disassemble(read, cpu.ip, { is286: cpu.is286, is386: cpu.is386, code32: cpu.code32 }));
 }

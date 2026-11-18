@@ -19,7 +19,7 @@ npm run build      # 生成静态网页到 dist/
 - **面板**：寄存器（高低字节分开、刚改变的值高亮）、标志位、栈（标出返回地址来自哪一行）、变量、内存、DOS 屏幕（80×25 彩色文本）、虚拟磁盘。四个窗口之间的分隔条可以拖动调整大小（双击恢复，大小会记住），每个窗口都可以最大化（标题栏右边的按钮或双击标题栏，Esc 还原）
 - **硬件**：中断向量表、8259 中断控制器、8253 定时器（IRQ0 → INT 8 → INT 1Ch）、键盘控制器（IRQ1 → INT 9，端口 60h 扫描码）、8250 串口（COM1/COM2，含回环模式）。程序可以像在真机上一样挂接中断
 - **双机模式**：两台虚拟 PC 的 COM1 用虚拟交叉线连接，按虚拟时间同步运行。可选接线方式（全握手 / 部分握手 / 三线制）、串口芯片（真实 8250 / 带缓冲和硬件流控的虚拟串口），面板上显示 DTR/RTS/CTS/DSR 信号和线路上的每个字节
-- **CPU 型号**：8088、286、386 三种速度；选 286/386 时是 80286：186/286 的指令、16MB 内存、A20 门和完整的 16 位保护模式（HIMEM.SYS、Windows 3.0 和 3.1 的标准模式可以运行）
+- **CPU 型号**：8088、286、386 三档。286 档是 80286：186/286 的指令、16MB 内存、A20 门和完整的 16 位保护模式（HIMEM.SYS、Windows 3.0 和 3.1 的标准模式可以运行）；386 档是 80386：32 位寄存器和指令、32 位保护模式、分页、虚拟 8086 模式（实模式指令用 SingleStepTests/80386 真机测试集验证）
 - **原机速度**：按所选 CPU 的真实速度运行（虚拟时间与真实时间同步），延时、时钟、波特率和声音都与原机一致；也可以全速运行或按每秒 1~100 步动画执行
 - **PC 喇叭**：8253 的 2 号通道 + 端口 61h，用 Web Audio 发声（示例：两只老虎）
 - **直接运行 DOS 程序**：把 EXE/COM 上传到虚拟磁盘后点"运行"（MZ 重定位、PKLITE 等自解压程序、DOS 内存控制块链）
@@ -50,11 +50,12 @@ npm run build      # 生成静态网页到 dist/
 ```bash
 npm test                                  # 汇编器 + 虚拟机 + 示例程序的端到端测试
 npm run test:cpu                          # 用 SingleStepTests/8088 真机测试集验证 CPU（约 300 万个用例）
+npm run test:cpu386                       # 用 SingleStepTests/80386 的实模式测试集验证 386（约 176 万个用例）
 node tools/ml-compare.ts tests/ml/*.asm   # 与 MASM 6.11 逐字节对照（需要 ML.EXE，用环境变量 ML_EXE 指定）
 node tools/serial-demo.ts send.asm recv.asm 286 buffered   # 双机串口文件传输实验（命令行）
 ```
 
-`test:cpu` 需要先把测试集下载到 `test-data/8088/`（约 730MB，见 https://github.com/SingleStepTests/8088 的 `v2` 目录）。
+`test:cpu` 需要先把测试集下载到 `test-data/8088/`（约 730MB，见 https://github.com/SingleStepTests/8088 的 `v2` 目录）；`test:cpu386` 需要 `test-data/80386/`（约 600MB，https://github.com/SingleStepTests/80386 的 `v1_ex_real_mode` 目录，MOO 格式）。
 
 ## 开发计划
 
