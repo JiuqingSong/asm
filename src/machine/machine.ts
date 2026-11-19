@@ -33,6 +33,7 @@ const STUB_SIZE = 8;
 const STUB_INT8 = 0x0800;
 const STUB_INT9 = 0x0810;
 import { STUB_INT10, int10Stub } from './vgarom.ts';
+import { DISK_ROM, diskRom } from './diskrom.ts';
 /** 软盘参数表、硬盘参数表在 F000 段里的位置（与 IBM AT BIOS 相同） */
 const DPT_OFF = 0xefc7;
 const FDPT_OFF = 0xe401;
@@ -553,6 +554,7 @@ export class Machine {
       if (n === 8) off = STUB_INT8;
       else if (n === 9) off = STUB_INT9;
       else if (n === 0x10) off = STUB_INT10;
+      else if (n === 0x13) off = DISK_ROM; // 硬盘读写经 IDE 端口，其余进入陷阱（diskrom.ts）
       mem[n * 4] = off & 0xff; mem[n * 4 + 1] = off >> 8;
       mem[n * 4 + 2] = BIOS_SEG & 0xff; mem[n * 4 + 3] = BIOS_SEG >> 8;
       const a = bios + n * STUB_SIZE;
@@ -571,6 +573,7 @@ export class Machine {
     mem.set([0x50, 0xe4, 0x60, TRAP_OPCODE, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     // INT 10h：陷阱，切换显示模式后再用 OUT 指令写 VGA 寄存器（见 vgarom.ts）
     mem.set(int10Stub(0x10), bios + STUB_INT10);
+    mem.set(diskRom(0x13 * STUB_SIZE, FDPT_OFF), bios + DISK_ROM);
     // 复位向量：跳到 F000:E05B（IBM PC 的开机入口），那里的陷阱重新启动机器
     mem.set([0xea, 0x5b, 0xe0, 0x00, 0xf0], 0xffff0);
     mem.set([TRAP_OPCODE, 0x19, 0xcf], bios + 0xe05b);

@@ -801,7 +801,7 @@ HIMEM.SYS 就是这样打开 A20 的。
 
 ### 11.4 硬盘控制器（IDE）
 
-C:、D: 的硬盘映像也能经 IDE 第一通道的 ATA 控制器读写（端口 1F0h~1F7h、3F6h，IRQ14；C: 是主盘，D: 是从盘）。DOS 用 BIOS 的 INT 13h，不经过它；Windows 95 的 32 位磁盘驱动（ESDI_506.PDR）、Linux 这样的系统直接操作控制器。装好 Windows 95 后如果"系统属性 → 性能"里还提示硬盘在用"MS-DOS 兼容方式"，在"添加新硬件"里自动检测一次，找到"标准 IDE/ESDI 硬盘控制器"后重新启动。
+C:、D: 的硬盘映像经 IDE 第一通道的 ATA 控制器读写（端口 1F0h~1F7h、3F6h，IRQ14；C: 是主盘，D: 是从盘）。BIOS 的 INT 13h 读、写、校验硬盘扇区（AH=02h~04h）也和真的 AT BIOS 一样经过这些端口（ROM 里的 8086 代码，见 src/machine/diskrom.ts），其余 INT 13h 功能在 JavaScript 里完成。Windows 95 的 IDE 驱动启动时会检查这一点（不经过端口时 IOS.LOG 里写"ESDI trap handler not called"，硬盘只能用兼容方式）。Windows 95 的 32 位磁盘驱动（ESDI_506.PDR）、Linux 这样的系统直接操作控制器。装好 Windows 95 后如果"系统属性 → 性能"里还提示硬盘在用"MS-DOS 兼容方式"，在"添加新硬件"里自动检测一次，找到"标准 IDE/ESDI 硬盘控制器"后重新启动。
 
 - 命令：IDENTIFY DEVICE、READ SECTORS、WRITE SECTORS、READ/WRITE MULTIPLE（SET MULTIPLE MODE，每块最多 16 扇区）、READ VERIFY、SEEK、RECALIBRATE、INITIALIZE DEVICE PARAMETERS（改变 CHS 换算用的磁头数、每道扇区数）、EXECUTE DEVICE DIAGNOSTIC、CHECK POWER MODE、SET FEATURES 和电源管理命令（直接完成）；其他命令（包括 DMA 读写、PACKET）中止。
 - 地址可以用 CHS 或 LBA（28 位）；默认的 CHS 换算按映像的几何参数（和 INT 13h 一样，最多 1024 柱面 × 16 磁头 × 63 扇区）。
