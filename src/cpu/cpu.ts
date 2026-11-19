@@ -2108,123 +2108,85 @@ export class CPU {
     this.deliverFault(e);
   }
 
+  /**
+   * 执行一条指令（前缀已处理）。按操作码的高 2 位分成四个函数：V8 给每个函数的内联预算有限，
+   * 一个巨大的 switch 会把预算用光，modrm、getRM、segBase 这些小函数就只能真的调用（拆开后约快 10%）
+   */
   private exec(op: number): void {
-    const r = this.r, s = this.s, os = this.osz;
     if (this.model >= 1) {
       // 286：这些操作码在 8086 上是别的指令（POP CS、条件跳转和 RET 的别名），在 186/286 上是新指令
       if (op === 0x0f) { this.exec0F(); return; }
-      if (op >= 0x60 && op <= 0x6f) { this.exec186(op); return; }
-      if (op === 0xc0 || op === 0xc1) { // 移位，次数是立即数
-        const size = op === 0xc1 ? os : 1;
-        this.modrm();
-        const v = this.getRM(size);
-        this.setRM(size, this.shift(this.reg, v, this.fetch8() & 0x1f, size));
-        return;
-      }
-      if (op === 0xc8) { // ENTER 栈帧大小, 嵌套层数
-        const size = this.fetch16(), level = this.fetch8() & 0x1f;
-        const s32 = this.stack32;
-        this.pushN(this.getRegN(os, BP), os);
-        const frame = this.getSP();
-        if (level > 0) {
-          let bp = s32 ? this.r32(BP) : r[BP];
-          for (let k = 1; k < level; k++) {
-            bp = s32 ? (bp - os) >>> 0 : (bp - os) & 0xffff;
-            this.pushN(this.rd(SS, bp, os), os);
-          }
-          this.pushN(frame, os);
-        }
-        this.setRegN(os, BP, frame);
-        this.setSP(this.spAdd(this.getSP(), -size));
-        return;
-      }
-      if (op === 0xc9) { // LEAVE
-        const s32 = this.stack32;
-        const bp = s32 ? this.r32(BP) : r[BP];
-        const v = this.rd(SS, bp, os);
-        this.setSP(this.spAdd(bp, os));
-        this.setRegN(os, BP, v);
-        return;
-      }
+      if ((op >= 0x60 && op <= 0x6f) || op === 0xc0 || op === 0xc1 || op === 0xc8 || op === 0xc9) { this.execNew(op); return; }
     }
+    switch (op >> 6) {
+      case 0: this.exec00(op); return;
+      case 1: this.exec40(op); return;
+      case 2: this.exec80(op); return;
+      default: this.execC0(op); return;
+    }
+  }
+
+  /** 186/286 新增的、在 8086 上是别的意思的操作码（60~6F、C0、C1、C8、C9） */
+  private execNew(op: number): void {
+    const r = this.r, os = this.osz;
+    if (op >= 0x60 && op <= 0x6f) { this.exec186(op); return; }
+    if (op === 0xc0 || op === 0xc1) { // 移位，次数是立即数
+      const size = op === 0xc1 ? os : 1;
+      this.modrm();
+      const v = this.getRM(size);
+      this.setRM(size, this.shift(this.reg, v, this.fetch8() & 0x1f, size));
+      return;
+    }
+    if (op === 0xc8) { // ENTER 栈帧大小, 嵌套层数
+      const size = this.fetch16(), level = this.fetch8() & 0x1f;
+      const s32 = this.stack32;
+      this.pushN(this.getRegN(os, BP), os);
+      const frame = this.getSP();
+      if (level > 0) {
+        let bp = s32 ? this.r32(BP) : r[BP];
+        for (let k = 1; k < level; k++) {
+          bp = s32 ? (bp - os) >>> 0 : (bp - os) & 0xffff;
+          this.pushN(this.rd(SS, bp, os), os);
+        }
+        this.pushN(frame, os);
+      }
+      this.setRegN(os, BP, frame);
+      this.setSP(this.spAdd(this.getSP(), -size));
+      return;
+    }
+    if (op === 0xc9) { // LEAVE
+      const s32 = this.stack32;
+      const bp = s32 ? this.r32(BP) : r[BP];
+      const v = this.rd(SS, bp, os);
+      this.setSP(this.spAdd(bp, os));
+      this.setRegN(os, BP, v);
+      return;
+    }
+  }
+
+  /** 操作码 00-3F */
+  private exec00(op: number): void {
+    const r = this.r, s = this.s, os = this.osz;
     switch (op) {
       // ---- 00-3F：算术逻辑运算 ----
       case 0x00: case 0x01: case 0x02: case 0x03: case 0x08: case 0x09: case 0x0a: case 0x0b:
       case 0x10: case 0x11: case 0x12: case 0x13: case 0x18: case 0x19: case 0x1a: case 0x1b:
       case 0x20: case 0x21: case 0x22: case 0x23: case 0x28: case 0x29: case 0x2a: case 0x2b:
-      case 0x30: case 0x31: case 0x32: case 0x33: case 0x38: case 0x39: case 0x3a: case 0x3b: {
-        const alu = (op >> 3) & 7, size = op & 1 ? os : 1;
-        this.modrm();
-        if (op & 2) {
-          const res = this.alu(alu, this.getReg(size), this.getRM(size), size);
-          if (alu !== 7) this.setReg(size, res);
-        } else {
-          const res = this.alu(alu, this.getRM(size), this.getReg(size), size);
-          if (alu !== 7) this.setRM(size, res);
-        }
-        return;
-      }
-      case 0x04: case 0x0c: case 0x14: case 0x1c: case 0x24: case 0x2c: case 0x34: case 0x3c: {
-        const res = this.alu((op >> 3) & 7, r[AX] & 0xff, this.fetch8(), 1);
-        if (op !== 0x3c) this.setR8(0, res);
-        return;
-      }
-      case 0x05: case 0x0d: case 0x15: case 0x1d: case 0x25: case 0x2d: case 0x35: case 0x3d: {
-        const res = this.alu((op >> 3) & 7, this.getRegN(os, AX), this.fetchN(os), os);
-        if (op !== 0x3d) this.setRegN(os, AX, res);
-        return;
-      }
+      case 0x30: case 0x31: case 0x32: case 0x33: case 0x38: case 0x39: case 0x3a: case 0x3b: this.opAlu(op); return;
+      case 0x04: case 0x0c: case 0x14: case 0x1c: case 0x24: case 0x2c: case 0x34: case 0x3c: this.op04(op); return;
+      case 0x05: case 0x0d: case 0x15: case 0x1d: case 0x25: case 0x2d: case 0x35: case 0x3d: this.op05(op); return;
       case 0x06: case 0x0e: case 0x16: case 0x1e: this.pushSeg((op >> 3) & 3); return;
-      case 0x07: case 0x0f: case 0x17: case 0x1f: {
-        if (op === 0x0f) { const v = this.rwS(SS, r[SP]); s[CS] = v; this.cBase[CS] = v << 4; r[SP] += 2; return; } // 8086 的 POP CS
-        this.popSeg((op >> 3) & 3);
-        return;
-      }
-      case 0x27: { // DAA
-        if (this.model === 2) { this.daa386(false); return; }
-        const al = r[AX] & 0xff, cf = this.flags & CF, af = this.flags & AF;
-        let v = al;
-        if ((al & 0xf) > 9 || af) { v += 6; this.flags |= AF; } else this.flags &= ~AF;
-        if (al > (af ? 0x9f : 0x99) || cf) { v += 0x60; this.flags |= CF; } else this.flags &= ~CF;
-        v &= 0xff;
-        this.setF(OF, ~al & v & 0x80);
-        this.setR8(0, v); this.szp8(v);
-        return;
-      }
-      case 0x2f: { // DAS
-        if (this.model === 2) { this.daa386(true); return; }
-        const al = r[AX] & 0xff, cf = this.flags & CF, af = this.flags & AF;
-        let v = al;
-        if ((al & 0xf) > 9 || af) { v -= 6; this.flags |= AF; } else this.flags &= ~AF;
-        if (al > (af ? 0x9f : 0x99) || cf) { v -= 0x60; this.flags |= CF; } else this.flags &= ~CF;
-        v &= 0xff;
-        this.setF(OF, al & ~v & 0x80);
-        this.setR8(0, v); this.szp8(v);
-        return;
-      }
-      case 0x37: case 0x3f: { // AAA / AAS
-        if (this.model === 2) { // 386：加减 6 作用在整个 AX 上（AL 的进位/借位进到 AH）
-          if ((r[AX] & 0xf) > 9 || this.flags & AF) {
-            r[AX] = op === 0x37 ? r[AX] + 0x106 : r[AX] - 0x106;
-            this.flags |= AF | CF;
-          } else this.flags &= ~(AF | CF);
-          r[AX] &= 0xff0f;
-          this.szp8(r[AX] & 0xff);
-          return;
-        }
-        const al = r[AX] & 0xff;
-        let ah = r[AX] >> 8;
-        let v = al;
-        if ((al & 0xf) > 9 || this.flags & AF) {
-          if (op === 0x37) { v = al + 6; ah = (ah + 1) & 0xff; } else { v = al - 6; ah = (ah - 1) & 0xff; }
-          this.flags |= AF | CF;
-        } else this.flags &= ~(AF | CF);
-        r[AX] = (ah << 8) | (v & 0x0f);
-        this.szp8(v & 0xff);
-        this.setF(OF, op === 0x37 ? ~al & v & 0x80 : al & ~v & 0x80);
-        return;
-      }
+      case 0x07: case 0x0f: case 0x17: case 0x1f: this.op07(op); return;
+      case 0x27: this.op27(op); return;
+      case 0x2f: this.op2F(op); return;
+      case 0x37: case 0x3f: this.op37(op); return;
+    }
+  }
 
+  /** 操作码 40-7F */
+  private exec40(op: number): void {
+    const r = this.r, os = this.osz;
+    switch (op) {
       // ---- 40-5F：INC/DEC/PUSH/POP 寄存器 ----
       case 0x40: case 0x41: case 0x42: case 0x43: case 0x44: case 0x45: case 0x46: case 0x47:
         this.setRegN(os, op & 7, this.inc(this.getRegN(os, op & 7), os)); return;
@@ -2242,89 +2204,36 @@ export class CPU {
       case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
       case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d: case 0x6e: case 0x6f:
       case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
-      case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f: {
-        const d = this.fetchS8();
-        if (this.cond(op & 0xf)) this.jumpNear(this.ip + d);
-        return;
-      }
+      case 0x78: case 0x79: case 0x7a: case 0x7b: case 0x7c: case 0x7d: case 0x7e: case 0x7f: this.opJcc(op); return;
 
+    }
+  }
+
+  /** 操作码 80-BF */
+  private exec80(op: number): void {
+    const r = this.r, s = this.s, os = this.osz;
+    switch (op) {
       // ---- 80-83：立即数运算 ----
-      case 0x80: case 0x81: case 0x82: case 0x83: {
-        const size = op & 1 ? os : 1;
-        this.modrm();
-        const a = this.getRM(size);
-        const b = op === 0x81 ? this.fetchN(os) : op === 0x83 ? (os === 4 ? this.fetchS8() >>> 0 : this.fetchS8() & 0xffff) : this.fetch8();
-        const res = this.alu(this.reg, a, b, size);
-        if (this.reg !== 7) this.setRM(size, res);
-        return;
-      }
-      case 0x84: case 0x85: {
-        const size = op & 1 ? os : 1;
-        this.modrm();
-        this.alu(4, this.getRM(size), this.getReg(size), size);
-        return;
-      }
-      case 0x86: case 0x87: {
-        const size = op & 1 ? os : 1;
-        this.modrm();
-        const a = this.getRM(size), b = this.getReg(size);
-        this.setRM(size, b); this.setReg(size, a);
-        return;
-      }
+      case 0x80: case 0x81: case 0x82: case 0x83: this.op80(op); return;
+      case 0x84: case 0x85: this.op84(op); return;
+      case 0x86: case 0x87: this.op86(op); return;
       case 0x88: case 0x89: { const size = op & 1 ? os : 1; this.modrm(); this.setRM(size, this.getReg(size)); return; }
       case 0x8a: case 0x8b: { const size = op & 1 ? os : 1; this.modrm(); this.setReg(size, this.getRM(size)); return; }
-      case 0x8c: { // MOV r/m, 段寄存器
-        this.modrm();
-        const i = this.model === 2 ? this.reg : this.reg & 3;
-        if (i > 5) throw ud();
-        if (this.mod === 3) this.setRegN(os, this.rm, s[i]); else this.setRM16(s[i]);
-        return;
-      }
-      case 0x8d: { // LEA
-        this.modrm();
-        if (this.mod === 3 && this.model >= 1) throw ud();
-        this.setReg(os, this.eaOff);
-        return;
-      }
-      case 0x8e: {
-        this.modrm();
-        const i = this.model === 2 ? this.reg : this.reg & 3;
-        if (i > 5 || (i === CS && this.model >= 1)) throw ud();
-        const v = this.getRM16();
-        if (i === CS) {
-          if (this.model >= 1) throw ud();
-          s[CS] = v; this.cBase[CS] = v << 4; // 8086 允许 MOV CS
-        } else this.loadSeg(i, v);
-        if (i === SS) this.inhibitIrq = true;
-        return;
-      }
-      case 0x8f: { // POP r/m
-        this.modrm();
-        if (this.reg !== 0 && this.model === 2) throw ud();
-        const sp = this.getSP();
-        const v = this.rd(SS, sp, os);
-        this.setSP(this.spAdd(sp, os));
-        if (this.eaSP && this.mod !== 3) this.eaOff = (this.eaOff + os) >>> 0; // [ESP+n] 按弹出后的 ESP 算
-        this.setRM(os, v);
-        return;
-      }
+      case 0x8c: this.op8C(op); return;
+      case 0x8d: this.op8D(op); return;
+      case 0x8e: this.op8E(op); return;
+      case 0x8f: this.op8F(op); return;
 
       // ---- 90-9F ----
       case 0x90: return;
-      case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: {
-        const t = this.getRegN(os, AX); this.setRegN(os, AX, this.getRegN(os, op & 7)); this.setRegN(os, op & 7, t); return;
-      }
+      case 0x91: case 0x92: case 0x93: case 0x94: case 0x95: case 0x96: case 0x97: this.op91(op); return;
       case 0x98: // CBW / CWDE
         if (os === 4) this.setR32(AX, ((r[AX] << 16) >> 16) >>> 0); else r[AX] = (((r[AX] & 0xff) << 24) >> 24) & 0xffff;
         return;
       case 0x99: // CWD / CDQ
         if (os === 4) this.setR32(DX, this.rh[AX] & 0x8000 ? 0xffffffff : 0); else r[DX] = r[AX] & 0x8000 ? 0xffff : 0;
         return;
-      case 0x9a: {
-        const nip = this.fetchN(os), ncs = this.fetch16();
-        this.farCall(ncs, nip, os);
-        return;
-      }
+      case 0x9a: this.op9A(op); return;
       case 0x9b: // WAIT：TS 和 MP 都置 1 时 #NM
         if (this.model >= 1 && (this.msw & 0x0a) === 0x0a) throw new CpuFault(7);
         return;
@@ -2332,25 +2241,12 @@ export class CPU {
         if (this.flags & VM && this.iopl < 3) throw gp(0);
         if (os === 4) this.pushN(this.flags & ~(VM | RF), 4); else this.pushN(this.flags & 0xffff, 2);
         return;
-      case 0x9d: { // POPF / POPFD
-        if (this.flags & VM && this.iopl < 3) throw gp(0);
-        const v = this.popN(os);
-        if (this.msw & 1 && !(this.flags & VM)) this.popFlagsProtected(v, this.cpl, os);
-        else if (this.flags & VM) { if (os === 4) this.setEflags(v, VM | RF | IOPL); else this.setFlags((v & ~IOPL) | (this.flags & IOPL)); }
-        else if (os === 4) this.setEflags(v, VM);
-        else this.setFlags(v);
-        return;
-      }
+      case 0x9d: this.op9D(op); return;
       case 0x9e: this.flags = (this.flags & ~0xff) | ((r[AX] >> 8) & 0xd5) | 2; return;
       case 0x9f: this.setR8(4, this.flags & 0xff); return;
 
       // ---- A0-AF ----
-      case 0xa0: case 0xa1: case 0xa2: case 0xa3: { // MOV AL/AX, [偏移] 等
-        const o = this.asz32 ? this.fetch32() : this.fetch16();
-        const seg = this.segOvr >= 0 ? this.segOvr : DS, size = op & 1 ? os : 1;
-        if (op < 0xa2) this.setRegN(size, AX, this.rd(seg, o, size)); else this.wr(seg, o, size, this.getRegN(size, AX));
-        return;
-      }
+      case 0xa0: case 0xa1: case 0xa2: case 0xa3: this.opA0(op); return;
       case 0xa4: case 0xa5: case 0xa6: case 0xa7: case 0xaa: case 0xab: case 0xac: case 0xad: case 0xae: case 0xaf:
         this.stringOp(op); return;
       case 0xa8: this.alu(4, r[AX] & 0xff, this.fetch8(), 1); return;
@@ -2362,30 +2258,17 @@ export class CPU {
       case 0xb8: case 0xb9: case 0xba: case 0xbb: case 0xbc: case 0xbd: case 0xbe: case 0xbf:
         this.setRegN(os, op & 7, this.fetchN(os)); return;
 
+    }
+  }
+
+  /** 操作码 C0-FF */
+  private execC0(op: number): void {
+    const r = this.r, os = this.osz;
+    switch (op) {
       // ---- C0-CF ----
-      case 0xc0: case 0xc2: { // RET n（C0 是 8086 上的别名）
-        const n = this.fetch16();
-        const sp = this.getSP();
-        const nip = this.rd(SS, sp, os);
-        this.jumpNear(nip);
-        this.setSP(this.spAdd(sp, os + n));
-        return;
-      }
-      case 0xc1: case 0xc3: {
-        const sp = this.getSP();
-        const nip = this.rd(SS, sp, os);
-        this.jumpNear(nip);
-        this.setSP(this.spAdd(sp, os));
-        return;
-      }
-      case 0xc4: case 0xc5: {
-        this.modrm();
-        if (this.mod === 3 && this.model >= 1) throw ud();
-        const off = this.rd(this.eaSi, this.eaOff, os), sel = this.rwS(this.eaSi, this.eaPlus(os));
-        this.loadSeg(op === 0xc4 ? ES : DS, sel);
-        this.setReg(os, off);
-        return;
-      }
+      case 0xc0: case 0xc2: this.opC0(op); return;
+      case 0xc1: case 0xc3: this.opC1(op); return;
+      case 0xc4: case 0xc5: this.opC4(op); return;
       case 0xc6: this.modrm(); if (this.reg && this.model === 2) throw ud(); this.setRM8(this.fetch8()); return;
       case 0xc7: this.modrm(); if (this.reg && this.model === 2) throw ud(); this.setRM(os, this.fetchN(os)); return;
       case 0xc8: case 0xca: { const n = this.fetch16(); this.farReturn(n, os); return; }
@@ -2396,64 +2279,24 @@ export class CPU {
       case 0xcf: this.iret(os); return;
 
       // ---- D0-DF ----
-      case 0xd0: case 0xd1: case 0xd2: case 0xd3: {
-        const size = op & 1 ? os : 1;
-        this.modrm();
-        const count = op & 2 ? r[CX] & (this.model >= 1 ? 0x1f : 0xff) : 1;
-        this.setRM(size, this.shift(this.reg, this.getRM(size), count, size));
-        return;
-      }
-      case 0xd4: { // AAM
-        const base = this.fetch8();
-        if (base === 0) { this.divideError(); return; }
-        const al = r[AX] & 0xff;
-        r[AX] = (Math.floor(al / base) << 8) | (al % base);
-        this.szp8(r[AX] & 0xff);
-        this.flags &= ~(CF | OF | AF);
-        return;
-      }
-      case 0xd5: { // AAD
-        const base = this.fetch8();
-        const al = r[AX] & 0xff, ah = r[AX] >> 8;
-        const res = this.alu(0, al, (ah * base) & 0xff, 1);
-        r[AX] = res;
-        return;
-      }
+      case 0xd0: case 0xd1: case 0xd2: case 0xd3: this.opD0(op); return;
+      case 0xd4: this.opD4(op); return;
+      case 0xd5: this.opD5(op); return;
       case 0xd6: this.setR8(0, this.flags & CF ? 0xff : 0); return; // SALC（未公开）
-      case 0xd7: { // XLAT
-        const seg = this.segOvr >= 0 ? this.segOvr : DS;
-        const off = this.asz32 ? (this.r32(BX) + (r[AX] & 0xff)) >>> 0 : (r[BX] + (r[AX] & 0xff)) & 0xffff;
-        this.setR8(0, this.rbS(seg, off));
-        return;
-      }
+      case 0xd7: this.opD7(op); return;
       case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
         // ESC（协处理器指令）：没有协处理器。EM 或 TS 置 1 时 #NM（让操作系统去模拟），否则忽略
         if (this.model >= 1 && this.msw & 0x0c) throw new CpuFault(7);
         this.modrm(); return;
 
       // ---- E0-EF ----
-      case 0xe0: case 0xe1: case 0xe2: { // LOOPNZ / LOOPZ / LOOP（计数器按地址大小是 CX 或 ECX）
-        const d = this.fetchS8();
-        let cx: number;
-        if (this.asz32) { cx = (this.r32(CX) - 1) >>> 0; this.setR32(CX, cx); } else { cx = (r[CX] - 1) & 0xffff; r[CX] = cx; }
-        const zf = (this.flags & ZF) !== 0;
-        if (cx !== 0 && (op === 0xe2 || (op === 0xe1 ? zf : !zf))) this.jumpNear(this.ip + d);
-        return;
-      }
+      case 0xe0: case 0xe1: case 0xe2: this.opE0(op); return;
       case 0xe3: { const d = this.fetchS8(); if ((this.asz32 ? this.r32(CX) : r[CX]) === 0) this.jumpNear(this.ip + d); return; }
       case 0xe4: { const p = this.fetch8(); this.setR8(0, this.inN(p, 1)); return; }
       case 0xe5: { const p = this.fetch8(); this.setRegN(os, AX, this.inN(p, os)); return; }
       case 0xe6: { const p = this.fetch8(); this.outN(p, 1, r[AX] & 0xff); return; }
       case 0xe7: { const p = this.fetch8(); this.outN(p, os, this.getRegN(os, AX)); return; }
-      case 0xe8: { // CALL 近
-        const d = this.fetchRel(os);
-        const ret = this.ip;
-        const nip = this.model === 2 ? (os === 4 ? (ret + d) >>> 0 : (ret + d) & 0xffff) : (ret + d) & 0xffff;
-        if (this.model === 2 && nip > this.cLimit[CS]) throw gp(0);
-        this.pushN(ret, os);
-        this.ip = nip;
-        return;
-      }
+      case 0xe8: this.opE8(op); return;
       case 0xe9: { const d = this.fetchRel(os); this.jumpNear(this.ip + d); return; }
       case 0xea: { const nip = this.fetchN(os); const ncs = this.fetch16(); this.farJump(ncs, nip); return; }
       case 0xeb: { const d = this.fetchS8(); this.jumpNear(this.ip + d); return; }
@@ -2465,70 +2308,389 @@ export class CPU {
       // ---- F0-FF ----
       case 0xf4: this.requireCpl0(); this.halted = true; return;
       case 0xf5: this.flags ^= CF; return;
-      case 0xf6: case 0xf7: {
-        const size = op & 1 ? os : 1;
-        this.modrm();
-        switch (this.reg) {
-          case 0: case 1: {
-            const v = this.getRM(size);
-            this.alu(4, v, this.fetchN(size), size);
-            return;
-          }
-          case 2: { const v = ~this.getRM(size); this.setRM(size, size === 4 ? v >>> 0 : v & MASK[size]); return; }
-          case 3: this.setRM(size, this.alu(5, 0, this.getRM(size), size)); return;
-          default: this.mulDiv(this.reg, size); return;
-        }
-      }
+      case 0xf6: case 0xf7: this.opF6(op); return;
       case 0xf8: this.flags &= ~CF; return;
       case 0xf9: this.flags |= CF; return;
       case 0xfa: this.requireIopl(); this.flags &= ~IF; return;
       case 0xfb: this.requireIopl(); this.flags |= IF; this.inhibitIrq = true; return;
       case 0xfc: this.flags &= ~DF; return;
       case 0xfd: this.flags |= DF; return;
-      case 0xfe: {
-        this.modrm();
-        if (this.reg === 0) this.setRM8(this.inc(this.getRM8(), 1));
-        else if (this.reg === 1) this.setRM8(this.dec(this.getRM8(), 1));
-        else if (this.model >= 1) throw ud();
+      case 0xfe: this.opFE(op); return;
+      case 0xff: this.opFF(op); return;
+    }
+  }
+
+  /** 00-3B 里带 ModR/M 的 ADD OR ADC SBB AND SUB XOR CMP */
+  private opAlu(op: number): void {
+    const os = this.osz;
+    const alu = (op >> 3) & 7, size = op & 1 ? os : 1;
+    this.modrm();
+    if (op & 2) {
+      const res = this.alu(alu, this.getReg(size), this.getRM(size), size);
+      if (alu !== 7) this.setReg(size, res);
+    } else {
+      const res = this.alu(alu, this.getRM(size), this.getReg(size), size);
+      if (alu !== 7) this.setRM(size, res);
+    }
+    return;
+  }
+
+  /** AL, 立即数 的运算 */
+  private op04(op: number): void {
+    const r = this.r;
+    const res = this.alu((op >> 3) & 7, r[AX] & 0xff, this.fetch8(), 1);
+    if (op !== 0x3c) this.setR8(0, res);
+    return;
+  }
+
+  /** AX/EAX, 立即数 的运算 */
+  private op05(op: number): void {
+    const os = this.osz;
+    const res = this.alu((op >> 3) & 7, this.getRegN(os, AX), this.fetchN(os), os);
+    if (op !== 0x3d) this.setRegN(os, AX, res);
+    return;
+  }
+
+  /** POP 段寄存器（0F 是 8086 的 POP CS） */
+  private op07(op: number): void {
+    const r = this.r, s = this.s;
+    if (op === 0x0f) { const v = this.rwS(SS, r[SP]); s[CS] = v; this.cBase[CS] = v << 4; r[SP] += 2; return; } // 8086 的 POP CS
+    this.popSeg((op >> 3) & 3);
+    return;
+  }
+
+  /** 27：DAA */
+  private op27(op: number): void {
+    const r = this.r;
+    if (this.model === 2) { this.daa386(false); return; }
+    const al = r[AX] & 0xff, cf = this.flags & CF, af = this.flags & AF;
+    let v = al;
+    if ((al & 0xf) > 9 || af) { v += 6; this.flags |= AF; } else this.flags &= ~AF;
+    if (al > (af ? 0x9f : 0x99) || cf) { v += 0x60; this.flags |= CF; } else this.flags &= ~CF;
+    v &= 0xff;
+    this.setF(OF, ~al & v & 0x80);
+    this.setR8(0, v); this.szp8(v);
+    return;
+  }
+
+  /** 2F：DAS */
+  private op2F(op: number): void {
+    const r = this.r;
+    if (this.model === 2) { this.daa386(true); return; }
+    const al = r[AX] & 0xff, cf = this.flags & CF, af = this.flags & AF;
+    let v = al;
+    if ((al & 0xf) > 9 || af) { v -= 6; this.flags |= AF; } else this.flags &= ~AF;
+    if (al > (af ? 0x9f : 0x99) || cf) { v -= 0x60; this.flags |= CF; } else this.flags &= ~CF;
+    v &= 0xff;
+    this.setF(OF, al & ~v & 0x80);
+    this.setR8(0, v); this.szp8(v);
+    return;
+  }
+
+  /** 37 3F：AAA / AAS */
+  private op37(op: number): void {
+    const r = this.r;
+    if (this.model === 2) { // 386：加减 6 作用在整个 AX 上（AL 的进位/借位进到 AH）
+      if ((r[AX] & 0xf) > 9 || this.flags & AF) {
+        r[AX] = op === 0x37 ? r[AX] + 0x106 : r[AX] - 0x106;
+        this.flags |= AF | CF;
+      } else this.flags &= ~(AF | CF);
+      r[AX] &= 0xff0f;
+      this.szp8(r[AX] & 0xff);
+      return;
+    }
+    const al = r[AX] & 0xff;
+    let ah = r[AX] >> 8;
+    let v = al;
+    if ((al & 0xf) > 9 || this.flags & AF) {
+      if (op === 0x37) { v = al + 6; ah = (ah + 1) & 0xff; } else { v = al - 6; ah = (ah - 1) & 0xff; }
+      this.flags |= AF | CF;
+    } else this.flags &= ~(AF | CF);
+    r[AX] = (ah << 8) | (v & 0x0f);
+    this.szp8(v & 0xff);
+    this.setF(OF, op === 0x37 ? ~al & v & 0x80 : al & ~v & 0x80);
+    return;
+  }
+
+  /** 60-7F：条件跳转（60-6F 是 8086 上的别名） */
+  private opJcc(op: number): void {
+    const d = this.fetchS8();
+    if (this.cond(op & 0xf)) this.jumpNear(this.ip + d);
+    return;
+  }
+
+  /** 80-83：r/m, 立即数 的运算 */
+  private op80(op: number): void {
+    const os = this.osz;
+    const size = op & 1 ? os : 1;
+    this.modrm();
+    const a = this.getRM(size);
+    const b = op === 0x81 ? this.fetchN(os) : op === 0x83 ? (os === 4 ? this.fetchS8() >>> 0 : this.fetchS8() & 0xffff) : this.fetch8();
+    const res = this.alu(this.reg, a, b, size);
+    if (this.reg !== 7) this.setRM(size, res);
+    return;
+  }
+
+  /** TEST r/m, reg */
+  private op84(op: number): void {
+    const os = this.osz;
+    const size = op & 1 ? os : 1;
+    this.modrm();
+    this.alu(4, this.getRM(size), this.getReg(size), size);
+    return;
+  }
+
+  /** XCHG r/m, reg */
+  private op86(op: number): void {
+    const os = this.osz;
+    const size = op & 1 ? os : 1;
+    this.modrm();
+    const a = this.getRM(size), b = this.getReg(size);
+    this.setRM(size, b); this.setReg(size, a);
+    return;
+  }
+
+  /** 8C：MOV r/m, 段寄存器 */
+  private op8C(op: number): void {
+    const s = this.s, os = this.osz;
+    this.modrm();
+    const i = this.model === 2 ? this.reg : this.reg & 3;
+    if (i > 5) throw ud();
+    if (this.mod === 3) this.setRegN(os, this.rm, s[i]); else this.setRM16(s[i]);
+    return;
+  }
+
+  /** 8D：LEA */
+  private op8D(op: number): void {
+    const os = this.osz;
+    this.modrm();
+    if (this.mod === 3 && this.model >= 1) throw ud();
+    this.setReg(os, this.eaOff);
+    return;
+  }
+
+  /** MOV 段寄存器, r/m */
+  private op8E(op: number): void {
+    const s = this.s;
+    this.modrm();
+    const i = this.model === 2 ? this.reg : this.reg & 3;
+    if (i > 5 || (i === CS && this.model >= 1)) throw ud();
+    const v = this.getRM16();
+    if (i === CS) {
+      if (this.model >= 1) throw ud();
+      s[CS] = v; this.cBase[CS] = v << 4; // 8086 允许 MOV CS
+    } else this.loadSeg(i, v);
+    if (i === SS) this.inhibitIrq = true;
+    return;
+  }
+
+  /** 8F：POP r/m */
+  private op8F(op: number): void {
+    const os = this.osz;
+    this.modrm();
+    if (this.reg !== 0 && this.model === 2) throw ud();
+    const sp = this.getSP();
+    const v = this.rd(SS, sp, os);
+    this.setSP(this.spAdd(sp, os));
+    if (this.eaSP && this.mod !== 3) this.eaOff = (this.eaOff + os) >>> 0; // [ESP+n] 按弹出后的 ESP 算
+    this.setRM(os, v);
+    return;
+  }
+
+  /** XCHG AX, reg */
+  private op91(op: number): void {
+    const os = this.osz;
+    const t = this.getRegN(os, AX); this.setRegN(os, AX, this.getRegN(os, op & 7)); this.setRegN(os, op & 7, t); return;
+  }
+
+  /** CALL 远（直接） */
+  private op9A(op: number): void {
+    const os = this.osz;
+    const nip = this.fetchN(os), ncs = this.fetch16();
+    this.farCall(ncs, nip, os);
+    return;
+  }
+
+  /** 9D：POPF / POPFD */
+  private op9D(op: number): void {
+    const os = this.osz;
+    if (this.flags & VM && this.iopl < 3) throw gp(0);
+    const v = this.popN(os);
+    if (this.msw & 1 && !(this.flags & VM)) this.popFlagsProtected(v, this.cpl, os);
+    else if (this.flags & VM) { if (os === 4) this.setEflags(v, VM | RF | IOPL); else this.setFlags((v & ~IOPL) | (this.flags & IOPL)); }
+    else if (os === 4) this.setEflags(v, VM);
+    else this.setFlags(v);
+    return;
+  }
+
+  /** A0 A1 A2 A3：MOV AL/AX, [偏移] 等 */
+  private opA0(op: number): void {
+    const os = this.osz;
+    const o = this.asz32 ? this.fetch32() : this.fetch16();
+    const seg = this.segOvr >= 0 ? this.segOvr : DS, size = op & 1 ? os : 1;
+    if (op < 0xa2) this.setRegN(size, AX, this.rd(seg, o, size)); else this.wr(seg, o, size, this.getRegN(size, AX));
+    return;
+  }
+
+  /** C0 C2：RET n（C0 是 8086 上的别名） */
+  private opC0(op: number): void {
+    const os = this.osz;
+    const n = this.fetch16();
+    const sp = this.getSP();
+    const nip = this.rd(SS, sp, os);
+    this.jumpNear(nip);
+    this.setSP(this.spAdd(sp, os + n));
+    return;
+  }
+
+  /** RET（C1 是 8086 上的别名） */
+  private opC1(op: number): void {
+    const os = this.osz;
+    const sp = this.getSP();
+    const nip = this.rd(SS, sp, os);
+    this.jumpNear(nip);
+    this.setSP(this.spAdd(sp, os));
+    return;
+  }
+
+  /** LES / LDS */
+  private opC4(op: number): void {
+    const os = this.osz;
+    this.modrm();
+    if (this.mod === 3 && this.model >= 1) throw ud();
+    const off = this.rd(this.eaSi, this.eaOff, os), sel = this.rwS(this.eaSi, this.eaPlus(os));
+    this.loadSeg(op === 0xc4 ? ES : DS, sel);
+    this.setReg(os, off);
+    return;
+  }
+
+  /** 移位 1 次 / CL 次 */
+  private opD0(op: number): void {
+    const r = this.r, os = this.osz;
+    const size = op & 1 ? os : 1;
+    this.modrm();
+    const count = op & 2 ? r[CX] & (this.model >= 1 ? 0x1f : 0xff) : 1;
+    this.setRM(size, this.shift(this.reg, this.getRM(size), count, size));
+    return;
+  }
+
+  /** D4：AAM */
+  private opD4(op: number): void {
+    const r = this.r;
+    const base = this.fetch8();
+    if (base === 0) { this.divideError(); return; }
+    const al = r[AX] & 0xff;
+    r[AX] = (Math.floor(al / base) << 8) | (al % base);
+    this.szp8(r[AX] & 0xff);
+    this.flags &= ~(CF | OF | AF);
+    return;
+  }
+
+  /** D5：AAD */
+  private opD5(op: number): void {
+    const r = this.r;
+    const base = this.fetch8();
+    const al = r[AX] & 0xff, ah = r[AX] >> 8;
+    const res = this.alu(0, al, (ah * base) & 0xff, 1);
+    r[AX] = res;
+    return;
+  }
+
+  /** D7：XLAT */
+  private opD7(op: number): void {
+    const r = this.r;
+    const seg = this.segOvr >= 0 ? this.segOvr : DS;
+    const off = this.asz32 ? (this.r32(BX) + (r[AX] & 0xff)) >>> 0 : (r[BX] + (r[AX] & 0xff)) & 0xffff;
+    this.setR8(0, this.rbS(seg, off));
+    return;
+  }
+
+  /** E0 E1 E2：LOOPNZ / LOOPZ / LOOP（计数器按地址大小是 CX 或 ECX） */
+  private opE0(op: number): void {
+    const r = this.r;
+    const d = this.fetchS8();
+    let cx: number;
+    if (this.asz32) { cx = (this.r32(CX) - 1) >>> 0; this.setR32(CX, cx); } else { cx = (r[CX] - 1) & 0xffff; r[CX] = cx; }
+    const zf = (this.flags & ZF) !== 0;
+    if (cx !== 0 && (op === 0xe2 || (op === 0xe1 ? zf : !zf))) this.jumpNear(this.ip + d);
+    return;
+  }
+
+  /** E8：CALL 近 */
+  private opE8(op: number): void {
+    const os = this.osz;
+    const d = this.fetchRel(os);
+    const ret = this.ip;
+    const nip = this.model === 2 ? (os === 4 ? (ret + d) >>> 0 : (ret + d) & 0xffff) : (ret + d) & 0xffff;
+    if (this.model === 2 && nip > this.cLimit[CS]) throw gp(0);
+    this.pushN(ret, os);
+    this.ip = nip;
+    return;
+  }
+
+  /** TEST NOT NEG MUL IMUL DIV IDIV */
+  private opF6(op: number): void {
+    const os = this.osz;
+    const size = op & 1 ? os : 1;
+    this.modrm();
+    switch (this.reg) {
+      case 0: case 1: {
+        const v = this.getRM(size);
+        this.alu(4, v, this.fetchN(size), size);
         return;
       }
-      case 0xff: {
-        this.modrm();
-        switch (this.reg) {
-          case 0: this.setRM(os, this.inc(this.getRM(os), os)); return;
-          case 1: this.setRM(os, this.dec(this.getRM(os), os)); return;
-          case 2: { // CALL 近（间接）
-            const t = this.getRM(os);
-            const nip = this.model === 2 ? (os === 4 ? t >>> 0 : t & 0xffff) : t;
-            if (this.model === 2 && nip > this.cLimit[CS]) throw gp(0);
-            this.pushN(this.ip, os);
-            this.ip = nip;
-            return;
-          }
-          case 3: {
-            if (this.mod === 3 && this.model >= 1) throw ud();
-            const nip = this.rd(this.eaSi, this.eaOff, os), ncs = this.rwS(this.eaSi, this.eaPlus(os));
-            this.farCall(ncs, nip, os);
-            return;
-          }
-          case 4: this.jumpNear(this.getRM(os)); return;
-          case 5: {
-            if (this.mod === 3 && this.model >= 1) throw ud();
-            const nip = this.rd(this.eaSi, this.eaOff, os), ncs = this.rwS(this.eaSi, this.eaPlus(os));
-            this.farJump(ncs, nip);
-            return;
-          }
-          case 6: // PUSH r/m（8086 的 PUSH SP 压入减 2 之后的值）
-            if (this.model === 0 && this.mod === 3 && this.rm === SP) { r[SP] -= 2; this.wwS(SS, r[SP], r[SP]); return; }
-            this.pushN(this.getRM(os), os);
-            return;
-          default: { // /7：8086 上是 PUSH 的别名
-            if (this.model >= 1) throw ud();
-            if (this.mod === 3 && this.rm === SP) { r[SP] -= 2; this.wwS(SS, r[SP], r[SP]); return; }
-            this.push(this.getRM16());
-            return;
-          }
-        }
+      case 2: { const v = ~this.getRM(size); this.setRM(size, size === 4 ? v >>> 0 : v & MASK[size]); return; }
+      case 3: this.setRM(size, this.alu(5, 0, this.getRM(size), size)); return;
+      default: this.mulDiv(this.reg, size); return;
+    }
+  }
+
+  /** INC/DEC r/m8 */
+  private opFE(op: number): void {
+    this.modrm();
+    if (this.reg === 0) this.setRM8(this.inc(this.getRM8(), 1));
+    else if (this.reg === 1) this.setRM8(this.dec(this.getRM8(), 1));
+    else if (this.model >= 1) throw ud();
+    return;
+  }
+
+  /** INC DEC CALL JMP PUSH r/m */
+  private opFF(op: number): void {
+    const r = this.r, os = this.osz;
+    this.modrm();
+    switch (this.reg) {
+      case 0: this.setRM(os, this.inc(this.getRM(os), os)); return;
+      case 1: this.setRM(os, this.dec(this.getRM(os), os)); return;
+      case 2: { // CALL 近（间接）
+        const t = this.getRM(os);
+        const nip = this.model === 2 ? (os === 4 ? t >>> 0 : t & 0xffff) : t;
+        if (this.model === 2 && nip > this.cLimit[CS]) throw gp(0);
+        this.pushN(this.ip, os);
+        this.ip = nip;
+        return;
+      }
+      case 3: {
+        if (this.mod === 3 && this.model >= 1) throw ud();
+        const nip = this.rd(this.eaSi, this.eaOff, os), ncs = this.rwS(this.eaSi, this.eaPlus(os));
+        this.farCall(ncs, nip, os);
+        return;
+      }
+      case 4: this.jumpNear(this.getRM(os)); return;
+      case 5: {
+        if (this.mod === 3 && this.model >= 1) throw ud();
+        const nip = this.rd(this.eaSi, this.eaOff, os), ncs = this.rwS(this.eaSi, this.eaPlus(os));
+        this.farJump(ncs, nip);
+        return;
+      }
+      case 6: // PUSH r/m（8086 的 PUSH SP 压入减 2 之后的值）
+        if (this.model === 0 && this.mod === 3 && this.rm === SP) { r[SP] -= 2; this.wwS(SS, r[SP], r[SP]); return; }
+        this.pushN(this.getRM(os), os);
+        return;
+      default: { // /7：8086 上是 PUSH 的别名
+        if (this.model >= 1) throw ud();
+        if (this.mod === 3 && this.rm === SP) { r[SP] -= 2; this.wwS(SS, r[SP], r[SP]); return; }
+        this.push(this.getRM16());
+        return;
       }
     }
   }
