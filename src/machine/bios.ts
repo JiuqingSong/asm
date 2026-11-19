@@ -130,20 +130,14 @@ export class Hle {
       case 0x2a: case 0x28: return true; // 网络、DOS 空闲：忽略
       case 0x08: return this.timerTick();
       case 0x09: return this.keyboardIrq();
+      // 硬件中断的默认处理（ROM 里的桩代码先进陷阱做下面的事，再用 OUT 指令发 EOI，见 machine.ts 的 IRQ_STUBS）
       case 0x0e: // IRQ6（软驱控制器）：和 IBM BIOS 一样在 40:3E 的位 7 记下"中断来过"，直接操作控制器的程序等这一位
         this.cpu.wb(BDA, 0x3e, this.cpu.rb(BDA, 0x3e) | 0x80);
-        this.m.pic.out8(0x20, 0x20);
         return true;
-      case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0f:
-        this.m.pic.out8(0x20, 0x20); // 默认的硬件中断处理：只发 EOI
-        return true;
-      case 0x70: case 0x71: case 0x72: case 0x73: case 0x76: case 0x77: // 74h、75h 是鼠标桩代码用的陷阱号
-        // IRQ8~15：给从片和主片都发 EOI；IRQ8 是实时钟，读寄存器 C 清掉中断标志
-        if (n === 0x70) this.m.rtcAck();
-        if (n === 0x76) this.cpu.wb(BDA, 0x8e, 0xff); // IRQ14（硬盘）：和 AT BIOS 一样在 40:8E 记下"硬盘中断来过"
-        this.m.pic2.out8(0x20, 0x20);
-        this.m.pic.out8(0x20, 0x20);
-        return true;
+      case 0x70: this.m.rtcAck(); return true;                  // IRQ8 实时钟：读寄存器 C 清掉中断标志
+      case 0x76: this.cpu.wb(BDA, 0x8e, 0xff); return true;     // IRQ14（硬盘）：和 AT BIOS 一样在 40:8E 记下"硬盘中断来过"
+      case 0x0a: case 0x0b: case 0x0c: case 0x0d: case 0x0f: case 0x71: case 0x72: case 0x73: case 0x77:
+        return true; // 只发 EOI（桩代码里做）
       case 0x10: return this.video();
       case 0x11: this.cpu.r[AX] = this.cpu.rw(BDA, 0x10); return true;
       case 0x13: return this.disk();

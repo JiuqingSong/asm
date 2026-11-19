@@ -102,17 +102,30 @@ if (process.env.WATCHPHYS) {
   cpu.readLin = (a: number) => { note('读', a); return rl(a); };
   cpu.writeLin = (a: number, v: number) => { note('写', a); wl(a, v); };
 }
-// PORTLOG=3c0-3df,a0-a1：记录这些端口的读写（只记保护模式下的；PORTLOGALL=1 时都记），最后打印最近的 PORTLOGN 条
+// PORTLOG=3c0-3df,a0-a1：记录这些端口的读写（只记保护模式下的；PORTLOGALL=1 时都记，PORTLOGPM=1 时不记虚拟 8086 模式的），最后打印最近的 PORTLOGN 条
 if (process.env.PORTLOG) {
   const ranges = process.env.PORTLOG.split(',').map(r => r.split('-').map(x => parseInt(x, 16))).map(([a, b]) => [a, b ?? a]);
   const io = m.cpu.io;
   const log: string[] = [];
   (globalThis as { __portlog?: string[] }).__portlog = log;
-  const want = (p: number) => (process.env.PORTLOGALL || m.cpu.protectedMode) && ranges.some(([a, b]) => p >= a && p <= b);
-  const at = () => `${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}${m.cpu.v86 ? 'v' : ''}`;
+  const want = (p: number) => (process.env.PORTLOGALL || (m.cpu.protectedMode && !(process.env.PORTLOGPM && m.cpu.v86))) && ranges.some(([a, b]) => p >= a && p <= b);
+  const at = () => `${process.env.PORTLOGTIME ? (m.clock / 1193.182).toFixed(2) + 'ms ' : ''}${m.cpu.s[1].toString(16)}:${m.cpu.ip.toString(16)}${m.cpu.v86 ? 'v' : ''}`;
+  // PORTLOGIRQ=14：同时记下这个中断的请求和响应（看中断有没有送到）
+  if (process.env.PORTLOGIRQ) {
+    const irq = +process.env.PORTLOGIRQ, pic = irq >= 8 ? m.pic2 : m.pic, bit = irq & 7;
+    const raise = pic.raise.bind(pic);
+    pic.raise = (n: number) => { if (n === bit) log.push(`${at()} IRQ${irq} 请求（主片屏蔽 ${m.pic.imr.toString(16)}，从片屏蔽 ${m.pic2.imr.toString(16)}，IF=${(m.cpu.flags >> 9) & 1}）`); raise(n); };
+    const ack = m.pic.ack.bind(m.pic);
+    m.pic.ack = () => { const v = ack(); if (v === (irq >= 8 ? m.pic2.vectorBase : m.pic.vectorBase) + bit) log.push(`${at()} IRQ${irq} 响应（向量 ${v.toString(16)}）`); return v; };
+  }
+  let words = 0; // 数据端口的字：只计数，连续的合成一行
+  const flush = () => { if (words) { log.push(`  （数据端口 ${words} 个字）`); words = 0; } };
   m.cpu.io = {
-    in8: p => { const v = io.in8(p); if (want(p)) log.push(`${at()} IN ${p.toString(16)}=${v.toString(16)}`); return v; },
-    out8: (p, v) => { if (want(p)) log.push(`${at()} OUT ${p.toString(16)},${v.toString(16)}`); io.out8(p, v); },
+    ...io,
+    in8: p => { const v = io.in8(p); if (want(p)) { flush(); log.push(`${at()} IN ${p.toString(16)}=${v.toString(16)}`); } return v; },
+    out8: (p, v) => { if (want(p)) { flush(); log.push(`${at()} OUT ${p.toString(16)},${v.toString(16)}`); } io.out8(p, v); },
+    in16: p => { if (want(p)) words++; return io.in16!(p); },
+    out16: (p, v) => { if (want(p)) words++; io.out16!(p, v); },
   };
 }
 if (process.env.ATTRWATCH) { // 谁写了属性控制器的 10h（模式控制）寄存器
@@ -321,6 +334,19 @@ for (const h of find(m.mem, 2)) { const a = parseInt(h, 16); console.log(`  ${h}
 }
 if (process.env.WATCH) console.log('最后执行的指令：\n' + ((globalThis as { __tail?: string[] }).__tail ?? []).slice(-40).join('\n'));
 
+if (process.env.DISLIN) {
+  const { disassemble } = await import('../src/cpu/disasm.ts');
+  for (const spec of process.env.DISLIN.split(';')) {
+    const [a0, n] = spec.split(',');
+    let a = parseInt(a0, 16);
+    console.log(`反汇编 ${a.toString(16)}：`);
+    for (let k = 0; k < +(n ?? 30); k++) {
+      const d = disassemble(x => m.cpu.peekLin(x >>> 0), a, { is286: true, is386: true, code32: true });
+      console.log(`  ${(a >>> 0).toString(16)}  ${d.text}`);
+      a += d.length;
+    }
+  }
+}
 if (process.env.PORTLOG) { const l = (globalThis as { __portlog?: string[] }).__portlog ?? []; const n = +(process.env.PORTLOGN ?? 300); console.log(`端口访问（共 ${l.length} 次，最后 ${n} 次）：\n` + l.slice(-n).join('\n')); }
 if (process.env.PORTS) { const l = (globalThis as { __ports?: string[] }).__ports ?? []; console.log('串口访问（共 ' + l.length + ' 次）：' + l.slice(0, 200).join(' ')); }
 if (process.env.CONSOLE) console.log('输出的文字：' + JSON.stringify(m.console.slice(-600)));

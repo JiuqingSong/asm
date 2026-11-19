@@ -12,6 +12,12 @@ import type { Disk } from './disk.ts';
 const BSY = 0x80, DRDY = 0x40, DSC = 0x10, DRQ = 0x08, ERR = 0x01;
 /** 错误寄存器的位：中止命令、找不到扇区（ID 不存在） */
 const ABRT = 0x04, IDNF = 0x10;
+/**
+ * 命令执行要花的时间（PIT 时钟，约 0.1 毫秒）：这段时间里状态是"忙"，之后才置 DRQ（或完成）、发中断。
+ * 不能立即发中断：驱动（例如 Windows 95 的 ESDI_506）写完命令以后才记下"在等中断"，中断来得太早会被当成
+ * 多余的中断丢掉，驱动就一直等到超时、复位控制器
+ */
+const DELAY = 120;
 /** READ/WRITE MULTIPLE 一块最多的扇区数 */
 const MAX_MULTIPLE = 16;
 
@@ -22,6 +28,10 @@ export interface IdeHost {
   disk(unit: number): Disk | null;
   /** 发 IRQ14 */
   irq(): void;
+  /** 撤销 IRQ14 的请求（主机读了状态寄存器或者写了新命令；还没被响应的请求随之消失，和真的 8259 一样） */
+  irqOff(): void;
+  /** 现在的虚拟时间（PIT 时钟） */
+  now(): number;
   /** 硬盘被写过 */
   written(unit: number): void;
 }
@@ -55,6 +65,9 @@ export class IdeChannel {
   private writing = false;
   /** 光盘映像的扇区还没读出来：读到以后再做 */
   private waiting: (() => void) | null = null;
+  /** "忙"结束的时间和那时要做的事 */
+  next = Infinity;
+  private action: (() => void) | null = null;
 
   private host: IdeHost;
   constructor(host: IdeHost) {
@@ -66,6 +79,7 @@ export class IdeChannel {
   reset(): void {
     this.phase = 'idle';
     this.waiting = null;
+    this.next = Infinity; this.action = null;
     this.sectorCount = 1; this.sector = 1; this.cylLow = 0; this.cylHigh = 0;
     this.device = 0xa0;
     for (const u of [0, 1]) {
@@ -82,6 +96,22 @@ export class IdeChannel {
   private get sel(): number { return (this.device >> 4) & 1; }
 
   private irq(): void { if (!(this.control & 2)) this.host.irq(); }
+
+  /** 先"忙"一会儿，然后做 f（置 DRQ 或完成状态、发中断） */
+  private afterBusy(f: () => void): void {
+    this.phase = 'idle';
+    this.status[this.unit] = BSY;
+    this.action = f;
+    this.next = this.host.now() + DELAY;
+  }
+
+  /** 机器推进时间时调用 */
+  tick(): void {
+    if (this.host.now() < this.next) return;
+    const f = this.action;
+    this.next = Infinity; this.action = null;
+    f?.();
+  }
 
   /** 机器定期调用：光盘映像的数据读到了就继续 */
   poll(): void { if (this.waiting) { const f = this.waiting; this.waiting = null; f(); } }
@@ -100,7 +130,7 @@ export class IdeChannel {
       case 0x1f4: return this.cylLow;
       case 0x1f5: return this.cylHigh;
       case 0x1f6: return this.device;
-      case 0x1f7: return this.status[u]; // 读状态寄存器就算应答了中断（中断控制器是边沿触发）
+      case 0x1f7: this.host.irqOff(); return this.status[u]; // 读状态寄存器：撤销中断请求
       case 0x3f6: return this.status[u]; // 备用状态
     }
     return 0xff;
@@ -146,9 +176,11 @@ export class IdeChannel {
   private command(cmd: number): void {
     const u = this.sel, d = this.host.disk(u);
     if (!d) return; // 没有这个设备：不理会
+    this.host.irqOff();
     this.unit = u;
     this.error[u] = 0;
     this.waiting = null;
+    this.next = Infinity; this.action = null;
     switch (cmd) {
       case 0xec: return this.sendIdentify(d);                                 // IDENTIFY DEVICE
       case 0x20: case 0x21: return this.startRead(d, 1);                      // READ SECTORS
@@ -178,7 +210,7 @@ export class IdeChannel {
       }
       case 0x90: {                                                            // EXECUTE DEVICE DIAGNOSTIC
         this.reset();
-        this.irq();
+        this.afterBusy(() => { this.status[u] = DRDY | DSC; this.irq(); });
         return;
       }
       case 0xe5: this.sectorCount = 0xff; return this.done();                 // CHECK POWER MODE：在转
@@ -223,23 +255,18 @@ export class IdeChannel {
   }
 
   private done(): void {
-    this.phase = 'idle';
-    this.status[this.unit] = DRDY | DSC;
-    this.irq();
+    const u = this.unit;
+    this.afterBusy(() => { this.status[u] = DRDY | DSC; this.irq(); });
   }
 
   private abort(): void {
-    this.phase = 'idle';
-    this.error[this.unit] = ABRT;
-    this.status[this.unit] = DRDY | DSC | ERR;
-    this.irq();
+    const u = this.unit;
+    this.afterBusy(() => { this.error[u] = ABRT; this.status[u] = DRDY | DSC | ERR; this.irq(); });
   }
 
   private notFound(): void {
-    this.phase = 'idle';
-    this.error[this.unit] = IDNF;
-    this.status[this.unit] = DRDY | DSC | ERR;
-    this.irq();
+    const u = this.unit;
+    this.afterBusy(() => { this.error[u] = IDNF; this.status[u] = DRDY | DSC | ERR; this.irq(); });
   }
 
   // ---- IDENTIFY ----
@@ -275,11 +302,14 @@ export class IdeChannel {
     w[82] = 0x4000; w[83] = 0x4000; w[84] = 0x4000; w[85] = 0x4000; w[86] = 0x4000; w[87] = 0x4000;
     const out = new Uint8Array(512);
     for (let k = 0; k < 256; k++) { out[k * 2] = w[k] & 0xff; out[k * 2 + 1] = w[k] >> 8; }
-    this.buf = out; this.pos = 0;
     this.left = 0; this.writing = false;
-    this.phase = 'dataIn';
-    this.status[this.unit] = DRDY | DSC | DRQ;
-    this.irq();
+    const u = this.unit;
+    this.afterBusy(() => {
+      this.buf = out; this.pos = 0;
+      this.phase = 'dataIn';
+      this.status[u] = DRDY | DSC | DRQ;
+      this.irq();
+    });
   }
 
   // ---- 读 ----
@@ -312,11 +342,14 @@ export class IdeChannel {
       }
       buf.set(s, k * 512);
     }
-    this.buf = buf; this.pos = 0; this.blockLen = count;
     this.setAddress(d, this.lba + count - 1);
-    this.phase = 'dataIn';
-    this.status[this.unit] = DRDY | DSC | DRQ;
-    this.irq();
+    const u = this.unit;
+    this.afterBusy(() => {
+      this.buf = buf; this.pos = 0; this.blockLen = count;
+      this.phase = 'dataIn';
+      this.status[u] = DRDY | DSC | DRQ;
+      this.irq();
+    });
   }
 
   private readBlockDone(): void {
@@ -359,7 +392,7 @@ export class IdeChannel {
     this.host.written(this.unit);
     this.setAddress(d, this.lba + this.blockLen - 1);
     this.lba += this.blockLen; this.left -= this.blockLen;
-    if (this.left > 0) { this.expectBlock(); this.irq(); return; }
+    if (this.left > 0) { this.afterBusy(() => { this.expectBlock(); this.irq(); }); return; }
     this.done();
   }
 }

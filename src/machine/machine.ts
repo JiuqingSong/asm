@@ -32,6 +32,13 @@ export type StopReason = 'step' | 'breakpoint' | 'exit' | 'wait' | 'budget' | 'e
 const STUB_SIZE = 8;
 const STUB_INT8 = 0x0800;
 const STUB_INT9 = 0x0810;
+/**
+ * 其他硬件中断（IRQ2~7、IRQ8~15，除了鼠标的 IRQ12）的默认处理程序：每个 16 字节，需要的话先进陷阱，再用真的
+ * OUT 指令给中断控制器发 EOI。不能在 JavaScript 里直接改中断控制器：Windows 增强模式把中断送进虚拟 8086 模式的
+ * BIOS 处理时，要截获到 EOI 才会重新打开这个中断（否则它一直屏蔽着，例如硬盘的 IRQ14，32 位磁盘驱动就等不到中断）
+ */
+const IRQ_STUBS = 0x1600;
+const IRQ_VECTORS = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x70, 0x71, 0x72, 0x73, 0x76, 0x77]; // 74h 是鼠标（IRQ12），75h 是鼠标桩代码用的陷阱号
 import { STUB_INT10, int10Stub } from './vgarom.ts';
 import { DISK_ROM, diskRom } from './diskrom.ts';
 /** 软盘参数表、硬盘参数表在 F000 段里的位置（与 IBM AT BIOS 相同） */
@@ -137,11 +144,13 @@ export class Machine {
   pic2 = new PIC();
   dma = new DMA();
   /** IDE 第二通道上的 ATAPI 光驱（IRQ15） */
-  cdrom = new AtapiCdrom(() => this.pic2.raise(7));
+  cdrom = new AtapiCdrom(() => this.pic2.raise(7), () => this.pic2.lower(7));
   /** IDE 第一通道上的 ATA 硬盘（IRQ14）：C: 主盘、D: 从盘，给 Windows 95 的 32 位磁盘驱动用；DOS 经 INT 13h 读写 */
   ide = new IdeChannel({
     disk: u => this.drives[2 + u],
     irq: () => this.pic2.raise(6),
+    irqOff: () => this.pic2.lower(6),
+    now: () => this.clock,
     written: () => this.disksChanged(),
   });
   /** 软驱控制器（端口 3F0h~3F7h，IRQ6，DMA 2 号通道）：给 Windows 95 这样自己操作软驱的系统用；DOS 经 INT 13h 读写 */
@@ -582,6 +591,13 @@ export class Machine {
     mem.set([0x50, 0xe4, 0x60, TRAP_OPCODE, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     // INT 10h：陷阱，切换显示模式后再用 OUT 指令写 VGA 寄存器（见 vgarom.ts）
     mem.set(int10Stub(0x10), bios + STUB_INT10);
+    IRQ_VECTORS.forEach((n, k) => {
+      const off = IRQ_STUBS + k * 16;
+      const trap = n === 0x0e || n === 0x70 || n === 0x76 ? [TRAP_OPCODE, n] : [];
+      const eoi = n >= 0x70 ? [0xb0, 0x20, 0xe6, 0xa0, 0xe6, 0x20] : [0xb0, 0x20, 0xe6, 0x20]; // mov al,20h / (out 0A0h,al) / out 20h,al
+      mem.set([...trap, 0x50, ...eoi, 0x58, 0xcf], bios + off);  // （陷阱）push ax / EOI / pop ax / iret
+      mem[n * 4] = off & 0xff; mem[n * 4 + 1] = off >> 8;
+    });
     mem.set(diskRom(0x13 * STUB_SIZE, FDPT_OFF), bios + DISK_ROM);
     // 复位向量：跳到 F000:E05B（IBM PC 的开机入口），那里的陷阱重新启动机器
     mem.set([0xea, 0x5b, 0xe0, 0x00, 0xf0], 0xffff0);
@@ -843,7 +859,7 @@ export class Machine {
     }
     if (cpu.halted) {
       // HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据
-      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), Math.ceil(this.fdc.next - this.clock)));
+      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), Math.ceil(this.fdc.next - this.clock), Math.ceil(this.ide.next - this.clock)));
       this.advanceTime(dt);
       this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
       cpu.step();
@@ -863,6 +879,7 @@ export class Machine {
     if (this.clock >= this.rtcNext) this.rtcEvent();
     if (this.cdrom.pending) this.cdrom.poll();
     if (this.ide.pending) this.ide.poll();
+    if (this.clock >= this.ide.next) this.ide.tick();
     if (this.clock >= this.fdc.next) this.fdc.tick();
     this.com1.tick(this.clock);
     this.com2.tick(this.clock);

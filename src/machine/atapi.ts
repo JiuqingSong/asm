@@ -61,8 +61,12 @@ export class AtapiCdrom {
   /** 光驱的状态变化（放入、取出光盘），界面据此刷新 */
   onChange: (() => void) | null = null;
 
-  constructor(raiseIrq: () => void) {
+  /** 撤销中断请求（读状态寄存器、写命令时） */
+  private lowerIrq: () => void;
+
+  constructor(raiseIrq: () => void, lowerIrq: () => void = () => {}) {
     this.raiseIrq = raiseIrq;
+    this.lowerIrq = lowerIrq;
     this.reset();
   }
 
@@ -117,7 +121,7 @@ export class AtapiCdrom {
       case 0x174: return this.lbaMid;
       case 0x175: return this.lbaHigh;
       case 0x176: return this.device;
-      case 0x177: return this.status;   // 读状态寄存器就算应答了中断（我们的中断控制器是边沿触发，不用另外清）
+      case 0x177: this.lowerIrq(); return this.status; // 读状态寄存器：撤销中断请求（还没被响应的请求随之消失）
       case 0x376: return this.status;   // 备用状态：不影响中断
     }
     return 0xff;
@@ -161,6 +165,7 @@ export class AtapiCdrom {
   // ======================= ATA 命令 =======================
 
   private command(cmd: number): void {
+    this.lowerIrq();
     this.error = 0;
     switch (cmd) {
       case 0xa0: // PACKET：等 12 字节的命令包

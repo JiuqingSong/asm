@@ -14,6 +14,9 @@ function machine(): Machine {
   return m;
 }
 
+/** 让虚拟时间走一段（命令执行要一点时间） */
+function wait(m: Machine): void { (m as unknown as { advanceTime(dt: number): void }).advanceTime(1000); }
+
 function irq(m: Machine): boolean {
   const had = (m.pic2.irr & 0x40) !== 0;
   m.pic2.irr &= ~0x40;
@@ -40,7 +43,7 @@ describe('IDE 硬盘（第一通道）', () => {
     expect([io.in8(0x1f2), io.in8(0x1f3), io.in8(0x1f4), io.in8(0x1f5), io.in8(0x1f1)]).toEqual([1, 1, 0, 0, 1]);
     expect(io.in8(0x1f7) & 0xc0).toBe(0x40);
     io.out8(0x1f6, 0xa0);
-    io.out8(0x1f7, 0xec);
+    io.out8(0x1f7, 0xec); wait(m);
     expect(irq(m)).toBe(true);
     expect(io.in8(0x1f7) & 0x08).toBe(0x08);
     const w = readWords(m, 256);
@@ -51,17 +54,18 @@ describe('IDE 硬盘（第一通道）', () => {
     expect(io.in8(0x1f7) & 0x08).toBe(0);
     io.out8(0x1f6, 0xb0);
     expect(io.in8(0x1f7)).toBe(0);
-    io.out8(0x1f7, 0xec);                      // 没有从盘：不理会
+    io.out8(0x1f7, 0xec); wait(m);                      // 没有从盘：不理会
     expect(irq(m)).toBe(false);
   });
 
   it('READ SECTORS：LBA 和 CHS 方式，每个扇区一次中断；结束时寄存器指向最后一个扇区', () => {
     const m = machine(), io = m.cpu.io;
     lba(m, 0, 1000, 2);
-    io.out8(0x1f7, 0x20);
+    io.out8(0x1f7, 0x20); wait(m);
     expect(irq(m)).toBe(true);
     let w = readWords(m, 256);
     expect(w[0]).toBe(1000);
+    wait(m);
     expect(irq(m)).toBe(true);                 // 第二个扇区
     w = readWords(m, 256);
     expect(w[0]).toBe(1001);
@@ -69,46 +73,47 @@ describe('IDE 硬盘（第一通道）', () => {
     expect(io.in8(0x1f3) | (io.in8(0x1f4) << 8)).toBe(1001);
     // CHS：柱面 2、磁头 3、扇区 4 → (2 × 16 + 3) × 63 + 3
     io.out8(0x1f6, 0xa3); io.out8(0x1f2, 1); io.out8(0x1f3, 4); io.out8(0x1f4, 2); io.out8(0x1f5, 0);
-    io.out8(0x1f7, 0x20);
+    io.out8(0x1f7, 0x20); wait(m);
     w = readWords(m, 256);
     expect(w[0]).toBe(((2 * 16 + 3) * 63 + 3) & 0xffff);
     // 超出范围
     lba(m, 0, 0x0fffffff, 1);
-    io.out8(0x1f7, 0x20);
+    io.out8(0x1f7, 0x20); wait(m);
     expect(io.in8(0x1f7) & 1).toBe(1);
     expect(io.in8(0x1f1)).toBe(0x10);
   });
 
   it('SET MULTIPLE + READ MULTIPLE 一次中断传多个扇区；INITIALIZE DEVICE PARAMETERS 改变 CHS 换算', () => {
     const m = machine(), io = m.cpu.io;
-    io.out8(0x1f7, 0xc4);                      // 没设置过：中止
+    io.out8(0x1f7, 0xc4); wait(m);                      // 没设置过：中止
     expect(io.in8(0x1f1)).toBe(0x04);
-    io.out8(0x1f2, 8); io.out8(0x1f7, 0xc6);
+    io.out8(0x1f2, 8); io.out8(0x1f7, 0xc6); wait(m);
     expect(io.in8(0x1f7) & 1).toBe(0);
     lba(m, 0, 50, 10);
-    io.out8(0x1f7, 0xc4);
+    io.out8(0x1f7, 0xc4); wait(m);
     expect(irq(m)).toBe(true);
     const a = readWords(m, 8 * 256);
     expect([a[0], a[7 * 256]]).toEqual([50, 57]);
+    wait(m);
     expect(irq(m)).toBe(true);
     const b = readWords(m, 2 * 256);
     expect([b[0], b[256]]).toEqual([58, 59]);
     // 逻辑几何：8 磁头、32 扇区
-    io.out8(0x1f6, 0xa7); io.out8(0x1f2, 32); io.out8(0x1f7, 0x91);
+    io.out8(0x1f6, 0xa7); io.out8(0x1f2, 32); io.out8(0x1f7, 0x91); wait(m);
     io.out8(0x1f6, 0xa1); io.out8(0x1f2, 1); io.out8(0x1f3, 1); io.out8(0x1f4, 1); io.out8(0x1f5, 0);
-    io.out8(0x1f7, 0x20);
+    io.out8(0x1f7, 0x20); wait(m);
     expect(readWords(m, 256)[0]).toBe((1 * 8 + 1) * 32);
   });
 
   it('WRITE SECTORS：第一块不发中断，写完每块发中断；映像被改写', () => {
     const m = machine(), io = m.cpu.io;
     lba(m, 0, 77, 2);
-    io.out8(0x1f7, 0x30);
+    io.out8(0x1f7, 0x30); wait(m);
     expect(irq(m)).toBe(false);
     expect(io.in8(0x1f7) & 0x08).toBe(0x08);
-    for (let k = 0; k < 256; k++) io.out16!(0x1f0, 0x1234);
+    for (let k = 0; k < 256; k++) io.out16!(0x1f0, 0x1234); wait(m);
     expect(irq(m)).toBe(true);
-    for (let k = 0; k < 256; k++) io.out16!(0x1f0, 0x5678);
+    for (let k = 0; k < 256; k++) io.out16!(0x1f0, 0x5678); wait(m);
     expect(irq(m)).toBe(true);
     expect(io.in8(0x1f7)).toBe(0x50);
     const d = m.drives[2]!;

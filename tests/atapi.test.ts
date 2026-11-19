@@ -20,13 +20,13 @@ function packet(m: Machine, cmd: number[], limit = 0xfffe): { data: number[]; st
   io.out8(0x176, 0xa0);                       // 选主盘
   io.out8(0x174, limit & 0xff); io.out8(0x175, limit >> 8);
   io.out8(0x177, 0xa0);                       // PACKET
-  expect(io.in8(0x177) & 0x08).toBe(0x08);    // DRQ：等命令包
+  expect(io.in8(0x376) & 0x08).toBe(0x08);    // DRQ：等命令包
   expect(io.in8(0x172) & 3).toBe(1);          // C/D = 1
   const p = [...cmd, ...new Array(12).fill(0)].slice(0, 12);
   for (let k = 0; k < 12; k += 2) io.out16!(0x170, p[k] | (p[k + 1] << 8));
   const data: number[] = [];
   for (let guard = 0; guard < 1000; guard++) {
-    const st = io.in8(0x177);
+    const st = io.in8(0x376);
     if (st & 0x80) return { data, status: st, error: io.in8(0x171) }; // 忙：调用者自己处理
     if (!(st & 0x08)) return { data, status: st, error: io.in8(0x171) };
     const n = io.in8(0x174) | (io.in8(0x175) << 8);

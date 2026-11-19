@@ -670,6 +670,8 @@ Turbo Pascal / Turbo C 的 BGI 驱动 `EGAVGA.BGI` 就是直接操作这些寄�
 
 ### 9.1 8259 中断控制器
 
+硬件中断的默认处理程序（IRQ2~7、IRQ8~15，鼠标的 IRQ12 除外）是 ROM 里的小段代码，用真的 OUT 指令发 EOI：Windows 增强模式把中断送进虚拟 8086 模式的 BIOS 处理时，要截获到 EOI 才重新打开这个中断。
+
 和 AT 机一样两片：主片（端口 20h、21h，IRQ0~7，向量默认从 08h 开始）和接在主片 IRQ2 上的从片（端口 A0h、A1h，IRQ8~15，向量默认从 70h 开始），都可以用 ICW2 改。主片初始屏蔽字 B8h，即开放 IRQ0（时钟）、IRQ1（键盘）、IRQ2（级联）、IRQ6；从片初始全部屏蔽。程序要用串口中断时，需要自己清除 IRQ3/IRQ4 的屏蔽位，和真机一样。支持优先级、嵌套（ISR）、非特定和特定 EOI；从片的中断要给两片都发 EOI。
 
 **IRQ8 实时钟**：CMOS 寄存器 B 的位 6 打开周期中断（频率由寄存器 A 的低 4 位决定，默认 1024Hz），位 4 打开每秒一次的更新结束中断；中断原因在寄存器 C 里，读出后清零，读之前不会再发下一次中断（和真的 MC146818 一样）。
@@ -805,7 +807,7 @@ C:、D: 的硬盘映像经 IDE 第一通道的 ATA 控制器读写（端口 1F0h
 
 - 命令：IDENTIFY DEVICE、READ SECTORS、WRITE SECTORS、READ/WRITE MULTIPLE（SET MULTIPLE MODE，每块最多 16 扇区）、READ VERIFY、SEEK、RECALIBRATE、INITIALIZE DEVICE PARAMETERS（改变 CHS 换算用的磁头数、每道扇区数）、EXECUTE DEVICE DIAGNOSTIC、CHECK POWER MODE、SET FEATURES 和电源管理命令（直接完成）；其他命令（包括 DMA 读写、PACKET）中止。
 - 地址可以用 CHS 或 LBA（28 位）；默认的 CHS 换算按映像的几何参数（和 INT 13h 一样，最多 1024 柱面 × 16 磁头 × 63 扇区）。
-- 只有 PIO 方式，命令立即完成；软件复位（3F6h 位 2）后寄存器里是 ATA 硬盘的签名。D: 是光盘映像合成的只读盘时写命令被中止，扇区还没从文件里读出来时报告"忙"。
+- 只有 PIO 方式；每个命令先报告"忙"约 0.1 毫秒，再置 DRQ（或完成）、发中断（立即发中断的话，Windows 95 的驱动会把它当成多余的中断）。读状态寄存器 1F7h（不是 3F6h）或写新命令时撤销还没被响应的中断请求，和真的 IDE 盘加 8259 一样（光驱的 177h 也是）；软件复位（3F6h 位 2）后寄存器里是 ATA 硬盘的签名。D: 是光盘映像合成的只读盘时写命令被中止，扇区还没从文件里读出来时报告"忙"。
 - CMOS 12h、19h/1Ah 里硬盘是类型 47（用户自定义），1Bh~2Ch 是几何参数，2Eh/2Fh 是校验和；BIOS 的 IRQ14 处理程序（INT 76h）在 40:8E 写 FFh。
 - Windows 3.1 的 32 位磁盘访问（WDCTRL）不能用：它检查 BIOS 的细节，会报告"interrupt conflicts"。
 
