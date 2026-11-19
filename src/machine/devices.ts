@@ -25,16 +25,18 @@ export class PIC implements IrqSource {
   raise(irq: number): void { this.irr |= 1 << irq; }
   lower(irq: number): void { this.irr &= ~(1 << irq); }
 
+  /** 优先级最高（编号最小）的位；没有则 -1 */
   private highest(mask: number): number {
-    for (let i = 0; i < 8; i++) if (mask & (1 << i)) return i;
-    return -1;
+    mask &= 0xff;
+    return mask === 0 ? -1 : 31 - Math.clz32(mask & -mask);
   }
 
+  // CPU 每条指令都问一次：只用位运算（x & -x 是最低的那个 1）
   pending(): boolean {
-    const req = this.highest(this.requests() & ~this.imr);
-    if (req < 0) return false;
-    const svc = this.highest(this.isr);
-    return svc < 0 || req < svc;
+    const req = this.requests() & ~this.imr & 0xff;
+    if (req === 0) return false;
+    const svc = this.isr & 0xff;
+    return svc === 0 || (req & -req) < (svc & -svc);
   }
 
   ack(): number {

@@ -240,7 +240,7 @@ export class CPU {
     this.flushTlb();
   }
 
-  setA20(on: boolean): void { this.a20 = on; this.updateAddrMask(); this.fetchKey = -1; }
+  setA20(on: boolean): void { this.a20 = on; this.updateAddrMask(); this.fetchKey = -1; this.fHi = 0; }
   get a20Enabled(): boolean { return this.a20; }
   private updateAddrMask(): void {
     this.addrMask = this.model === 0 ? 0xfffff : this.model === 1 ? (this.a20 ? 0xffffff : 0xefffff) : (this.a20 ? 0xffffffff : 0xffefffff);
@@ -326,6 +326,48 @@ export class CPU {
   private rl(lin: number): number { const a = this.phys(lin, false); return a < MEM_SIZE ? this.readLin(a) : 0xff; }
   private wl(lin: number, v: number): void { const a = this.phys(lin, true); if (a < MEM_SIZE) this.writeLin(a, v); }
 
+  /**
+   * 按线性地址读写一个字 / 双字（386）。不跨页时只转换一次地址、直接读写内存；
+   * 跨页、显存（A0000~BFFFF）、16MB 以上就逐字节走 rl / wl（结果和逐字节完全一样，包括缺页时 CR2 的值）
+   */
+  private rl2(a: number): number {
+    if ((a & 0xfff) !== 0xfff) {
+      const p = this.phys(a, false);
+      if (p < MEM_SIZE && (p >>> 17) !== 5) return this.mem[p] | (this.mem[p + 1] << 8);
+    }
+    return this.rl(a) | (this.rl(a + 1) << 8);
+  }
+  private rl4(a: number): number {
+    if ((a & 0xfff) <= 0xffc) {
+      const p = this.phys(a, false);
+      if (p < MEM_SIZE && (p >>> 17) !== 5) { const m = this.mem; return (m[p] | (m[p + 1] << 8) | (m[p + 2] << 16) | (m[p + 3] << 24)) >>> 0; }
+    }
+    return (this.rl(a) | (this.rl(a + 1) << 8) | (this.rl(a + 2) << 16) | (this.rl(a + 3) << 24)) >>> 0;
+  }
+  private wl2(a: number, v: number): void {
+    if ((a & 0xfff) !== 0xfff) {
+      const p = this.phys(a, true);
+      if (p < MEM_SIZE && (p >>> 17) !== 5) {
+        const m = this.mem, w = this.onWrite;
+        if (w) { w(p, m[p]); m[p] = v; w(p + 1, m[p + 1]); m[p + 1] = v >> 8; } else { m[p] = v; m[p + 1] = v >> 8; }
+        return;
+      }
+    }
+    this.wl(a, v); this.wl(a + 1, v >> 8);
+  }
+  private wl4(a: number, v: number): void {
+    if ((a & 0xfff) <= 0xffc) {
+      const p = this.phys(a, true);
+      if (p < MEM_SIZE && (p >>> 17) !== 5) {
+        const m = this.mem, w = this.onWrite;
+        if (w) { w(p, m[p]); m[p] = v; w(p + 1, m[p + 1]); m[p + 1] = v >>> 8; w(p + 2, m[p + 2]); m[p + 2] = v >>> 16; w(p + 3, m[p + 3]); m[p + 3] = v >>> 24; }
+        else { m[p] = v; m[p + 1] = v >>> 8; m[p + 2] = v >>> 16; m[p + 3] = v >>> 24; }
+        return;
+      }
+    }
+    this.wl(a, v); this.wl(a + 1, v >>> 8); this.wl(a + 2, v >>> 16); this.wl(a + 3, v >>> 24);
+  }
+
   /** 分页：查页表把线性地址换成物理地址；不合规时 #PF（CR2 = 线性地址） */
   private translate(lin: number, write: boolean): number {
     const page = lin >>> 12;
@@ -385,11 +427,11 @@ export class CPU {
   /** 作废一页的地址转换缓存（INVLPG） */
   private invalidatePage(lin: number): void {
     this.tlb[lin >>> 12] = 0; // 还留在"用过的页"列表里，下次整体作废时再清一次也无妨
-    this.fetchKey = -1;
+    this.fetchKey = -1; this.fHi = 0;
   }
 
   flushTlb(): void {
-    this.fetchKey = -1;
+    this.fetchKey = -1; this.fHi = 0;
     const t = this.tlb, u = this.tlbUsed;
     for (let k = 0; k < this.tlbCount; k++) t[u[k]] = 0;
     this.tlbCount = 0;
@@ -459,18 +501,18 @@ export class CPU {
   private rwS(i: number, off: number): number {
     if (this.model === 2) {
       this.check(i, off, 2, false);
-      const a = this.segBase(i) + off;
-      return this.rl(a) | (this.rl(a + 1) << 8);
+      return this.rl2(this.segBase(i) + off);
     }
     off &= 0xffff;
     if (this.msw & 1) this.check(i, off, 2, false);
-    const b = this.segBase(i);
-    return this.readLin((b + off) & this.addrMask) | (this.readLin((b + ((off + 1) & 0xffff)) & this.addrMask) << 8);
+    const b = this.segBase(i), a = (b + off) & this.addrMask;
+    // 两个字节在同一页、不是显存：直接读（偏移 FFFFh 时第二个字节回绕到段开头，走下面的逐字节）
+    if (off !== 0xffff && (a & 0xfff) !== 0xfff && (a >>> 17) !== 5) return this.mem[a] | (this.mem[a + 1] << 8);
+    return this.readLin(a) | (this.readLin((b + ((off + 1) & 0xffff)) & this.addrMask) << 8);
   }
   private rdS(i: number, off: number): number {
     this.check(i, off, 4, false);
-    const a = this.segBase(i) + off;
-    return (this.rl(a) | (this.rl(a + 1) << 8) | (this.rl(a + 2) << 16) | (this.rl(a + 3) << 24)) >>> 0;
+    return this.rl4(this.segBase(i) + off);
   }
   private wbS(i: number, off: number, v: number): void {
     if (this.model === 2) { this.check(i, off, 1, true); this.wl(this.segBase(i) + off, v); return; }
@@ -481,20 +523,23 @@ export class CPU {
   private wwS(i: number, off: number, v: number): void {
     if (this.model === 2) {
       this.check(i, off, 2, true);
-      const a = this.segBase(i) + off;
-      this.wl(a, v); this.wl(a + 1, v >> 8);
+      this.wl2(this.segBase(i) + off, v);
       return;
     }
     off &= 0xffff;
     if (this.msw & 1) this.check(i, off, 2, true);
-    const b = this.segBase(i);
-    this.writeLin((b + off) & this.addrMask, v);
+    const b = this.segBase(i), a = (b + off) & this.addrMask;
+    if (off !== 0xffff && (a & 0xfff) !== 0xfff && (a >>> 17) !== 5) {
+      const m = this.mem, w = this.onWrite;
+      if (w) { w(a, m[a]); m[a] = v; w(a + 1, m[a + 1]); m[a + 1] = v >> 8; } else { m[a] = v; m[a + 1] = v >> 8; }
+      return;
+    }
+    this.writeLin(a, v);
     this.writeLin((b + ((off + 1) & 0xffff)) & this.addrMask, v >> 8);
   }
   private wdS(i: number, off: number, v: number): void {
     this.check(i, off, 4, true);
-    const a = this.segBase(i) + off;
-    this.wl(a, v); this.wl(a + 1, v >>> 8); this.wl(a + 2, v >>> 16); this.wl(a + 3, v >>> 24);
+    this.wl4(this.segBase(i) + off, v);
   }
   /** 按大小读写 */
   private rd(i: number, off: number, size: number): number {
@@ -511,7 +556,30 @@ export class CPU {
   private rdL(a: number): number { return (this.rwL(a) | (this.rwL(a + 2) << 16)) >>> 0; }
   private wdL(a: number, v: number): void { this.wwL(a, v); this.wwL(a + 2, v >>> 16); }
 
+  /**
+   * 取指令的窗口：IP 在 [fLo, fHi) 里时，这个字节就是 mem[fDelta + IP]（同一个 4KB 页、不超过 CS 的界限）。
+   * 每条指令开始时（step）核对 CS 基址、界限、CPL、CR0、地址掩码是否还和建窗口时一样；作废 TLB 时也作废窗口
+   */
+  private fLo = 0;
+  private fHi = 0;
+  private fDelta = 0;
+  private fCsBase = 0;
+  private fLimit = 0;
+  private fCpl = 0;
+  private fMsw = 0;
+  private fMask = 0;
+
   private fetch8(): number {
+    const ip = this.ip;
+    if (ip < this.fHi && ip >= this.fLo) {
+      this.ip = this.model === 2 ? ip + 1 : (ip + 1) & 0xffff;
+      return this.mem[this.fDelta + ip];
+    }
+    return this.fetch8Slow();
+  }
+
+  /** 窗口外的取指：照常检查界限、经过分页，顺便为这一页建窗口 */
+  private fetch8Slow(): number {
     const ip = this.ip;
     if (this.model === 2) {
       if (ip > this.cLimit[CS]) throw gp(0);
@@ -524,13 +592,29 @@ export class CPU {
         if (a < MEM_SIZE && (a >>> 17) !== 5) { this.fetchKey = key; this.fetchBase = a - (a & 0xfff); }
         v = a < MEM_SIZE ? this.readLin(a) : 0xff;
       }
+      if (key === this.fetchKey) this.openFetchWindow(ip, this.fetchBase + (lin & 0xfff), this.cLimit[CS] + 1);
       this.ip = ip + 1;
       return v;
     }
     if (this.msw & 1 && ip > this.cLimit[CS]) throw gp(0);
-    const v = this.readLin((this.segBase(CS) + ip) & this.addrMask);
+    const a = (this.segBase(CS) + ip) & this.addrMask;
+    const v = this.readLin(a);
+    if ((a >>> 17) !== 5) this.openFetchWindow(ip, a, this.msw & 1 ? Math.min(this.cLimit[CS] + 1, 0x10000) : 0x10000);
     this.ip = (ip + 1) & 0xffff;
     return v;
+  }
+
+  /** IP 处的字节在物理地址 a：同一页里、界限 end 之内的 IP 都可以直接读内存 */
+  private openFetchWindow(ip: number, a: number, end: number): void {
+    const off = a & 0xfff;
+    this.fLo = Math.max(0, ip - off);
+    this.fHi = Math.min(ip - off + 0x1000, end);
+    this.fDelta = a - ip;
+    this.fCsBase = this.segBase(CS);
+    this.fLimit = this.cLimit[CS];
+    this.fCpl = this.cpl;
+    this.fMsw = this.msw;
+    this.fMask = this.addrMask;
   }
   private fetch16(): number {
     const lo = this.fetch8();
@@ -1251,18 +1335,18 @@ export class CPU {
     if (count === 0) return v;
     if (op === 6 && this.model >= 1) op = 4; // 186 以后：/6 是 SHL 的别名（8086 上是未公开的 SETMO）
     const mask = MASK[size], sign = SIGN[size];
-    const t = size === 4 ? (x: number) => x >>> 0 : (x: number) => x & mask;
+    // 截断到 size 字节：(x & mask) >>> 0（32 位时 mask 是 FFFFFFFFh，>>> 0 让结果不带符号）。不用闭包，免得每次移位都分配函数
     let cf = this.flags & CF ? 1 : 0;
     for (let i = 0; i < count; i++) {
       switch (op) {
-        case 0: cf = v & sign ? 1 : 0; v = t(v * 2 + cf); break;
-        case 1: cf = v & 1; v = t((v >>> 1) + (cf ? sign : 0)); break;
-        case 2: { const n = v & sign ? 1 : 0; v = t(v * 2 + cf); cf = n; break; }
-        case 3: { const n = v & 1; v = t((v >>> 1) + (cf ? sign : 0)); cf = n; break; }
-        case 4: cf = v & sign ? 1 : 0; v = t(v * 2); break;
+        case 0: cf = v & sign ? 1 : 0; v = ((v * 2 + cf) & mask) >>> 0; break;
+        case 1: cf = v & 1; v = (((v >>> 1) + (cf ? sign : 0)) & mask) >>> 0; break;
+        case 2: { const n = v & sign ? 1 : 0; v = ((v * 2 + cf) & mask) >>> 0; cf = n; break; }
+        case 3: { const n = v & 1; v = (((v >>> 1) + (cf ? sign : 0)) & mask) >>> 0; cf = n; break; }
+        case 4: cf = v & sign ? 1 : 0; v = ((v * 2) & mask) >>> 0; break;
         case 5: cf = v & 1; v = v >>> 1; break;
         case 6: cf = 0; v = mask; break;
-        case 7: cf = v & 1; v = t((v >>> 1) + (v & sign ? sign : 0)); break;
+        case 7: cf = v & 1; v = (((v >>> 1) + (v & sign ? sign : 0)) & mask) >>> 0; break;
       }
     }
     this.setF(CF, cf);
@@ -1938,6 +2022,8 @@ export class CPU {
     }
     this.inhibitIrq = false;
     if (this.halted) return;
+    // 上一条指令（或调试器、BIOS 高层代码）可能改了 CS、CPL、CR0、A20：取指窗口不再适用就作废
+    if (this.fHi !== 0 && (this.segBase(CS) !== this.fCsBase || this.cLimit[CS] !== this.fLimit || this.cpl !== this.fCpl || this.msw !== this.fMsw || this.addrMask !== this.fMask)) this.fHi = 0;
     const tf = this.flags & TF;
     this.startIP = this.ip;
     this.startSP = this.model === 2 ? this.r32(SP) : this.r[SP];

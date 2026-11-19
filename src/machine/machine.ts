@@ -64,35 +64,44 @@ class History {
   private waddr = new Int32Array(this.wcap);
   private wold = new Uint8Array(this.wcap);
   private head = 0;   // 已记录的总条数
+  private pos = 0;    // 下一条记录放在哪里（= head % cap，单独记着省掉每条指令一次取模）
   count = 0;          // 有效条数
   private wpos = 0;   // 已记录的内存写入总数
   enabled = true;
 
-  clear(): void { this.head = 0; this.count = 0; this.wpos = 0; }
+  clear(): void { this.head = 0; this.pos = 0; this.count = 0; this.wpos = 0; }
 
+  // 每条指令都调用一次：直接读 CPU 的寄存器数组，不经过 r32() 之类的函数
   begin(cpu: CPU, flags: number): void {
-    const i = this.head % this.cap;
+    const i = this.pos;
     const o = i * 18;
-    const r = this.regs;
-    for (let k = 0; k < 8; k++) r[o + k] = cpu.r32(k);
-    for (let k = 0; k < 6; k++) r[o + 8 + k] = cpu.s[k];
+    const r = this.regs, lo = cpu.r, hi = cpu.rh, s = cpu.s;
+    r[o] = lo[0] | (hi[0] << 16); r[o + 1] = lo[1] | (hi[1] << 16);
+    r[o + 2] = lo[2] | (hi[2] << 16); r[o + 3] = lo[3] | (hi[3] << 16);
+    r[o + 4] = lo[4] | (hi[4] << 16); r[o + 5] = lo[5] | (hi[5] << 16);
+    r[o + 6] = lo[6] | (hi[6] << 16); r[o + 7] = lo[7] | (hi[7] << 16);
+    r[o + 8] = s[0]; r[o + 9] = s[1]; r[o + 10] = s[2]; r[o + 11] = s[3]; r[o + 12] = s[4]; r[o + 13] = s[5];
     r[o + 14] = cpu.ip;
     r[o + 15] = cpu.flags;
     r[o + 16] = (cpu.halted ? 1 : 0) | (cpu.waiting ? 2 : 0);
     r[o + 17] = flags;
     this.wstart[i] = this.wpos;
     this.head++;
+    this.pos = i + 1 === this.cap ? 0 : i + 1;
     if (this.count < this.cap) this.count++;
-    // 写入日志被覆盖的旧记录失效
+    // 写入日志被覆盖的旧记录失效（通常最老的一条还有效，一次比较就够了）
+    let oldest = this.pos - this.count;
+    if (oldest < 0) oldest += this.cap;
+    if (this.wpos - this.wstart[oldest] <= this.wcap) return;
     while (this.count > 0) {
-      const oldest = (this.head - this.count) % this.cap;
-      if (this.wpos - this.wstart[oldest] <= this.wcap) break;
+      const old = (this.head - this.count) % this.cap;
+      if (this.wpos - this.wstart[old] <= this.wcap) break;
       this.count--;
     }
   }
 
   write(addr: number, old: number): void {
-    const j = this.wpos % this.wcap;
+    const j = this.wpos & (this.wcap - 1);
     this.waddr[j] = addr;
     this.wold[j] = old;
     this.wpos++;
@@ -114,9 +123,10 @@ class History {
     this.head--;
     this.count--;
     const i = this.head % this.cap;
+    this.pos = i;
     const start = this.wstart[i];
     for (let w = this.wpos - 1; w >= start; w--) {
-      const j = w % this.wcap;
+      const j = w & (this.wcap - 1);
       const a = this.waddr[j];
       if (a >= PLANAR_HISTORY) restore(a - PLANAR_HISTORY, this.wold[j]); // 显卡平面里的字节
       else cpu.mem[a] = this.wold[j];
@@ -968,7 +978,8 @@ export class Machine {
       this.message = 'CPU 执行了 HLT 且中断已关闭（IF=0），不会再被唤醒';
       return 'error';
     }
-    if (!this.inBios()) {
+    // 每条指令都走到这里：两件事都不用查时（通常如此）就不去算 CS:IP 的线性地址
+    if ((this.breakRequest || !this.wildWarned) && !this.inBios()) {
       if (this.breakRequest) {
         this.message = this.breakRequest;
         this.breakRequest = '';
@@ -1093,7 +1104,7 @@ export class Machine {
         if (p.kind === 'step' && !this.inBios() && !cpu.repContinue && !cpu.waiting) return this.stopAt('step');
         if (p.kind === 'over' && cpu.s[CS] === p.cs && cpu.ip === p.ip && cpu.r[SP] >= p.sp && !cpu.repContinue) return this.stopAt('step');
         if (p.kind === 'over' && !this.inBios() && n > 0 && this.breakpoints.has(this.linearIP) && !cpu.repContinue) return this.stopAt('breakpoint');
-        if (p.kind === 'run' && n > 0 && !this.inBios() && !cpu.repContinue && this.breakpoints.has(this.linearIP)) return this.stopAt('breakpoint');
+        if (p.kind === 'run' && n > 0 && this.breakpoints.size !== 0 && !this.inBios() && !cpu.repContinue && this.breakpoints.has(this.linearIP)) return this.stopAt('breakpoint');
         this.exec1();
       }
       const s = this.checkStop();

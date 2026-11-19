@@ -67,7 +67,12 @@ export class SerialMouse implements SerialPeer {
 
   deliver(to: UART, now: number): void {
     this.uart = to;
-    if (this.active && this.queue.length === 0) this.makePacket(now);
+    if (this.queue.length === 0) {
+      // 每条指令都会走到这里：没有移动、按键也没变就不必去算波特率（makePacket 也会什么都不做）
+      const m = this.mouse;
+      if (Math.trunc(m.rawDx) === 0 && Math.trunc(m.rawDy) === 0 && (m.buttons & 7) === this.lastButtons) return;
+      if (this.active) this.makePacket(now);
+    }
     while (this.queue.length && this.queue[0].time <= now) {
       const { byte } = this.queue.shift()!;
       // 主机按 1200 bps 接收才收得对；Microsoft 协议按 8 位数据接收时，第 8 位读到的是停止位（1）
