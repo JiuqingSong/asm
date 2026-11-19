@@ -73,7 +73,12 @@ export class Mouse {
     this.pending = 0;
     this.inHandler = false;
     this.version++;
+    this.changed();
   }
+
+  /** 可能有了需要回调的事件：Machine 用它通知 CPU 重新检查中断（INT 33h 里的改动由 CPU 在陷阱之后统一处理） */
+  onChange: (() => void) | null = null;
+  private changed(): void { if (this.onChange !== null) this.onChange(); }
 
   /** 装载新程序时：完全恢复初始状态 */
   powerOn(): void {
@@ -122,6 +127,7 @@ export class Mouse {
     this.clamp();
     this.pending |= EV_MOVE;
     this.version++;
+    this.changed();
   }
 
   /** 界面上的按键变化：排队，按虚拟时间逐个生效 */
@@ -156,6 +162,7 @@ export class Mouse {
     }
     this.buttons = buttons & 7;
     this.version++;
+    this.changed();
   }
 
   /** 有需要交给回调的事件吗 */

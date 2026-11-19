@@ -110,6 +110,13 @@ export class CPU {
 
   io: IOBus = nullBus;
   irq: IrqSource | null = null;
+  /**
+   * 中断请求线：false 表示上次问过中断源"没有"，之后中断源的状态也没变，这条指令就不用再问。
+   * 只有 irqGated 为 true 时才会变成 false（Machine 打开它，并保证 8259、鼠标的状态一变就把它置回 true）；
+   * 另外每个 BIOS 陷阱之后也置回 true（高层代码可能改了任何东西）
+   */
+  irqCheck = true;
+  irqGated = false;
   trap: TrapHandler | null = null;
   /** 内存写入钩子（用于反向执行的历史记录）：参数为物理地址和写入前的旧值 */
   onWrite: ((addr: number, old: number) => void) | null = null;
@@ -2037,14 +2044,17 @@ export class CPU {
   step(): void {
     this.repContinue = false;
     this.irqTaken = false;
-    if (!this.inhibitIrq && this.flags & IF && this.irq && this.irq.pending()) {
-      this.irqTaken = true;
-      this.waiting = false; // 等待中的陷阱被中断打断：返回后会重新执行陷阱
-      this.startIP = this.ip; this.startSP = this.r32(SP);
-      const n = this.irq.ack();
-      try { this.interrupt(n); } catch (e) { this.faultHandler(e); }
-      this.steps++;
-      return;
+    if (!this.inhibitIrq && this.flags & IF && this.irqCheck && this.irq !== null) {
+      if (this.irq.pending()) {
+        this.irqTaken = true;
+        this.waiting = false; // 等待中的陷阱被中断打断：返回后会重新执行陷阱
+        this.startIP = this.ip; this.startSP = this.r32(SP);
+        const n = this.irq.ack();
+        try { this.interrupt(n); } catch (e) { this.faultHandler(e); }
+        this.steps++;
+        return;
+      }
+      if (this.irqGated) this.irqCheck = false;
     }
     this.inhibitIrq = false;
     if (this.halted) return;
@@ -2078,7 +2088,7 @@ export class CPU {
             const before = this.s.slice();
             this.inTrap = true;
             let done: boolean;
-            try { done = this.trap(n); } finally { this.inTrap = false; }
+            try { done = this.trap(n); } finally { this.inTrap = false; this.irqCheck = true; }
             if (!done) {
               this.ip = this.startIP;
               this.waiting = true;

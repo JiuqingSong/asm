@@ -12,18 +12,22 @@ export class PIC implements IrqSource {
   private initStep = 0;
   private needIcw4 = false;
   private readIsr = false;
+  /** 状态（请求、在服务、屏蔽）可能变了：Machine 用它通知 CPU 重新检查中断（见 CPU.irqCheck） */
+  onChange: (() => void) | null = null;
+  private changed(): void { if (this.onChange !== null) this.onChange(); }
 
   /** 复位到 BIOS 开机后的状态 */
   reset(vectorBase: number, imr: number): void {
     this.irr = 0; this.isr = 0; this.imr = imr; this.vectorBase = vectorBase;
     this.initStep = 0; this.readIsr = false;
+    this.changed();
   }
 
   /** 请求：从片有待处理的中断时，主片的 IRQ2 就有请求 */
   private requests(): number { return this.irr | (this.slave !== null && this.slave.pending() ? 4 : 0); }
 
-  raise(irq: number): void { this.irr |= 1 << irq; }
-  lower(irq: number): void { this.irr &= ~(1 << irq); }
+  raise(irq: number): void { this.irr |= 1 << irq; this.changed(); }
+  lower(irq: number): void { this.irr &= ~(1 << irq); this.changed(); }
 
   /** 优先级最高（编号最小）的位；没有则 -1 */
   private highest(mask: number): number {
@@ -40,6 +44,7 @@ export class PIC implements IrqSource {
   }
 
   ack(): number {
+    this.changed();
     const req = this.highest(this.requests() & ~this.imr);
     if (req === 2 && this.slave !== null && this.slave.pending()) { this.isr |= 4; return this.slave.ack(); } // 级联：向量由从片给出
     this.irr &= ~(1 << req);
@@ -53,6 +58,7 @@ export class PIC implements IrqSource {
   }
 
   out8(port: number, v: number): void {
+    this.changed();
     if (port === 0x20) {
       if (v & 0x10) { // ICW1
         this.initStep = 2;

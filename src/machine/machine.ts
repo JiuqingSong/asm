@@ -286,6 +286,10 @@ export class Machine {
     pic.slave = this.pic2;
     this.pic2.reset(0x70, 0xff);
     const mouse = this.mouse;
+    // 8259、鼠标的状态一变就让 CPU 重新检查中断；没变时 CPU 不用每条指令都问
+    const wake = () => { cpu.irqCheck = true; };
+    pic.onChange = this.pic2.onChange = mouse.onChange = wake;
+    cpu.irqGated = true;
     cpu.irq = {
       pending: () => pic.pending() || mouse.wantsCallback(),
       ack: () => {
@@ -1167,6 +1171,7 @@ export class Machine {
     let p = this.pending;
     if (!p) return 'paused';
     this.serialNext = 0; // 两次运行之间界面可能改了接线、插拔了外设：先照常推进一次串口
+    this.cpu.irqCheck = true; // 同理，中断也重新检查一次
     const cpu = this.cpu;
     if (this.status !== 'running') this.status = p.kind === 'run' ? 'running' : 'paused';
     if (p.kind === 'run') return this.runLoop(budget, untilClock);
