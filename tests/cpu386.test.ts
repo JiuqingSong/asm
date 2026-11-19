@@ -30,9 +30,10 @@ const PM32_SETUP = [
   0xbc, 0x00, 0x00, 0x20, 0x00,             // mov esp, 200000h
 ];
 
-function machine(code32: number[], idt?: (cpu: CPU) => void): CPU {
+function machine(code32: number[], idt?: (cpu: CPU) => void, is486 = false): CPU {
   const c = new CPU();
   c.is386 = true;
+  c.is486 = is486;
   c.setA20(true);
   c.mem.set(GDT, 0x1000);
   c.mem.set([0x27, 0x00, 0x00, 0x10, 0x00, 0x00], 0x1100); // GDTR：界限 27h，基址 1000h
@@ -121,5 +122,32 @@ describe('386 保护模式', () => {
     expect(c.mem[0x10000 + 0x200 * 4] & 0x20).toBe(0x20); // 页目录项：已访问
     expect(c.mem[0x12000] & 0x60).toBe(0x60);   // 页表项：已访问、已写
     expect(c.ip).toBe(0x2105);
+  });
+
+  it('486 的 CR0.WP：内核态写只读页产生缺页（错误码 3）；386 上照样写进去', () => {
+    const run = (is486: boolean) => machine([
+      0xb8, 0x00, 0x00, 0x01, 0x00,             // mov eax, 10000h
+      0x0f, 0x22, 0xd8,                         // mov cr3, eax
+      0x0f, 0x20, 0xc0,                         // mov eax, cr0
+      0x0d, 0x00, 0x00, 0x01, 0x80,             // or eax, 80010000h（PG + WP）
+      0x0f, 0x22, 0xc0,                         // mov cr0, eax
+      0xc7, 0x05, 0x04, 0x00, 0x00, 0x80, 0xbe, 0xba, 0xfe, 0xca, // mov dword [80000004h], CAFEBABEh（只读页）
+      0xf4,
+    ], c => {
+      const w32 = (a: number, v: number) => { for (let k = 0; k < 4; k++) c.mem[a + k] = (v >>> (8 * k)) & 0xff; };
+      w32(0x10000, 0x11000 | 3);
+      w32(0x10000 + 0x200 * 4, 0x12000 | 3);
+      for (let i = 0; i < 1024; i++) w32(0x11000 + i * 4, (i * 0x1000) | 3);
+      w32(0x12000, 0x100000 | 1);                // 只读、内核页
+      c.mem.set([0x00, 0x21, 0x08, 0x00, 0x00, 0x8e, 0x00, 0x00], 0x3000 + 14 * 8);
+      c.mem.set([0x5b, 0x0f, 0x20, 0xd1, 0xf4], 0x2100);
+    }, is486);
+    const c4 = run(true);
+    expect(c4.ip).toBe(0x2105);                 // 进了缺页处理程序
+    expect(c4.r32(BX)).toBe(3);                 // 页存在、写、0 级
+    expect(c4.r32(CX)).toBe(0x80000004);
+    expect(c4.mem[0x100004]).toBe(0);
+    const c3 = run(false);
+    expect(c3.mem[0x100004]).toBe(0xbe);        // 386 不管 WP：写进去了
   });
 });

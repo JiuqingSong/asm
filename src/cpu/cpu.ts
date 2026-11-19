@@ -125,6 +125,12 @@ export class CPU {
   /** 选 386 时为 true（32 位寄存器和指令、分页等） */
   get is386(): boolean { return this.model === 2; }
   set is386(v: boolean) { this.model = v ? 2 : Math.min(this.model, 1); this.modelChanged(); }
+  /**
+   * 选 486 时为 true（在 386 的基础上）：BSWAP、XADD、CMPXCHG、INVLPG、INVD/WBINVD、CPUID 指令；EFLAGS 的 AC 位
+   * （程序靠能不能改它区分 386 和 486）和 ID 位（能改说明有 CPUID）；CR0 的 WP 位（分页时内核态写只读页也产生缺页）。
+   * 没有浮点单元（相当于 486SX），没有对齐检查（AM + AC 时不产生 #AC）
+   */
+  is486 = false;
   /** 正在执行陷阱处理函数（BIOS 的高层模拟） */
   private inTrap = false;
   /** 陷阱处理函数要求等待（如等待按键），CPU 停在陷阱处 */
@@ -269,9 +275,9 @@ export class CPU {
     else if (this.model === 1) this.flags = (v & (this.msw & 1 ? 0x7fd5 : 0x0fd5)) | 0x0002;
     else this.flags = (this.flags & 0xffff0000) | (v & 0x7fd5) | 0x0002;
   }
-  /** 386：写整个 EFLAGS（keep 里的位保持原样）；没有 AC 位（这是 386 和 486 的区别） */
+  /** 386：写整个 EFLAGS（keep 里的位保持原样）；386 没有 AC 位（这是 386 和 486 的区别），486 有 AC 位和 ID 位 */
   private setEflags(v: number, keep = 0): void {
-    const mask = 0x37fd5 & ~keep;
+    const mask = (this.is486 ? 0x277fd5 : 0x37fd5) & ~keep;
     this.flags = ((this.flags & ~mask) | (v & mask) | 0x0002) >>> 0;
   }
   private get iopl(): number { return (this.flags >> 12) & 3; }
@@ -327,6 +333,7 @@ export class CPU {
     let e = this.tlb[page];
     if (e === 0 || (write && !(e & 0x40))) e = this.walk(lin, write, user);
     else if (user && (!(e & 4) || (write && !(e & 2)))) this.pageFault(lin, write, user, true);
+    else if (write && !(e & 2) && this.msw & 0x10000 && this.is486) this.pageFault(lin, write, user, true); // 486 的 CR0.WP
     return ((e & 0xfffff000) | (lin & 0xfff)) >>> 0;
   }
   private walk(lin: number, write: boolean, user: boolean): number {
@@ -340,6 +347,7 @@ export class CPU {
     if (!(pte & 1)) this.pageFault(lin, write, user, false);
     const u = pde & pte & 4, w = pde & pte & 2;
     if (user && (!u || (write && !w))) this.pageFault(lin, write, user, true);
+    if (write && !w && this.msw & 0x10000 && this.is486) this.pageFault(lin, write, user, true); // 486 的 CR0.WP：内核态也不能写只读页
     if (!(pde & 0x20)) wr(pdeA, pde | 0x20);
     const npte = pte | 0x20 | (write ? 0x40 : 0);
     if (npte !== pte) wr(pteA, npte);
@@ -374,6 +382,12 @@ export class CPU {
   get code32(): boolean { return this.cBig[CS] !== 0 && (this.msw & 1) !== 0 && !(this.flags & VM); }
 
   /** 清空 TLB（写 CR3、开关分页、任务切换时） */
+  /** 作废一页的地址转换缓存（INVLPG） */
+  private invalidatePage(lin: number): void {
+    this.tlb[lin >>> 12] = 0; // 还留在"用过的页"列表里，下次整体作废时再清一次也无妨
+    this.fetchKey = -1;
+  }
+
   flushTlb(): void {
     this.fetchKey = -1;
     const t = this.tlb, u = this.tlbUsed;
@@ -1597,6 +1611,11 @@ export class CPU {
           if (this.msw & 1 && !wasPm) this.enterProtected();
           return;
         }
+        if (reg === 7 && this.is486 && this.mod !== 3) { // INVLPG（486）：作废这一页的地址转换缓存
+          this.requireCpl0();
+          this.invalidatePage((this.segBase(this.eaSi) + this.eaOff) >>> 0);
+          return;
+        }
         if (this.mod === 3 || reg === 5 || reg === 7) throw ud();
         const t = reg === 0 || reg === 2 ? this.gdtr : this.idtr;
         const si = this.eaSi;
@@ -1636,6 +1655,7 @@ export class CPU {
         return;
       }
       case 0x05: if (this.model !== 1) throw ud(); this.loadAll(); return;
+      case 0x08: case 0x09: if (!this.is486) throw ud(); this.requireCpl0(); return; // INVD / WBINVD（486）：没有缓存，什么都不用做
       case 0x06: this.requireCpl0(); this.msw &= ~8; return; // CLTS
     }
     if (!is386) throw ud(); // 其余是 386 以后的指令
@@ -1701,6 +1721,42 @@ export class CPU {
       case 0xb7: this.modrm(); this.setReg(os, this.getRM16()); return;                      // MOVZX r, r/m16
       case 0xbe: this.modrm(); this.setReg(os, ((this.getRM8() << 24) >> 24) >>> 0); return;  // MOVSX r, r/m8
       case 0xbf: this.modrm(); this.setReg(os, ((this.getRM16() << 16) >> 16) >>> 0); return; // MOVSX r, r/m16
+      // ---- 486 的新指令 ----
+      case 0xa2: { // CPUID：后期的 486 才有（EFLAGS 的 ID 位能改说明有）
+        if (!this.is486) throw ud();
+        if (this.r32(AX) === 0) { // 最大功能号 1，厂商 "GenuineIntel"
+          this.setR32(AX, 1); this.setR32(BX, 0x756e6547); this.setR32(DX, 0x49656e69); this.setR32(CX, 0x6c65746e);
+        } else if (this.r32(AX) === 1) { // 家族 4、型号 8（486DX4）；没有浮点单元等特性
+          this.setR32(AX, 0x0480); this.setR32(BX, 0); this.setR32(CX, 0); this.setR32(DX, 0);
+        } else { this.setR32(AX, 0); this.setR32(BX, 0); this.setR32(CX, 0); this.setR32(DX, 0); }
+        return;
+      }
+      case 0xb0: case 0xb1: { // CMPXCHG r/m, r：累加器等于目标时目标 = 源（ZF=1），否则累加器 = 目标（ZF=0）；标志和 CMP 一样
+        if (!this.is486) throw ud();
+        this.modrm();
+        const size = op2 === 0xb0 ? 1 : os;
+        const dst = this.getRM(size), acc = this.getRegN(size, AX);
+        this.alu(7, acc, dst, size);
+        if (this.flags & ZF) this.setRM(size, this.getReg(size));
+        else { this.setRM(size, dst); this.setRegN(size, AX, dst); } // 不相等时真的 486 也会把原值写回目标
+        return;
+      }
+      case 0xc0: case 0xc1: { // XADD r/m, r：源 = 目标，目标 = 两者之和
+        if (!this.is486) throw ud();
+        this.modrm();
+        const size = op2 === 0xc0 ? 1 : os;
+        const dst = this.getRM(size), src = this.getReg(size);
+        const sum = this.alu(0, dst, src, size);
+        this.setReg(size, dst);
+        this.setRM(size, sum);
+        return;
+      }
+      case 0xc8: case 0xc9: case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf: { // BSWAP r32
+        if (!this.is486) throw ud();
+        const v = this.r32(op2 & 7);
+        this.setR32(op2 & 7, (((v & 0xff) << 24) | ((v & 0xff00) << 8) | ((v >>> 8) & 0xff00) | (v >>> 24)) >>> 0);
+        return;
+      }
       case 0xbc: case 0xbd: { // BSF / BSR
         this.modrm();
         const v = this.getRM(os);

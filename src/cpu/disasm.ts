@@ -167,8 +167,9 @@ export function disassemble(read: ReadByte, start: number, cpu: boolean | Disasm
         const op2 = next();
         if (op2 === 0x01) {
           modrm();
-          const names = ['SGDT', 'SIDT', 'LGDT', 'LIDT', 'SMSW', '', 'LMSW', ''];
-          if (!names[reg] || (reg < 4 && mod === 3)) break;
+          const names = ['SGDT', 'SIDT', 'LGDT', 'LIDT', 'SMSW', '', 'LMSW', is386 ? 'INVLPG' : ''];
+          if (!names[reg] || ((reg < 4 || reg === 7) && mod === 3)) break;
+          if (reg === 7) return finish('INVLPG', [memText]);
           return finish(names[reg], [reg >= 4 ? rm16(false) : memText]);
         }
         if (op2 === 0x00) {
@@ -232,6 +233,13 @@ export function disassemble(read: ReadByte, start: number, cpu: boolean | Disasm
       case 0xb6: case 0xbe: modrm(); return finish(op2 === 0xb6 ? 'MOVZX' : 'MOVSX', [RW[reg], rmOp(false, true)]);
       case 0xb7: case 0xbf: modrm(); return finish(op2 === 0xb7 ? 'MOVZX' : 'MOVSX', [RW[reg], rm16(true)]);
       case 0xbc: case 0xbd: modrm(); return finish(op2 === 0xbc ? 'BSF' : 'BSR', [RW[reg], rmOp(true, false)]);
+      // 486
+      case 0x08: return finish('INVD', []);
+      case 0x09: return finish('WBINVD', []);
+      case 0xa2: return finish('CPUID', []);
+      case 0xb0: case 0xb1: modrm(); return finish('CMPXCHG', [rmOp(op2 === 0xb1, false), regOp(op2 === 0xb1)]);
+      case 0xc0: case 0xc1: modrm(); return finish('XADD', [rmOp(op2 === 0xc1, false), regOp(op2 === 0xc1)]);
+      case 0xc8: case 0xc9: case 0xca: case 0xcb: case 0xcc: case 0xcd: case 0xce: case 0xcf: return finish('BSWAP', [R32[op2 & 7]]);
     }
     return null;
   }

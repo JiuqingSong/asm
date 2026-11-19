@@ -20,6 +20,7 @@ export const CPU_SPEEDS = [
   { id: '8088', name: '8088 4.77MHz', clocks: 3.6, is286: false },
   { id: '286', name: '286 12MHz', clocks: 1.0, is286: true },
   { id: '386', name: '386 33MHz', clocks: 0.25, is286: true },
+  { id: '486', name: '486 66MHz', clocks: 0.06, is286: true },
 ] as const;
 export type CpuSpeedId = (typeof CPU_SPEEDS)[number]['id'];
 
@@ -196,7 +197,8 @@ export class Machine {
     this.cpuModel = id;
     this.clocksPerInstr = s.clocks;
     this.cpu.is286 = s.is286;
-    this.cpu.is386 = id === '386';
+    this.cpu.is386 = id === '386' || id === '486';
+    this.cpu.is486 = id === '486';
     this.cpu.setFlags(this.cpu.flags); // 位 12-15：8086 为 1，286 为 0
   }
   com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => (on ? this.pic.raise(4) : this.pic.lower(4)));
