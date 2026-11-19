@@ -591,6 +591,13 @@ export class Machine {
     this.breakpoints.clear();
   }
 
+  /** 打开/关闭历史记录（"后退"用）。切换时清空已有记录：中间没记录的那一段无法后退，留着旧记录会退到错误的状态 */
+  setHistory(on: boolean): void {
+    if (this.history.enabled === on) return;
+    this.history.enabled = on;
+    this.history.clear();
+  }
+
   /** 装载程序；name 是程序文件名（写进环境变量块，程序可以由此知道自己的路径） */
   load(program: Program, cmdline = '', name = 'PROGRAM.EXE'): void {
     const cpu = this.cpu, mem = this.mem;

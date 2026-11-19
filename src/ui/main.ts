@@ -55,6 +55,8 @@ interface Session {
   binModel: monaco.editor.ITextModel | null;
   /** 在反汇编面板上按地址设的断点（线性地址） */
   addrBps: Set<number>;
+  /** 记录历史（可以后退）：从磁盘启动时默认关闭（为了速度），运行源程序、EXE 时默认打开；双机模式下总是不记录 */
+  record: boolean;
 }
 
 class App {
@@ -91,7 +93,7 @@ class App {
       const s: Session = {
         i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model: this.editor.createModel(''), program: null, dirty: true,
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
-        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(),
+        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(), record: true,
       };
       s.screen.onKey = e => this.key(s, e);
       s.screen.onMouseRel = (dx, dy, buttons) => {
@@ -217,6 +219,13 @@ class App {
     $('btn-over').onclick = () => this.step(true);
     $('btn-out').onclick = () => this.step('out');
     $('btn-back').onclick = () => this.back();
+    $<HTMLInputElement>('record-history').onchange = e => {
+      const s = this.cur;
+      s.record = (e.target as HTMLInputElement).checked;
+      this.applyHistory(s);
+      this.setStatus(s.record ? '开始记录历史：从现在起可以后退' : '不再记录历史（运行更快），不能后退', '');
+      this.updateButtons();
+    };
     $('btn-reset').onclick = () => this.restart();
     $('btn-power').onclick = () => this.powerOff();
     $('btn-cad').onclick = () => {
@@ -330,7 +339,7 @@ class App {
     for (const s of this.sessions) {
       s.box.querySelector('.screen-title')!.textContent = dual ? `${s.tag} 机屏幕` : 'DOS 屏幕';
       s.box.querySelector('.screen-hint')?.classList.toggle('hidden', dual);
-      s.m.history.enabled = !dual;
+      this.applyHistory(s);
     }
     if (!dual && this.active !== 0) this.setActive(0);
     else for (const s of this.sessions) s.box.classList.toggle('active', dual && s.i === this.active);
@@ -491,6 +500,8 @@ class App {
     this.editor.setText(s.binModel, text);
     s.binary = `[${driveName(drive)} 启动]`;
     s.program = bootProgram(drive);
+    s.record = false;
+    this.applyHistory(s);
     s.dirty = false;
     if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
     this.renderTabs();
@@ -535,6 +546,8 @@ class App {
     this.editor.setText(s.binModel, text);
     s.binary = name;
     s.program = program;
+    s.record = true;
+    this.applyHistory(s);
     s.dirty = false;
     if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
     this.renderTabs();
@@ -695,6 +708,8 @@ class App {
       return false;
     }
     s.program = p;
+    s.record = true;
+    this.applyHistory(s);
     const warns = p.diagnostics.filter(d => d.severity === 'warning').length;
     const size = p.chunks.reduce((n, c) => n + c.bytes.length, 0);
     this.addMessage('ok', `${who}汇编成功：${p.format.toUpperCase()} 程序，${size} 字节${warns ? `，${warns} 个警告` : ''}`, s.i);
@@ -1014,8 +1029,14 @@ class App {
     s.className = 'status ' + cls;
   }
 
+  /** 按会话的设置和单机/双机模式打开或关闭历史记录 */
+  private applyHistory(s: Session): void { s.m.setHistory(s.record && this.mode !== 'dual'); }
+
   private updateButtons(): void {
     const running = this.run !== 'idle';
+    const rec = $<HTMLInputElement>('record-history');
+    rec.checked = this.cur.record && this.mode !== 'dual';
+    rec.disabled = this.mode === 'dual';
     $<HTMLButtonElement>('btn-run').disabled = running;
     $<HTMLButtonElement>('btn-pause').disabled = !running && !this.live.some(s => s.m.status === 'waiting');
     $<HTMLButtonElement>('btn-back').disabled = running || this.mode === 'dual' || !this.cur.m.canStepBack;
@@ -1214,3 +1235,4 @@ if (import.meta.env.DEV) (window as unknown as { __app: App }).__app = app;
 
 const brand = document.querySelector('.brand') as HTMLElement;
 brand.title = `AsmPerfect 86 版本 ${import.meta.env.VITE_APP_VERSION ?? '开发版'}`;
+$('version').textContent = import.meta.env.VITE_APP_VERSION ? 'v' + import.meta.env.VITE_APP_VERSION : '开发版';

@@ -9,7 +9,7 @@
 <body>
   <div id="app">
     <header class="toolbar">
-      <div class="brand">AsmPerfect <span>86</span></div>
+      <div class="brand">AsmPerfect <span>86</span> <small id="version" class="version"></small></div>
       <div class="group">
         <select id="examples" title="打开示例程序">
           <option value="">示例程序…</option>
@@ -38,6 +38,7 @@
         </select>
       </div>
       <div class="group">
+        <label class="check" title="记录每条指令执行前的状态，才能后退。从磁盘启动时默认不记录（记录要多花约 20% 的时间）；随时可以勾上，从勾上那一刻开始记录"><input type="checkbox" id="record-history" /> 记录</label>
         <button id="btn-back" title="后退一步 (Ctrl+Shift+F11)">⟲ 后退</button>
         <button id="btn-step" title="单步进入 (F11)">↓ 单步</button>
         <button id="btn-over" title="单步跳过：CALL / INT / LOOP 整体执行 (F10)">↷ 跳过</button>

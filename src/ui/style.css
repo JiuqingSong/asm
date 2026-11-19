@@ -69,6 +69,7 @@ body { background: var(--bg); color: var(--text); font: 13px/1.4 var(--ui); over
 }
 .brand { font-weight: 700; font-size: 15px; letter-spacing: 0.2px; margin-right: 4px; white-space: nowrap; }
 .brand span { color: var(--accent); }
+.brand .version { font-weight: 400; font-size: 11px; color: var(--muted, #888); letter-spacing: 0; }
 .group { display: flex; align-items: center; gap: 4px; padding-left: 10px; border-left: 1px solid var(--border); }
 .group:first-of-type { border-left: none; padding-left: 0; }
 button, select, input {
