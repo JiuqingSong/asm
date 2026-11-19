@@ -140,6 +140,7 @@ export class Hle {
       case 0x70: case 0x71: case 0x72: case 0x73: case 0x76: case 0x77: // 74h、75h 是鼠标桩代码用的陷阱号
         // IRQ8~15：给从片和主片都发 EOI；IRQ8 是实时钟，读寄存器 C 清掉中断标志
         if (n === 0x70) this.m.rtcAck();
+        if (n === 0x76) this.cpu.wb(BDA, 0x8e, 0xff); // IRQ14（硬盘）：和 AT BIOS 一样在 40:8E 记下"硬盘中断来过"
         this.m.pic2.out8(0x20, 0x20);
         this.m.pic.out8(0x20, 0x20);
         return true;

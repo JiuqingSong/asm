@@ -2,6 +2,7 @@
 import { CPU, CS, DS, ES, SS, SP, DX, AX, BX, CX, BP, SI, DI, IF, BIOS_SEG, TRAP_OPCODE, type IOBus } from '../cpu/cpu.ts';
 import { Disk } from './disk.ts';
 import { FloppyController } from './fdc.ts';
+import { IdeChannel } from './ide.ts';
 import { SerialMouse } from './serial-mouse.ts';
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, DMA, Keyboard, type KeyEvent } from './devices.ts';
@@ -132,6 +133,12 @@ export class Machine {
   dma = new DMA();
   /** IDE 第二通道上的 ATAPI 光驱（IRQ15） */
   cdrom = new AtapiCdrom(() => this.pic2.raise(7));
+  /** IDE 第一通道上的 ATA 硬盘（IRQ14）：C: 主盘、D: 从盘，给 Windows 95 的 32 位磁盘驱动用；DOS 经 INT 13h 读写 */
+  ide = new IdeChannel({
+    disk: u => this.drives[2 + u],
+    irq: () => this.pic2.raise(6),
+    written: () => this.disksChanged(),
+  });
   /** 软驱控制器（端口 3F0h~3F7h，IRQ6，DMA 2 号通道）：给 Windows 95 这样自己操作软驱的系统用；DOS 经 INT 13h 读写 */
   fdc = new FloppyController({
     disk: d => this.drives[d],
@@ -279,12 +286,13 @@ export class Machine {
         }
         if (DMA.owns(port)) return this.dma.in8(port);
         if (AtapiCdrom.owns(port)) return this.cdrom.in8(port);
+        if (IdeChannel.owns(port)) return this.ide.in8(port);
         this.unknownPort(port, '读');
         return 0xff;
       },
-      wide: (port) => port === 0x170,
-      in16: () => this.cdrom.in16(),
-      out16: (_port, v) => this.cdrom.out16(v),
+      wide: (port) => port === 0x170 || port === 0x1f0,
+      in16: port => (port === 0x1f0 ? this.ide.in16() : this.cdrom.in16()),
+      out16: (port, v) => { if (port === 0x1f0) this.ide.out16(v); else this.cdrom.out16(v); },
       out8: (port, v) => {
         if (port >= 0x3f8 && port <= 0x3ff) { this.com1.out8(port - 0x3f8, v); return; }
         if (port >= 0x2f8 && port <= 0x2ff) { this.com2.out8(port - 0x2f8, v); return; }
@@ -342,6 +350,7 @@ export class Machine {
         }
         if (DMA.owns(port)) { this.dma.out8(port, v); return; }
         if (AtapiCdrom.owns(port)) { this.cdrom.out8(port, v); return; }
+        if (IdeChannel.owns(port)) { this.ide.out8(port, v); return; }
         this.unknownPort(port, '写');
       },
     };
@@ -412,6 +421,21 @@ export class Machine {
     c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
     const ext = this.cpu.is286 ? 15360 : 0;
     c[0x17] = c[0x30] = ext & 0xff; c[0x18] = c[0x31] = ext >> 8;
+    // 硬盘类型：12h 的高、低 4 位是 C:、D:，Fh 表示看 19h/1Ah 的扩展类型；47 = 用户自定义，参数在 1Bh~23h、24h~2Ch
+    for (const k of [0, 1]) {
+      const d = this.drives[2 + k];
+      if (!d) continue;
+      c[0x12] |= k ? 0x0f : 0xf0;
+      c[0x19 + k] = 47;
+      const p = k ? 0x24 : 0x1b, cyl = d.geo.cylinders;
+      c[p] = cyl & 0xff; c[p + 1] = cyl >> 8; c[p + 2] = d.geo.heads;
+      c[p + 3] = 0xff; c[p + 4] = 0xff;                       // 写预补偿：没有
+      c[p + 5] = cyl & 0xff; c[p + 6] = cyl >> 8; c[p + 7] = d.geo.sectors; // 着陆区、每道扇区数
+    }
+    // 10h~2Dh 的校验和（2Eh 高字节、2Fh 低字节）
+    let sum = 0;
+    for (let k = 0x10; k <= 0x2d; k++) sum += c[k];
+    c[0x2e] = (sum >> 8) & 0xff; c[0x2f] = sum & 0xff;
   }
 
   /**
@@ -599,6 +623,7 @@ export class Machine {
     this.pic2.reset(0x70, 0xff);
     this.dma.reset();
     this.cdrom.reset();
+    this.ide.reset();
     this.fdc.reset();
     this.rtcFlags = 0;
     this.pit.reload = [0x10000, 0x10000, 0x10000];
@@ -819,6 +844,7 @@ export class Machine {
     this.pit.advance(dt);
     if (this.clock >= this.rtcNext) this.rtcEvent();
     if (this.cdrom.pending) this.cdrom.poll();
+    if (this.ide.pending) this.ide.poll();
     if (this.clock >= this.fdc.next) this.fdc.tick();
     this.com1.tick(this.clock);
     this.com2.tick(this.clock);
