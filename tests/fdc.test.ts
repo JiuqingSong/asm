@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { Machine } from '../src/machine/machine.ts';
 import { Disk } from '../src/machine/disk.ts';
+import { bootProgram } from '../src/machine/boot.ts';
 
 // 像 Windows 95 的 HSFLOP、Linux 的 floppy 驱动那样经端口操作软驱控制器，数据经 DMA 2 号通道
 
@@ -14,7 +15,13 @@ function machine(): Machine {
   const m = new Machine();
   m.setCpu('386');
   m.drives[0] = new Disk('A.IMG', floppy(), true);
-  m.mem[0x410] = 0x01; // 一个软驱
+  return m;
+}
+
+function boot(): Machine {
+  const m = machine();
+  m.drives[0]!.data.set([0x55, 0xaa], 510);
+  m.load(bootProgram(0));
   return m;
 }
 
@@ -75,6 +82,65 @@ function seek(m: Machine, cyl: number, head = 0): void {
 }
 
 describe('软驱控制器（82077）', () => {
+  it('B: 空着启动也报告两个软驱，插拔介质不改变 BIOS 和 CMOS 的设备配置', () => {
+    const m = boot();
+    for (const disk of [null, new Disk('B.IMG', floppy(), true), null]) {
+      m.drives[1] = disk;
+      m.hle.handle(0x11);
+      expect(m.cpu.r[0] & 0xc1).toBe(0x41);
+      for (const drive of [0, 1]) {
+        m.cpu.r[0] = 0x0800;
+        m.cpu.r[2] = drive;
+        m.hle.handle(0x13);
+        expect(m.cpu.r[0] >> 8).toBe(0);
+        expect(m.cpu.r[2] & 0xff).toBe(2);
+      }
+      const io = m.cpu.io;
+      io.out8(0x70, 0x10);
+      expect(io.in8(0x71)).toBe(0x44);
+      io.out8(0x70, 0x14);
+      expect(io.in8(0x71) & 0xc1).toBe(0x41);
+      m.cpu.r[0] = 0x0201;
+      m.cpu.r[1] = 1;
+      m.cpu.r[2] = 1;
+      m.cpu.r[3] = 0x5000;
+      m.cpu.s[0] = 0;
+      m.hle.handle(0x13);
+      expect(m.cpu.r[0] >> 8).toBe(disk ? 0 : 0x80);
+      if (disk) expect(m.mem.subarray(0x5000, 0x5200)).toEqual(disk.data.subarray(0, 512));
+    }
+  });
+
+  it('B: 空着启动后可插盘、换盘并经 DMA 读写，取出介质后软驱仍能寻道', () => {
+    const m = boot(), io = m.cpu.io;
+    resetFdc(m);
+    io.out8(0x3f2, 0x2d);
+    for (const disk of [null, new Disk('B1.IMG', floppy(), true), new Disk('B2.IMG', floppy(), true), null]) {
+      m.drives[1] = disk;
+      expect(io.in8(0x3f7) & 0x80).toBe(0x80);
+      cmd(m, [0x0f, 1, 0]);
+      wait(m);
+      expect(irqCount(m)).toBe(true);
+      cmd(m, [0x08]);
+      expect(results(m)).toEqual([0x21, 0]);
+      expect(io.in8(0x3f7) & 0x80).toBe(disk ? 0 : 0x80);
+      if (!disk) continue;
+      disk.data[0] = disk.name === 'B1.IMG' ? 0x11 : 0x22;
+      dma(m, 0x46, 0x5000, 512);
+      cmd(m, [0x46, 1, 0, 0, 1, 2, 18, 0x1b, 0xff]);
+      wait(m);
+      expect(results(m)).toEqual([1, 0, 0, 0, 0, 2, 2]);
+      expect(m.mem.subarray(0x5000, 0x5200)).toEqual(disk.data.subarray(0, 512));
+      m.mem.fill(0x5a, 0x5000, 0x5200);
+      dma(m, 0x4a, 0x5000, 512);
+      cmd(m, [0x45, 1, 0, 0, 1, 2, 18, 0x1b, 0xff]);
+      wait(m);
+      expect(results(m)).toEqual([1, 0, 0, 0, 0, 2, 2]);
+      expect(disk.data.subarray(0, 512)).toEqual(m.mem.subarray(0x5000, 0x5200));
+      expect(disk.dirty).toBe(true);
+    }
+  });
+
   it('复位后有 4 个"就绪变化"中断；VERSION 返回 90h；没有中断时 SENSE INTERRUPT 返回无效', () => {
     const m = machine();
     resetFdc(m);

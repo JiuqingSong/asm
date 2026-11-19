@@ -28,7 +28,7 @@ type Phase = 'command' | 'exec' | 'pioIn' | 'pioOut' | 'result';
 export interface FdcHost {
   /** 0、1 号驱动器里的软盘（没有盘时为 null） */
   disk(drive: number): Disk | null;
-  /** 驱动器存在（A: 总是有；B: 看设备配置） */
+  /** 驱动器存在（A:、B: 固定安装，与是否插盘无关） */
   driveExists(drive: number): boolean;
   /** 现在的虚拟时间（PIT 时钟） */
   now(): number;

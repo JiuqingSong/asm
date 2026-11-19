@@ -177,7 +177,7 @@ export class Machine {
   /** 软驱控制器（端口 3F0h~3F7h，IRQ6，DMA 2 号通道）：给 Windows 95 这样自己操作软驱的系统用；DOS 经 INT 13h 读写 */
   fdc = new FloppyController({
     disk: d => this.driveFor(d),
-    driveExists: d => d === 0 || (d === 1 && (this.mem[0x410] & 0xc1) === 0x41),
+    driveExists: d => d === 0 || d === 1,
     now: () => this.clock,
     irq: () => this.pic.raise(6),
     dma: data => (this.dma.ready(2) ? this.dma.transfer(2, data, this.cpu) : null), // 方向由通道的模式决定（和真机一样）
@@ -475,8 +475,8 @@ export class Machine {
     const c = this.cmos;
     c.fill(0);
     c[0x0a] = 0x26; c[0x0b] = 0x02;        // 实时钟：32768Hz 晶振、1024Hz 周期；24 小时制，周期中断关闭
-    c[0x10] = 0x40 | (this.driveFor(1) ? 0x04 : 0); // A:（和有盘时的 B:）是 1.44MB 软驱
-    c[0x14] = 0x01 | (this.driveFor(1) ? 0x40 : 0); // 设备字节
+    c[0x10] = 0x44;                       // A:、B: 固定为两台 1.44MB 软驱，与是否插盘无关
+    c[0x14] = 0x41;                       // 设备字节：两个软驱
     c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
     const ext = this.cpu.is286 ? 15360 : 0;
     c[0x17] = c[0x30] = ext & 0xff; c[0x18] = c[0x31] = ext >> 8;
@@ -677,8 +677,7 @@ export class Machine {
     const bda = 0x400;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
     // 设备字：位 0 有软驱，位 6~7 软驱数 − 1，位 4~5 = 00 表示 EGA/VGA（显卡有自己的 BIOS）
-    const floppies = this.driveFor(1) ? 2 : 1;
-    w16(bda + 0x10, 0x0001 | ((floppies - 1) << 6));
+    w16(bda + 0x10, 0x0041); // 固定安装 A:、B:，插拔介质不改变软驱数量
     // EGA/VGA 的信息：87h 显存 256KB、显示器是彩色的；88h 开关设置；89h VGA 的模式设置选项
     mem[bda + 0x87] = 0x60; mem[bda + 0x88] = 0x09; mem[bda + 0x89] = 0x11; mem[bda + 0x8a] = 0x0b;
     // 显卡 BIOS 的 ROM：C000:0000 起是 55AAh 标志和长度（32KB），程序据此判断有 EGA/VGA 显卡
