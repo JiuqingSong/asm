@@ -169,6 +169,13 @@ export class CPU {
   cBig = new Uint8Array(6);
   /** 保护模式下装入了空选择子（不能用来访问内存） */
   cNull = new Uint8Array(6);
+  /**
+   * 每个段"普通读 / 普通写"不用细查就能放行的最大偏移（-1 表示每次都要细查）。只由这个段的界限、属性、空选择子决定，
+   * 和 CPU 处在什么模式无关：空选择子、向下扩展、只能执行（读）、代码段或只读（写）一律细查，所以在任何模式下放行都是对的。
+   * 改了 cLimit / cAccess / cNull 之后要调用 segFast(i)
+   */
+  private rdMax = new Float64Array([0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff]);
+  private wrMax = new Float64Array([0xffff, -1, 0xffff, 0xffff, 0xffff, 0xffff]);
   /** 实模式下基址不是 段值 × 16 的段（LOADALL 设置的，或者 386 从保护模式回来后还没重新装入的），按位表示 */
   private overrideMask = 0;
   /** 当前特权级（保护模式下等于 CS 的 RPL；虚拟 8086 模式下是 3） */
@@ -234,6 +241,7 @@ export class CPU {
     this.cAccess.set([0x93, 0x9b, 0x93, 0x93, 0x93, 0x93]);
     this.cBig.fill(0);
     this.cNull.fill(0);
+    this.allSegFast();
     this.overrideMask = 0;
     this.cpl = 0;
     this.flags &= 0xffff;
@@ -477,6 +485,21 @@ export class CPU {
 
   /** 检查对段 i 的访问：保护模式下查空选择子、读写权限；286 保护模式和 386 查界限 */
   private check(i: number, off: number, size: number, write: boolean): void {
+    // 绝大多数访问在这里就放行；这个函数很小，V8 能把它内联进每个读写函数
+    if (off + size - 1 <= (write ? this.wrMax[i] : this.rdMax[i])) return;
+    this.checkFull(i, off, size, write);
+  }
+
+  /** 重新计算段 i 的快速界限（见 rdMax） */
+  private segFast(i: number): void {
+    const acc = this.cAccess[i], lim = this.cLimit[i];
+    const slow = this.cNull[i] !== 0 || (acc & 0x0c) === 0x04;
+    this.rdMax[i] = slow || (acc & 0x0a) === 0x08 ? -1 : lim;
+    this.wrMax[i] = slow || (acc & 8) !== 0 || !(acc & 2) ? -1 : lim;
+  }
+  private allSegFast(): void { for (let i = 0; i < 6; i++) this.segFast(i); }
+
+  private checkFull(i: number, off: number, size: number, write: boolean): void {
     const fault = i === SS ? ssf : gp;
     if (this.msw & 1 && !(this.flags & VM)) {
       if (this.cNull[i]) throw fault(0);
@@ -710,6 +733,7 @@ export class CPU {
     this.cAccess[i] = d.access;
     this.cBig[i] = d.big;
     this.cNull[i] = 0;
+    this.segFast(i);
   }
 
   /** 装入数据段寄存器和 SS（MOV、POP、LES/LDS 等） */
@@ -719,7 +743,7 @@ export class CPU {
       this.s[i] = sel;
       this.cBase[i] = sel << 4;
       this.overrideMask &= ~(1 << i);
-      if (this.flags & VM) { this.cLimit[i] = 0xffff; this.cAccess[i] = 0xf3; this.cBig[i] = 0; this.cNull[i] = 0; }
+      if (this.flags & VM) { this.cLimit[i] = 0xffff; this.cAccess[i] = 0xf3; this.cBig[i] = 0; this.cNull[i] = 0; this.segFast(i); }
       return;
     }
     if (i === CS) throw ud(); // 不能用 MOV/POP 装入 CS
@@ -727,6 +751,7 @@ export class CPU {
     if ((sel & 0xfffc) === 0) {
       if (i === SS) throw gp(0);
       this.s[i] = sel; this.cNull[i] = 1; this.cBase[i] = 0; this.cLimit[i] = 0;
+      this.segFast(i);
       return;
     }
     const d = this.desc(sel);
@@ -749,7 +774,7 @@ export class CPU {
   /** 实模式、虚拟 8086 模式下装入 CS（远转移、中断） */
   private loadCSReal(sel: number): void {
     this.s[CS] = sel; this.cBase[CS] = sel << 4; this.overrideMask &= ~2;
-    if (this.flags & VM) { this.cLimit[CS] = 0xffff; this.cBig[CS] = 0; }
+    if (this.flags & VM) { this.cLimit[CS] = 0xffff; this.cBig[CS] = 0; this.segFast(CS); }
   }
 
   /** 检查并返回一个可以转移到的代码段描述符（JMP/CALL/RET/IRET 共用的部分） */
@@ -772,7 +797,7 @@ export class CPU {
       if (this.cNull[i]) continue;
       const acc = this.cAccess[i], dpl = (acc >> 5) & 3;
       const conformingCode = (acc & 0x0c) === 0x0c && acc & 0x08;
-      if (!conformingCode && dpl < this.cpl) { this.s[i] = 0; this.cNull[i] = 1; }
+      if (!conformingCode && dpl < this.cpl) { this.s[i] = 0; this.cNull[i] = 1; this.segFast(i); }
     }
   }
 
@@ -1155,7 +1180,7 @@ export class CPU {
       this.pushN(oldSS, size); this.pushN(oldSP, size);
       this.pushN(flags, size); this.pushN(this.s[CS], size); this.pushN(this.ip, size);
       if (code >= 0) this.pushN(code, size);
-      for (const i of [GS, FS, DS, ES]) { this.s[i] = 0; this.cNull[i] = 1; }
+      for (const i of [GS, FS, DS, ES]) { this.s[i] = 0; this.cNull[i] = 1; this.segFast(i); }
       this.loadCS(gsel, t, 0);
     } else if (!(t.access & 0x04) && tdpl < this.cpl) {
       const oldSS = this.s[SS], oldSP = this.getSP();
@@ -1911,6 +1936,7 @@ export class CPU {
     this.overrideMask = 0;
     for (let i = 0; i < 6; i++) if (this.cBase[i] !== this.s[i] << 4) this.overrideMask |= 1 << i;
     this.cNull.fill(0);
+    this.allSegFast();
     this.cpl = 0;
   }
 
@@ -1934,7 +1960,7 @@ export class CPU {
     const order = [[ES, 0x836], [CS, 0x83c], [SS, 0x842], [DS, 0x848]];
     for (const [i, a] of order) {
       const c = cache(a);
-      this.cBase[i] = c.base; this.cLimit[i] = c.limit; this.cAccess[i] = c.access; this.cNull[i] = 0;
+      this.cBase[i] = c.base; this.cLimit[i] = c.limit; this.cAccess[i] = c.access; this.cNull[i] = 0; this.segFast(i);
     }
     const g = cache(0x84e); this.gdtr = { base: g.base, limit: g.limit };
     const l = cache(0x854); this.ldtr.base = l.base; this.ldtr.limit = l.limit;

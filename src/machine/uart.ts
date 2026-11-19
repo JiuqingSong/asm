@@ -67,6 +67,8 @@ export class UART {
   private txQueue: number[] = [];
 
   peer: SerialPeer | null = null;
+  /** 程序读写了这个串口的寄存器（机器据此知道串口可能有新的事要做，见 Machine.serialNext） */
+  touched = false;
   stats: SerialStats = { txBytes: 0, rxBytes: 0, overruns: 0, thrOverwrites: 0, framingErrors: 0 };
   /** 最近的事件（供界面显示） */
   events: SerialEvent[] = [];
@@ -127,6 +129,7 @@ export class UART {
 
   // ---------- 端口 ----------
   in8(off: number): number {
+    this.touched = true;
     const dlab = (this.lcr & 0x80) !== 0;
     let v = 0;
     switch (off) {
@@ -157,6 +160,7 @@ export class UART {
   }
 
   out8(off: number, v: number): void {
+    this.touched = true;
     const dlab = (this.lcr & 0x80) !== 0;
     switch (off) {
       case 0:

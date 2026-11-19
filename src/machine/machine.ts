@@ -200,6 +200,11 @@ export class Machine {
   diskLatency = true;
   /** DOS 正在"等磁盘"（陷阱处忙等，不是在等键盘） */
   busy = false;
+  /** 下一次需要推进串口和鼠标的虚拟时间，以及上次推进时鼠标的移动量和按键（见 devicesAfterClock） */
+  private serialNext = 0;
+  private serialDx = 0;
+  private serialDy = 0;
+  private serialBtn = 0;
 
   /** 选择 CPU 型号：决定速度和指令集（8088、80286、80386） */
   setCpu(id: CpuSpeedId): void {
@@ -911,40 +916,84 @@ export class Machine {
     return false;
   }
 
-  /** 执行一条 CPU 指令（含历史记录与设备时钟） */
+  /**
+   * 执行一条 CPU 指令（含历史记录与设备时钟）。
+   * 每条指令都走这里：不常用的分支（停机、历史记录、等磁盘）放在单独的函数里，
+   * 这样这个函数很小，V8 能把它和 cpu.step()、advanceTime() 一起内联进运行循环
+   */
   private exec1(): void {
     const cpu = this.cpu;
-    if (this.history.enabled) {
-      const visible = !this.inBios() && !cpu.repContinue && !cpu.waiting;
-      this.history.begin(cpu, visible ? H_VISIBLE : 0);
-    }
-    if (cpu.halted) {
-      // HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据
-      const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), Math.ceil(this.fdc.next - this.clock), Math.ceil(this.ide.next - this.clock)));
-      this.advanceTime(dt);
-      this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
-      cpu.step();
-      return;
-    }
+    if (this.history.enabled) this.recordHistory();
+    if (cpu.halted) { this.execHalted(); return; }
     cpu.step();
     this.instructions++;
-    // 等磁盘时一次多走一点时间（仍然足够细，能及时响应中断）
-    this.advanceTime(this.busy ? Math.max(this.clocksPerInstr, Math.min(this.hle.busyRemaining(), 32)) : this.clocksPerInstr);
+    if (this.busy) this.advanceTime(this.busyClocks()); else this.advanceInstr();
     this.kbd.tick(1);
   }
+
+  private recordHistory(): void {
+    const cpu = this.cpu;
+    const visible = !this.inBios() && !cpu.repContinue && !cpu.waiting;
+    this.history.begin(cpu, visible ? H_VISIBLE : 0);
+  }
+
+  /** HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据 */
+  private execHalted(): void {
+    const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), Math.ceil(this.fdc.next - this.clock), Math.ceil(this.ide.next - this.clock)));
+    this.advanceTime(dt);
+    this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
+    this.cpu.step();
+  }
+
+  /** 等磁盘时一次多走一点时间（仍然足够细，能及时响应中断） */
+  private busyClocks(): number { return Math.max(this.clocksPerInstr, Math.min(this.hle.busyRemaining(), 32)); }
 
   /** 推进虚拟时间：定时器、串口 */
   private advanceTime(dt: number): void {
     this.clock += dt;
     this.pit.advance(dt);
+    this.devicesAfterClock();
+  }
+
+  /**
+   * 普通指令走完后推进时间（和 advanceTime(clocksPerInstr) 一样）。
+   * 不带参数：虚拟时间是小数，作为参数传给没有被内联的函数时 V8 每次都要在堆上分配一个数，这里每条指令都走
+   */
+  private advanceInstr(): void {
+    const dt = this.clocksPerInstr;
+    this.clock += dt;
+    this.pit.advance(dt);
+    this.devicesAfterClock();
+  }
+
+  private devicesAfterClock(): void {
     if (this.clock >= this.rtcNext) this.rtcEvent();
+    if (this.cdrom.pending || this.ide.pending || this.clock >= this.ide.next || this.clock >= this.fdc.next) this.diskTick();
+    // 串口、鼠标：没到下一个事件、鼠标没动、程序没碰串口寄存器时，推进它们什么也不会发生，就跳过
+    const m = this.mouse;
+    if (this.clock >= this.serialNext || this.com1.touched || this.com2.touched || m.rawDx !== this.serialDx || m.rawDy !== this.serialDy || m.buttons !== this.serialBtn) this.tickSerial();
+  }
+
+  /** 推进串口和鼠标，再算出下一次需要推进的时间 */
+  private tickSerial(): void {
+    this.com1.tick(this.clock);
+    this.com2.tick(this.clock);
+    this.mouse.tick(this.clock);
+    this.com1.touched = this.com2.touched = false;
+    const m = this.mouse;
+    this.serialDx = m.rawDx; this.serialDy = m.rawDy; this.serialBtn = m.buttons;
+    const sm = this.serialMouse, p1 = this.com1.peer, p2 = this.com2.peer;
+    // 双机串口线、别的外设、排队的按键、鼠标还有要发的移动：每条指令都推进（和以前一样）
+    if (this.link || (p1 !== null && p1 !== sm) || (p2 !== null && p2 !== sm) || m.queued || sm.hasPendingMotion()) this.serialNext = 0;
+    else this.serialNext = Math.min(this.com1.nextEvent(), this.com2.nextEvent(), sm.nextArrival());
+  }
+
+  /** 光驱、硬盘、软驱：有事要做时才调用（顺序和原来逐项检查一样） */
+  private diskTick(): void {
     if (this.cdrom.pending) this.cdrom.poll();
     if (this.ide.pending) this.ide.poll();
     if (this.clock >= this.ide.next) this.ide.tick();
     if (this.clock >= this.fdc.next) this.fdc.tick();
-    this.com1.tick(this.clock);
-    this.com2.tick(this.clock);
-    this.mouse.tick(this.clock);
   }
 
   /** 机器空闲（等待键盘、已停止）时，让时间流逝到 t（双机运行时保持两台机器的时间同步） */
@@ -965,8 +1014,14 @@ export class Machine {
     return t;
   }
 
-  /** 检查执行一条指令之后是否需要停下 */
+  /** 检查执行一条指令之后是否需要停下（通常一个条件就能确定不用停） */
   private checkStop(): StopReason | null {
+    const cpu = this.cpu;
+    if (this.status !== 'exited' && !this.fatal && !cpu.waiting && !cpu.halted && this.wildWarned && !this.breakRequest) return null;
+    return this.checkStopFull();
+  }
+
+  private checkStopFull(): StopReason | null {
     const cpu = this.cpu;
     if (this.status === 'exited') return 'exit';
     if (this.fatal) {
@@ -1002,6 +1057,22 @@ export class Machine {
       }
     }
     return null;
+  }
+
+  /** 连续运行的循环（continuePending 的 run 分支，单独成一个小函数，热路径能整个内联） */
+  private runLoop(budget: number, untilClock: number): StopReason {
+    const cpu = this.cpu, bps = this.breakpoints;
+    for (let n = 0; n < budget; n++) {
+      if (this.clock >= untilClock) return 'budget';
+      if (n > 0 && bps.size !== 0 && !this.inBios() && !cpu.repContinue && bps.has(this.linearIP)) return this.stopAt('breakpoint');
+      this.exec1();
+      const s = this.checkStop();
+      if (s !== null) {
+        if (s !== 'wait') this.pending = null;
+        return s;
+      }
+    }
+    return 'budget';
   }
 
   /** 单步（进入）：执行一条用户指令；穿过 BIOS 代码和 REP 的剩余迭代 */
@@ -1091,14 +1162,15 @@ export class Machine {
     return true;
   }
 
-  /** 继续执行尚未完成的单步/跳过/运行（例如等到按键之后） */
+  /** 继续执行尚未完成的单步/跳过/运行（例如等到按键之后）；连续运行交给 runLoop */
   continuePending(budget: number, untilClock = Infinity): StopReason {
     let p = this.pending;
     if (!p) return 'paused';
+    this.serialNext = 0; // 两次运行之间界面可能改了接线、插拔了外设：先照常推进一次串口
     const cpu = this.cpu;
     if (this.status !== 'running') this.status = p.kind === 'run' ? 'running' : 'paused';
+    if (p.kind === 'run') return this.runLoop(budget, untilClock);
     for (let n = 0; n < budget; n++) {
-      if (p.kind === 'run' && this.clock >= untilClock) return 'budget';
       if (p.kind === 'out') {
         if (n > 0 && !this.inBios() && !cpu.repContinue && this.breakpoints.has(this.linearIP)) return this.stopAt('breakpoint');
         const kind = this.callKind(), ints = cpu.interrupts;
@@ -1106,12 +1178,11 @@ export class Machine {
         if (!cpu.irqTaken) p.depth += kind === 'call' ? 1 : kind === 'ret' ? -1 : 0;
         p.depth += cpu.interrupts - ints;
         if (p.depth < 0) p = this.pending = { kind: 'step' }; // 已经返回：再走出 BIOS 代码就停
-      } else if (n > 0 || p.kind === 'run') {
+      } else if (n > 0) {
         // 是否已到达停止点
         if (p.kind === 'step' && !this.inBios() && !cpu.repContinue && !cpu.waiting) return this.stopAt('step');
         if (p.kind === 'over' && cpu.s[CS] === p.cs && cpu.ip === p.ip && cpu.r[SP] >= p.sp && !cpu.repContinue) return this.stopAt('step');
         if (p.kind === 'over' && !this.inBios() && n > 0 && this.breakpoints.has(this.linearIP) && !cpu.repContinue) return this.stopAt('breakpoint');
-        if (p.kind === 'run' && n > 0 && this.breakpoints.size !== 0 && !this.inBios() && !cpu.repContinue && this.breakpoints.has(this.linearIP)) return this.stopAt('breakpoint');
         this.exec1();
       }
       const s = this.checkStop();
@@ -1121,7 +1192,6 @@ export class Machine {
         return s;
       }
     }
-    if (p.kind === 'run') return 'budget';
     this.pending = null;
     this.status = 'paused';
     this.message = '这一步执行的指令太多，已暂停';

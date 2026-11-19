@@ -132,6 +132,9 @@ export class Mouse {
     this.tick(now);
   }
 
+  /** 还有排队等着生效的按键变化 */
+  get queued(): boolean { return this.queue.length !== 0; }
+
   /** 推进虚拟时间：让排队的按键变化生效 */
   tick(now: number): void {
     while (this.queue.length && now - this.lastChange >= Mouse.BUTTON_HOLD) {

@@ -82,6 +82,13 @@ export class SerialMouse implements SerialPeer {
     }
   }
 
+  /** 下一次推进时会生成新数据包吗（队列空了、又有移动或按键变化） */
+  hasPendingMotion(): boolean {
+    if (this.queue.length !== 0) return false;
+    const m = this.mouse;
+    return Math.trunc(m.rawDx) !== 0 || Math.trunc(m.rawDy) !== 0 || (m.buttons & 7) !== this.lastButtons;
+  }
+
   nextArrival(): number { return this.queue.length ? this.queue[0].time : Infinity; }
 
   /** 有移动或按键变化时生成一个数据包（一个包发完才发下一个，和真鼠标一样） */
