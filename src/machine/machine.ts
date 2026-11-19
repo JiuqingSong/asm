@@ -216,10 +216,20 @@ export class Machine {
   files = new Map<string, Uint8Array>();
   /** 磁盘映像：0 = A:，1 = B:（软驱），2 = C:，3 = D:（硬盘）；换程序、重启时保留 */
   drives: (Disk | null)[] = [null, null, null, null];
-  /** 从光驱启动用的软盘映像（光盘里 El Torito 的启动软盘，由界面事先读出来） */
+  /**
+   * 从光驱启动用的信息（界面事先从光盘的 El Torito 启动目录读出来）：软盘模拟时是光盘里的启动软盘（disk），
+   * 不模拟时是要装入内存的引导程序（noemu：装入的段、映像所在的扇区、扇区数和内容）
+   */
   cdBoot: Disk | null = null;
-  /** 这次是从光驱启动的：光盘里的软盘映像当作 A:，原来的 A: 变成 B:（和真的 BIOS 一样，到下次启动为止） */
+  cdBootNoEmu: { image: Uint8Array; loadSeg: number; rba: number; count: number } | null = null;
+  /** 这次是从光驱启动的（软盘模拟）：光盘里的软盘映像当作 A:，原来的 A: 变成 B:（和真的 BIOS 一样，到下次启动为止） */
   private cdEmu: Disk | null = null;
+  /** 这次是从光驱启动的（不模拟）：光驱是 E0h 号盘，引导程序用 INT 13h 扩展功能按 2048 字节一块读光盘 */
+  private cdNoEmu: { image: Uint8Array; loadSeg: number; rba: number; count: number } | null = null;
+  /** 软盘模拟启动时光盘里的启动软盘（INT 13h AH=4Bh 报告用） */
+  get cdFloppyBoot(): Disk | null { return this.cdEmu; }
+  /** 不模拟方式启动时的引导信息 */
+  get cdNoEmuBoot() { return this.cdNoEmu; }
   /** 虚拟磁盘上文件的修改时间（毫秒）；没有记录的在第一次被查询时取当前时间 */
   fileTimes = new Map<string, number>();
 
@@ -573,7 +583,9 @@ export class Machine {
   load(program: Program, cmdline = '', name = 'PROGRAM.EXE'): void {
     const cpu = this.cpu, mem = this.mem;
     this.program = program;
-    this.cdEmu = program.format === 'boot' && program.bootDrive === CD_BOOT ? this.cdBoot : null;
+    const fromCd = program.format === 'boot' && program.bootDrive === CD_BOOT;
+    this.cdNoEmu = fromCd ? this.cdBootNoEmu : null;
+    this.cdEmu = fromCd && !this.cdNoEmu ? this.cdBoot : null;
     mem.fill(0);
     // 中断向量表与 BIOS 桩代码
     const bios = BIOS_SEG * 16;
@@ -698,23 +710,31 @@ export class Machine {
   private loadBootSector(drive: number): void {
     const cpu = this.cpu, mem = this.mem;
     // 和 BIOS 一样按 A:、C: 的顺序：A: 没有盘时从 C: 启动
-    if (drive === CD_BOOT) {
-      if (!this.cdEmu) throw new Error('光驱里没有可以启动的光盘');
-      drive = 0;
+    let entry = { cs: 0, ip: 0x7c00 };
+    if (drive === CD_BOOT && this.cdNoEmu) {
+      // 不模拟：把引导程序装到它指定的段（默认 07C0h，这时从 0000:7C00 开始执行），DL = 光驱的驱动器号
+      const seg = this.cdNoEmu.loadSeg || 0x7c0;
+      mem.set(this.cdNoEmu.image, seg * 16);
+      if (seg !== 0x7c0) entry = { cs: seg, ip: 0 };
+    } else {
+      if (drive === CD_BOOT) {
+        if (!this.cdEmu) throw new Error('光驱里没有可以启动的光盘');
+        drive = 0;
+      }
+      if (drive === 0 && !this.driveFor(0) && this.drives[2]) drive = 0x80;
+      const d = this.driveFor(drive);
+      if (!d) throw new Error(`${driveName(drive)} 没有磁盘映像，不能启动`);
+      const sec = d.readSector(0)!;
+      if (sec[510] !== 0x55 || sec[511] !== 0xaa) throw new Error(`${driveName(drive)} 的磁盘不能启动（第一个扇区末尾没有引导标记 55AAh；空白的硬盘需要先用启动软盘分区、格式化）`);
+      mem.set(sec, 0x7c00);
     }
-    if (drive === 0 && !this.driveFor(0) && this.drives[2]) drive = 0x80;
-    const d = this.driveFor(drive);
-    if (!d) throw new Error(`${driveName(drive)} 没有磁盘映像，不能启动`);
-    const sec = d.readSector(0)!;
-    if (sec[510] !== 0x55 || sec[511] !== 0xaa) throw new Error(`${driveName(drive)} 的磁盘不能启动（第一个扇区末尾没有引导标记 55AAh；空白的硬盘需要先用启动软盘分区、格式化）`);
-    mem.set(sec, 0x7c00);
     // 开机自检时 BIOS 按 CMOS 时钟设置"午夜以来的滴答数"，DOS 由此得到当前时间
     const now = new Date();
     const ticks = Math.floor(((now.getHours() * 60 + now.getMinutes()) * 60 + now.getSeconds()) * 1193182 / 65536);
     mem[0x46c] = ticks & 0xff; mem[0x46d] = (ticks >> 8) & 0xff; mem[0x46e] = (ticks >> 16) & 0xff; mem[0x46f] = 0;
     cpu.r.fill(0);
     cpu.s.fill(0);
-    cpu.s[CS] = 0; cpu.ip = 0x7c00;
+    cpu.s[CS] = entry.cs; cpu.ip = entry.ip;
     cpu.s[SS] = 0; cpu.r[SP] = 0x7c00;
     cpu.r[DX] = drive;
     cpu.setFlags(0x0202);

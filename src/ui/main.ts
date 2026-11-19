@@ -444,7 +444,10 @@ class App {
     this.renderFiles();
   }
 
-  /** 从光驱启动：读出光盘里的启动软盘映像（El Torito 软盘模拟），启动后它就是 A:，原来的 A: 变成 B: */
+  /**
+   * 从光驱启动：读出光盘的 El Torito 启动信息。软盘模拟时光盘里的启动软盘这次就是 A:，原来的 A: 变成 B:；
+   * 不模拟时把引导程序装入内存，光驱是 E0h 号盘（引导程序用 INT 13h 扩展功能读光盘）
+   */
   private async runCdBoot(s: Session): Promise<void> {
     const src = s.m.cdrom.source;
     const fail = (msg: string) => { this.addMessage('error', msg, s.i); this.setTab('messages'); };
@@ -452,23 +455,26 @@ class App {
     let r;
     try { r = await readElTorito(src); } catch (e) { fail('读光盘出错：' + (e as Error).message); return; }
     if (typeof r === 'string') { fail(r); return; }
-    s.m.cdBoot = new Disk(`${s.m.cdrom.discName} 的启动软盘`, r.image, true);
+    if (r.kind === 'floppy') { s.m.cdBoot = new Disk(`${s.m.cdrom.discName} 的启动软盘`, r.image, true); s.m.cdBootNoEmu = null; }
+    else { s.m.cdBoot = null; s.m.cdBootNoEmu = { image: r.image, loadSeg: r.loadSeg, rba: r.rba, count: r.count }; }
     this.runBoot(s, CD_BOOT);
   }
 
   /** 从磁盘映像启动（像开机一样：读引导扇区，运行真的 DOS 等系统） */
   private runBoot(s: Session, drive: number): void {
-    let d = drive === CD_BOOT ? s.m.cdBoot : s.m.driveFor(drive);
+    const noemu = drive === CD_BOOT ? s.m.cdBootNoEmu : null;
+    let d = noemu ? null : drive === CD_BOOT ? s.m.cdBoot : s.m.driveFor(drive);
     if (drive === 0 && !d && s.m.drives[2]) { drive = 0x80; d = s.m.drives[2]; }
-    if (!d) { this.addMessage('error', `${driveName(drive)} 没有磁盘映像`, s.i); this.setTab('messages'); return; }
-    if (d.readSector(0)![510] !== 0x55 || d.readSector(0)![511] !== 0xaa) {
+    if (!d && !noemu) { this.addMessage('error', `${driveName(drive)} 没有磁盘映像`, s.i); this.setTab('messages'); return; }
+    const name = d?.name ?? s.m.cdrom.discName ?? '光盘';
+    if (d && (d.readSector(0)![510] !== 0x55 || d.readSector(0)![511] !== 0xaa)) {
       this.addMessage('error', `${driveName(drive)} 的磁盘不能启动：第一个扇区末尾没有引导标记 55AAh${d.floppy ? '（这张软盘没有格式化成启动盘）' : '（空白硬盘需要先用启动软盘分区、格式化，例如运行 DOS 的安装程序）'}`, s.i);
       this.setTab('messages');
       return;
     }
     this.stop();
     const text = [
-      `; 从 ${driveName(drive)} 启动：${d.name}`,
+      `; 从 ${driveName(drive)} 启动：${name}`,
       ';',
       '; 像开机一样：BIOS 把磁盘的第一个扇区（引导扇区）读到 0000:7C00 执行，',
       '; 引导扇区再装入磁盘上的操作系统（例如 DOS 的 IO.SYS、MSDOS.SYS）。',
@@ -488,7 +494,8 @@ class App {
     s.dirty = false;
     if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
     this.renderTabs();
-    this.addMessage('ok', drive === CD_BOOT ? `从光驱启动（${d.name}，当作 A:${s.m.drives[0] ? '；原来的 A: 这次是 B:' : ''}）` : `从 ${driveName(drive)} 启动（${d.name}）`, s.i);
+    this.addMessage('ok', noemu ? `从光驱启动（${name}，不模拟方式：引导程序 ${noemu.count * 512} 字节装在 ${(noemu.loadSeg || 0x7c0).toString(16).toUpperCase()}0h，光驱是 E0h 号盘）`
+      : drive === CD_BOOT ? `从光驱启动（${name}，当作 A:${s.m.drives[0] ? '；原来的 A: 这次是 B:' : ''}）` : `从 ${driveName(drive)} 启动（${name}）`, s.i);
     this.loadAll();
     this.start();
     s.screen.focus();

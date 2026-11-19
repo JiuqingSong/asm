@@ -380,19 +380,18 @@ export class IsoDisk {
   }
 }
 
-/** 光盘启动（El Torito）的软盘模拟：光盘里那张软盘映像的内容 */
-export interface ElToritoFloppy {
-  image: Uint8Array;
-  /** 1 = 1.2MB、2 = 1.44MB、3 = 2.88MB */
-  media: number;
-}
+/** 光盘启动（El Torito）：软盘模拟时是光盘里那张软盘映像；不模拟时是要装入内存的引导程序 */
+export type ElToritoBoot =
+  | { kind: 'floppy'; image: Uint8Array; /** 1 = 1.2MB、2 = 1.44MB、3 = 2.88MB */ media: number; rba: number }
+  | { kind: 'noemu'; image: Uint8Array; /** 装入的段（0 表示默认的 07C0h） */ loadSeg: number; rba: number; /** 512 字节的虚拟扇区数 */ count: number };
 
 /**
- * 读出可启动光盘（El Torito）里的启动软盘映像。第 17 个扇区是启动记录卷描述符，里面写着启动目录在哪个扇区；
- * 启动目录的第一项是验证项（末尾 55AAh），第二项是默认启动项：可启动标志 88h、模拟方式、映像所在的扇区。
- * 只支持软盘模拟（Windows 98 安装盘、多数 DOS 启动光盘）；不能启动或者是别的方式时返回说明文字
+ * 读出可启动光盘（El Torito）的启动信息。第 17 个扇区是启动记录卷描述符，里面写着启动目录在哪个扇区；
+ * 启动目录的第一项是验证项（末尾 55AAh），第二项是默认启动项：可启动标志 88h、模拟方式、装入的段、
+ * 扇区数、映像所在的扇区。支持软盘模拟（Windows 98 安装盘、多数 DOS 启动光盘）和不模拟（Windows 2000/XP、
+ * Linux 的 isolinux）；不能启动或者是硬盘模拟时返回说明文字
  */
-export async function readElTorito(src: IsoSource): Promise<ElToritoFloppy | string> {
+export async function readElTorito(src: IsoSource): Promise<ElToritoBoot | string> {
   const read = async (offset: number, length: number) => { await src.load(offset, length); return src.get(offset, length)!; };
   if (src.size < 18 * 2048) return '这个光盘映像太小，不能启动';
   const brvd = await read(17 * 2048, 2048);
@@ -405,12 +404,17 @@ export async function readElTorito(src: IsoSource): Promise<ElToritoFloppy | str
   const e = cat.subarray(32, 64);
   if (e[0] !== 0x88) return '光盘的默认启动项没有标成可启动';
   const media = e[1] & 0x0f;
-  if (media === 0) return '这张光盘用"不模拟"方式启动（Windows 2000/XP、Linux 安装盘多是这样），暂时还不支持；目前只支持软盘模拟方式（Windows 98 安装盘、多数 DOS 启动光盘）';
+  const rba = (e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24)) >>> 0;
+  if (media === 0) {
+    const loadSeg = e[2] | (e[3] << 8), count = (e[6] | (e[7] << 8)) || 1;
+    if (rba * 2048 + count * 512 > src.size) return '光盘的引导程序超出了光盘范围';
+    if ((loadSeg || 0x7c0) * 16 + count * 512 > 0xa0000) return '光盘的引导程序太大，放不进常规内存';
+    return { kind: 'noemu', image: Uint8Array.from(await read(rba * 2048, count * 512)), loadSeg, rba, count };
+  }
   if (media === 4) return '这张光盘用"硬盘模拟"方式启动，暂时还不支持';
   const size = [0, 1200, 1440, 2880][media] * 1024;
   if (!size) return `不认识的启动模拟方式 ${media}`;
-  const rba = (e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24)) >>> 0;
   if (rba * 2048 + size > src.size) return '启动软盘映像超出了光盘范围';
   const image = Uint8Array.from(await read(rba * 2048, size)); // 复制一份：启动后可以写（不会写回光盘）
-  return { image, media };
+  return { kind: 'floppy', image, media, rba };
 }

@@ -155,7 +155,8 @@ if (process.env.INT6) {
 if (process.env.BOOT === 'CD') { // 从光驱启动（CD= 指定的光盘，El Torito 软盘模拟）
   const r = await readElTorito(m.cdrom.source!);
   if (typeof r === 'string') throw new Error(r);
-  m.cdBoot = new Disk('光盘的启动软盘', r.image, true);
+  if (r.kind === 'floppy') m.cdBoot = new Disk('光盘的启动软盘', r.image, true);
+  else { m.cdBootNoEmu = { image: r.image, loadSeg: r.loadSeg, rba: r.rba, count: r.count }; console.log(`不模拟方式：引导程序 ${r.count} 个扇区，从第 ${r.rba} 块装到 ${(r.loadSeg || 0x7c0).toString(16)}0h`); }
 }
 m.load(bootProgram(process.env.BOOT === 'C' ? 0x80 : process.env.BOOT === 'CD' ? CD_BOOT : 0));
 // WATCH=1：CPU 第一次跑到 A000 段以上（又不是 BIOS 的 F000 段）时，打印最近执行过的 40 条指令的位置

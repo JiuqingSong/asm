@@ -216,9 +216,89 @@ export class Hle {
     this.cpu.wb(BDA, drive >= 0x80 ? 0x74 : 0x41, status);
   }
 
+  /** 光驱（不模拟方式启动时的 E0h 号盘）上次操作的状态 */
+  private cdStatus = 0;
+
+  /**
+   * 不模拟方式从光驱启动时，E0h 号盘就是光驱：引导程序（Windows 2000/XP 的 ETFSBOOT、Linux 的 isolinux）用
+   * INT 13h 扩展功能按 2048 字节一块读光盘。这里直接从光盘映像读（不经过 ATAPI 端口），数据还没从文件里读出来时
+   * 等一会儿再执行（像光驱在转）
+   */
+  private cdDisk(): boolean {
+    const cpu = this.cpu, r = cpu.r, ah = this.ah, src = this.m.cdrom.source;
+    const ds = cpu.s[DS], si = r[SI];
+    const rw = (o: number) => cpu.rw(ds, (si + o) & 0xffff);
+    const wb = (o: number, v: number) => cpu.wb(ds, (si + o) & 0xffff, v & 0xff);
+    const ww = (o: number, v: number) => { wb(o, v); wb(o + 1, v >> 8); };
+    const wd = (o: number, v: number) => { ww(o, v & 0xffff); ww(o + 2, v >>> 16); };
+    const st = (code: number) => { this.cdStatus = code; this.ah = code; this.retFlag(CF, code !== 0); };
+    const sectors = src ? Math.floor(src.size / 2048) : 0;
+    switch (ah) {
+      case 0x00: case 0x0d: case 0x44: case 0x47: st(0); return true;      // 复位、校验、寻道
+      case 0x01: this.ah = this.cdStatus; this.retFlag(CF, this.cdStatus !== 0); return true;
+      case 0x41:                                                          // 有没有扩展功能
+        if (r[BX] !== 0x55aa) { st(1); return true; }
+        r[BX] = 0xaa55; r[CX] = 0x0001;                                   // 支持按包读写（42h~44h、47h、48h）
+        this.ah = 0x21; this.retFlag(CF, false);                          // EDD 1.1
+        return true;
+      case 0x42: {                                                        // 扩展读：DS:SI 是磁盘地址包
+        if (!src) { st(0xaa); return true; }                              // 没有光盘：驱动器没准备好
+        const count = rw(2), off = rw(4), seg = rw(6), lba = (rw(8) | (rw(10) << 16)) >>> 0;
+        if (rw(12) || rw(14) || lba + count > sectors) { ww(2, 0); st(4); return true; }
+        if (count === 0) { st(0); return true; }
+        const bytes = src.get(lba * 2048, count * 2048);
+        if (!bytes) { this.m.busy = true; return false; }                 // 等文件里的数据
+        this.m.busy = false;
+        let addr = seg * 16 + off;
+        for (let k = 0; k < bytes.length; k++, addr++) cpu.wb((addr >> 4) & 0xffff, addr & 15, bytes[k]);
+        st(0);
+        return true;
+      }
+      case 0x43: st(3); return true;                                      // 扩展写：光盘是写保护的
+      case 0x48: {                                                        // 驱动器参数
+        if (rw(0) < 0x1a) { st(1); return true; }
+        ww(0, 0x1a); ww(2, 0x0004);                                       // 可移动
+        wd(4, 0xffffffff); wd(8, 0xffffffff); wd(12, 0xffffffff);         // 没有 CHS 几何参数
+        wd(16, sectors); wd(20, 0);                                       // 扇区总数
+        ww(24, 2048);                                                     // 每扇区字节数
+        st(0);
+        return true;
+      }
+      case 0x4b: return this.cdBootStatus();
+    }
+    st(1);                                                                // 其他功能：无效命令
+    return true;
+  }
+
+  /** INT 13h AH=4Bh：光盘启动的状态（AL=00h 结束模拟、01h 只读状态），在 DS:SI 写 13h 字节的规格包 */
+  private cdBootStatus(): boolean {
+    const cpu = this.cpu, r = cpu.r, al = this.al;
+    const noemu = this.m.cdNoEmuBoot, floppy = this.m.cdFloppyBoot;
+    if ((al !== 0 && al !== 1) || (!noemu && !floppy)) { this.ah = 1; this.retFlag(CF, true); return true; }
+    const ds = cpu.s[DS], si = r[SI];
+    const p = new Uint8Array(0x13);
+    p[0] = 0x13;
+    if (noemu) {
+      p[1] = 0; p[2] = 0xe0;                                              // 不模拟、光驱 E0h
+      p.set([noemu.rba & 0xff, (noemu.rba >> 8) & 0xff, (noemu.rba >> 16) & 0xff, noemu.rba >>> 24], 4);
+      const seg = noemu.loadSeg || 0x7c0;
+      p[0x0c] = seg & 0xff; p[0x0d] = seg >> 8; p[0x0e] = noemu.count & 0xff; p[0x0f] = noemu.count >> 8;
+    } else {
+      p[1] = floppy!.floppyType === 2 ? 1 : floppy!.data.length > 1440 * 1024 ? 3 : 2; // 1.2MB、2.88MB、1.44MB
+      p[2] = 0x00;                                                        // 模拟成 A:
+      p[0x0c] = 0xc0; p[0x0d] = 0x07; p[0x0e] = 1;
+      p[0x10] = 79; p[0x11] = floppy!.geo.sectors; p[0x12] = floppy!.geo.heads - 1;
+    }
+    for (let k = 0; k < p.length; k++) cpu.wb(ds, (si + k) & 0xffff, p[k]);
+    this.ah = 0; this.retFlag(CF, false);
+    return true;
+  }
+
   private disk(): boolean {
     const cpu = this.cpu, r = cpu.r, ah = this.ah;
     const drive = r[DX] & 0xff;
+    if (drive === 0xe0 && this.m.cdNoEmuBoot) return this.cdDisk();
+    if (ah === 0x4b && drive === 0 && this.m.cdFloppyBoot) return this.cdBootStatus();
     const d = this.m.driveFor(drive);
     const hard = drive >= 0x80;
     const c = (r[CX] >> 8) | ((r[CX] & 0xc0) << 2), s = r[CX] & 0x3f, h = r[DX] >> 8;
