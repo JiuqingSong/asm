@@ -81,6 +81,8 @@ export class AtapiCdrom {
   }
 
   get discName(): string | null { return this.disc?.name ?? null; }
+  /** 光盘映像（从光盘启动时读启动目录用） */
+  get source(): IsoSource | null { return this.disc?.src ?? null; }
   get discSize(): number { return this.disc?.src.size ?? 0; }
 
   /** 开机、软件复位：寄存器里放 ATAPI 的签名（主机据此认出这是光驱而不是硬盘） */

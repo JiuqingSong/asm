@@ -38,7 +38,11 @@ import { DISK_ROM, diskRom } from './diskrom.ts';
 const DPT_OFF = 0xefc7;
 const FDPT_OFF = 0xe401;
 
+/** "从光驱启动"用的驱动器号（启动后光盘里的软盘映像当作 A:） */
+export const CD_BOOT = 0xe0;
+
 export function driveName(drive: number): string {
+  if (drive === CD_BOOT) return '光驱';
   return drive >= 0x80 ? String.fromCharCode(67 + drive - 0x80) + ':' : String.fromCharCode(65 + drive) + ':';
 }
 
@@ -142,7 +146,7 @@ export class Machine {
   });
   /** 软驱控制器（端口 3F0h~3F7h，IRQ6，DMA 2 号通道）：给 Windows 95 这样自己操作软驱的系统用；DOS 经 INT 13h 读写 */
   fdc = new FloppyController({
-    disk: d => this.drives[d],
+    disk: d => this.driveFor(d),
     driveExists: d => d === 0 || (d === 1 && (this.mem[0x410] & 0xc1) === 0x41),
     now: () => this.clock,
     irq: () => this.pic.raise(6),
@@ -193,6 +197,10 @@ export class Machine {
   files = new Map<string, Uint8Array>();
   /** 磁盘映像：0 = A:，1 = B:（软驱），2 = C:，3 = D:（硬盘）；换程序、重启时保留 */
   drives: (Disk | null)[] = [null, null, null, null];
+  /** 从光驱启动用的软盘映像（光盘里 El Torito 的启动软盘，由界面事先读出来） */
+  cdBoot: Disk | null = null;
+  /** 这次是从光驱启动的：光盘里的软盘映像当作 A:，原来的 A: 变成 B:（和真的 BIOS 一样，到下次启动为止） */
+  private cdEmu: Disk | null = null;
   /** 虚拟磁盘上文件的修改时间（毫秒）；没有记录的在第一次被查询时取当前时间 */
   fileTimes = new Map<string, number>();
 
@@ -417,8 +425,8 @@ export class Machine {
     const c = this.cmos;
     c.fill(0);
     c[0x0a] = 0x26; c[0x0b] = 0x02;        // 实时钟：32768Hz 晶振、1024Hz 周期；24 小时制，周期中断关闭
-    c[0x10] = 0x40 | (this.drives[1] ? 0x04 : 0); // A:（和有盘时的 B:）是 1.44MB 软驱
-    c[0x14] = 0x01 | (this.drives[1] ? 0x40 : 0); // 设备字节
+    c[0x10] = 0x40 | (this.driveFor(1) ? 0x04 : 0); // A:（和有盘时的 B:）是 1.44MB 软驱
+    c[0x14] = 0x01 | (this.driveFor(1) ? 0x40 : 0); // 设备字节
     c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
     const ext = this.cpu.is286 ? 15360 : 0;
     c[0x17] = c[0x30] = ext & 0xff; c[0x18] = c[0x31] = ext >> 8;
@@ -546,6 +554,7 @@ export class Machine {
   load(program: Program, cmdline = '', name = 'PROGRAM.EXE'): void {
     const cpu = this.cpu, mem = this.mem;
     this.program = program;
+    this.cdEmu = program.format === 'boot' && program.bootDrive === CD_BOOT ? this.cdBoot : null;
     mem.fill(0);
     // 中断向量表与 BIOS 桩代码
     const bios = BIOS_SEG * 16;
@@ -602,7 +611,7 @@ export class Machine {
     const bda = 0x400;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
     // 设备字：位 0 有软驱，位 6~7 软驱数 − 1，位 4~5 = 00 表示 EGA/VGA（显卡有自己的 BIOS）
-    const floppies = this.drives[1] ? 2 : 1;
+    const floppies = this.driveFor(1) ? 2 : 1;
     w16(bda + 0x10, 0x0001 | ((floppies - 1) << 6));
     // EGA/VGA 的信息：87h 显存 256KB、显示器是彩色的；88h 开关设置；89h VGA 的模式设置选项
     mem[bda + 0x87] = 0x60; mem[bda + 0x88] = 0x09; mem[bda + 0x89] = 0x11; mem[bda + 0x8a] = 0x0b;
@@ -663,7 +672,11 @@ export class Machine {
   private loadBootSector(drive: number): void {
     const cpu = this.cpu, mem = this.mem;
     // 和 BIOS 一样按 A:、C: 的顺序：A: 没有盘时从 C: 启动
-    if (drive === 0 && !this.drives[0] && this.drives[2]) drive = 0x80;
+    if (drive === CD_BOOT) {
+      if (!this.cdEmu) throw new Error('光驱里没有可以启动的光盘');
+      drive = 0;
+    }
+    if (drive === 0 && !this.driveFor(0) && this.drives[2]) drive = 0x80;
     const d = this.driveFor(drive);
     if (!d) throw new Error(`${driveName(drive)} 没有磁盘映像，不能启动`);
     const sec = d.readSector(0)!;
@@ -683,6 +696,7 @@ export class Machine {
     cpu.waiting = false;
     cpu.resetProtected();
     for (const x of this.drives) if (x) x.changed = true;
+    if (this.cdEmu) this.cdEmu.changed = true;
   }
 
   /** 关机：屏幕变黑，喇叭不响，程序停止（磁盘映像的内容保留） */
@@ -731,9 +745,10 @@ export class Machine {
     for (const scan of [...keys].reverse()) this.pressKey({ scan: scan | 0x80, ascii: 0, release: true });
   }
 
-  /** BIOS 驱动器号对应的磁盘映像（0、1 软驱，80h、81h 硬盘） */
+  /** BIOS 驱动器号对应的磁盘映像（0、1 软驱，80h、81h 硬盘；从光驱启动时 0 是光盘里的软盘映像，1 是原来的 A:） */
   driveFor(drive: number): Disk | null {
-    if (drive === 0 || drive === 1) return this.drives[drive];
+    if (drive === 0) return this.cdEmu ?? this.drives[0];
+    if (drive === 1) return this.cdEmu ? this.drives[0] : this.drives[1];
     if (drive === 0x80 || drive === 0x81) return this.drives[drive - 0x80 + 2];
     return null;
   }

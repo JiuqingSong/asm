@@ -4,7 +4,9 @@ import { DrivesPanel } from './drives.ts';
 import { bootProgram, driveName } from '../machine/boot.ts';
 import { assemble } from '../asm/assembler.ts';
 import type { Diag, Program } from '../asm/types.ts';
-import { Machine, CPU_SPEEDS, type StopReason, type CpuSpeedId } from '../machine/machine.ts';
+import { Machine, CPU_SPEEDS, CD_BOOT, type StopReason, type CpuSpeedId } from '../machine/machine.ts';
+import { readElTorito } from '../machine/iso.ts';
+import { Disk } from '../machine/disk.ts';
 import { DualMachine } from '../machine/dual.ts';
 import { loadExecutable } from '../machine/exe.ts';
 import { scanForChar, type KeyEvent } from '../machine/devices.ts';
@@ -292,7 +294,7 @@ class App {
     this.drives = new DrivesPanel($('drives'), {
       machines: () => this.live.map(x => ({ m: x.m, tag: x.tag, i: x.i })),
       dual: () => this.mode === 'dual',
-      boot: (i, drive) => this.runBoot(this.sessions[i], drive),
+      boot: (i, drive) => { if (drive === CD_BOOT) void this.runCdBoot(this.sessions[i]); else this.runBoot(this.sessions[i], drive); },
       message: (kind, text, i) => { this.addMessage(kind, text, i); if (kind === 'error') this.setTab('messages'); },
     });
     void this.drives.restore();
@@ -442,9 +444,21 @@ class App {
     this.renderFiles();
   }
 
+  /** 从光驱启动：读出光盘里的启动软盘映像（El Torito 软盘模拟），启动后它就是 A:，原来的 A: 变成 B: */
+  private async runCdBoot(s: Session): Promise<void> {
+    const src = s.m.cdrom.source;
+    const fail = (msg: string) => { this.addMessage('error', msg, s.i); this.setTab('messages'); };
+    if (!src) { fail('光驱里没有光盘'); return; }
+    let r;
+    try { r = await readElTorito(src); } catch (e) { fail('读光盘出错：' + (e as Error).message); return; }
+    if (typeof r === 'string') { fail(r); return; }
+    s.m.cdBoot = new Disk(`${s.m.cdrom.discName} 的启动软盘`, r.image, true);
+    this.runBoot(s, CD_BOOT);
+  }
+
   /** 从磁盘映像启动（像开机一样：读引导扇区，运行真的 DOS 等系统） */
   private runBoot(s: Session, drive: number): void {
-    let d = s.m.driveFor(drive);
+    let d = drive === CD_BOOT ? s.m.cdBoot : s.m.driveFor(drive);
     if (drive === 0 && !d && s.m.drives[2]) { drive = 0x80; d = s.m.drives[2]; }
     if (!d) { this.addMessage('error', `${driveName(drive)} 没有磁盘映像`, s.i); this.setTab('messages'); return; }
     if (d.readSector(0)![510] !== 0x55 || d.readSector(0)![511] !== 0xaa) {
@@ -474,7 +488,7 @@ class App {
     s.dirty = false;
     if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
     this.renderTabs();
-    this.addMessage('ok', `从 ${driveName(drive)} 启动（${d.name}）`, s.i);
+    this.addMessage('ok', drive === CD_BOOT ? `从光驱启动（${d.name}，当作 A:${s.m.drives[0] ? '；原来的 A: 这次是 B:' : ''}）` : `从 ${driveName(drive)} 启动（${d.name}）`, s.i);
     this.loadAll();
     this.start();
     s.screen.focus();

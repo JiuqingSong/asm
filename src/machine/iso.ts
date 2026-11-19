@@ -379,3 +379,38 @@ export class IsoDisk {
     return out;
   }
 }
+
+/** 光盘启动（El Torito）的软盘模拟：光盘里那张软盘映像的内容 */
+export interface ElToritoFloppy {
+  image: Uint8Array;
+  /** 1 = 1.2MB、2 = 1.44MB、3 = 2.88MB */
+  media: number;
+}
+
+/**
+ * 读出可启动光盘（El Torito）里的启动软盘映像。第 17 个扇区是启动记录卷描述符，里面写着启动目录在哪个扇区；
+ * 启动目录的第一项是验证项（末尾 55AAh），第二项是默认启动项：可启动标志 88h、模拟方式、映像所在的扇区。
+ * 只支持软盘模拟（Windows 98 安装盘、多数 DOS 启动光盘）；不能启动或者是别的方式时返回说明文字
+ */
+export async function readElTorito(src: IsoSource): Promise<ElToritoFloppy | string> {
+  const read = async (offset: number, length: number) => { await src.load(offset, length); return src.get(offset, length)!; };
+  if (src.size < 18 * 2048) return '这个光盘映像太小，不能启动';
+  const brvd = await read(17 * 2048, 2048);
+  const id = String.fromCharCode(...brvd.subarray(1, 6)), spec = String.fromCharCode(...brvd.subarray(7, 30));
+  if (brvd[0] !== 0 || id !== 'CD001' || spec !== 'EL TORITO SPECIFICATION') return '这张光盘不能启动（没有 El Torito 启动记录）';
+  const catalog = (brvd[0x47] | (brvd[0x48] << 8) | (brvd[0x49] << 16) | (brvd[0x4a] << 24)) >>> 0;
+  if ((catalog + 1) * 2048 > src.size) return '光盘的启动目录不在光盘范围内';
+  const cat = await read(catalog * 2048, 64);
+  if (cat[0] !== 1 || cat[30] !== 0x55 || cat[31] !== 0xaa) return '光盘的启动目录无效（验证项不对）';
+  const e = cat.subarray(32, 64);
+  if (e[0] !== 0x88) return '光盘的默认启动项没有标成可启动';
+  const media = e[1] & 0x0f;
+  if (media === 0) return '这张光盘用"不模拟"方式启动（Windows 2000/XP、Linux 安装盘多是这样），暂时还不支持；目前只支持软盘模拟方式（Windows 98 安装盘、多数 DOS 启动光盘）';
+  if (media === 4) return '这张光盘用"硬盘模拟"方式启动，暂时还不支持';
+  const size = [0, 1200, 1440, 2880][media] * 1024;
+  if (!size) return `不认识的启动模拟方式 ${media}`;
+  const rba = (e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24)) >>> 0;
+  if (rba * 2048 + size > src.size) return '启动软盘映像超出了光盘范围';
+  const image = Uint8Array.from(await read(rba * 2048, size)); // 复制一份：启动后可以写（不会写回光盘）
+  return { image, media };
+}

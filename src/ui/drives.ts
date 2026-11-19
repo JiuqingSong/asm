@@ -403,7 +403,8 @@ export class DrivesPanel {
         `<span class="spacer"></span><button data-act="cd-insert" data-i="${i}" title="选择一个光盘映像文件（.iso）放进光驱">${disc ? '换光盘' : '放入光盘'}</button>` +
         (disc ? `<button data-act="cd-eject" data-i="${i}" title="取出光盘">弹出</button>` : '') + '</div>');
       parts.push(`<div class="drive-boot"><button data-act="boot" data-i="${i}" data-from="0" ${m.drives[0] ? '' : 'disabled'} title="像开机一样从 A: 的软盘启动">从 A: 启动</button>` +
-        `<button data-act="boot" data-i="${i}" data-from="128" ${m.drives[2] ? '' : 'disabled'} title="从 C: 硬盘启动（A: 里有软盘时也从 C: 启动）">从 C: 启动</button></div>`);
+        `<button data-act="boot" data-i="${i}" data-from="128" ${m.drives[2] ? '' : 'disabled'} title="从 C: 硬盘启动（A: 里有软盘时也从 C: 启动）">从 C: 启动</button>` +
+        `<button data-act="boot" data-i="${i}" data-from="224" ${m.cdrom.discName ? '' : 'disabled'} title="从光驱里的可启动光盘启动（El Torito 软盘模拟：光盘里的启动软盘当作 A:，原来的 A: 变成 B:）">从光驱启动</button></div>`);
     }
     this.el.innerHTML = parts.join('');
   }

@@ -5,7 +5,7 @@
 //   {PNG} 把图形画面存成 PNG（文件名前缀用环境变量 PNG 指定）；CPU=8088/286/386 选 CPU
 //   调试：WATCH=1 跑飞（执行 00 00 或跑到 A000 段以上）时打印之前的指令和最近的换段；WATCHAT=段:偏移 第一次执行到这里时打印；
 //         DUMPAT=段:偏移 同时反汇编那里的代码；VIDEO=1 打印显卡状态；STATE=1 打印 CPU 状态；VEC=33 打印中断向量；DIS=段:偏移 反汇编
-//   环境变量 ISO=光盘映像 放进 D:；BOOT=C 表示从硬盘启动；DISKS="映像2;映像3" 是依次换进 A: 的软盘，按键里写 {SWAP} 换下一张，{EJECT} 取出 A:
+//   环境变量 ISO=光盘映像 放进 D:；CD=光盘映像 放进光驱；BOOT=C 表示从硬盘启动，BOOT=CD 从光驱启动；DISKS="映像2;映像3" 是依次换进 A: 的软盘，按键里写 {SWAP} 换下一张，{EJECT} 取出 A:
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { Machine } from '../src/machine/machine.ts';
@@ -14,7 +14,8 @@ import { scanForChar } from '../src/machine/devices.ts';
 import { CP437 } from '../src/ui/screen.ts';
 import { bootProgram } from '../src/machine/boot.ts';
 import { saveScreenPng } from './png.ts';
-import { IsoDisk, BytesSource } from '../src/machine/iso.ts';
+import { IsoDisk, BytesSource, readElTorito } from '../src/machine/iso.ts';
+import { CD_BOOT } from '../src/machine/machine.ts';
 
 const [a, c = '-', millionsArg = '200', ...keys] = process.argv.slice(2);
 const m = new Machine();
@@ -138,7 +139,12 @@ if (process.env.INT6) {
     return hle(n);
   };
 }
-m.load(bootProgram(process.env.BOOT === 'C' ? 0x80 : 0));
+if (process.env.BOOT === 'CD') { // 从光驱启动（CD= 指定的光盘，El Torito 软盘模拟）
+  const r = await readElTorito(m.cdrom.source!);
+  if (typeof r === 'string') throw new Error(r);
+  m.cdBoot = new Disk('光盘的启动软盘', r.image, true);
+}
+m.load(bootProgram(process.env.BOOT === 'C' ? 0x80 : process.env.BOOT === 'CD' ? CD_BOOT : 0));
 // WATCH=1：CPU 第一次跑到 A000 段以上（又不是 BIOS 的 F000 段）时，打印最近执行过的 40 条指令的位置
 if (process.env.WATCH) {
   const cpu = m.cpu as unknown as { step(): void; s: Uint16Array; ip: number };
