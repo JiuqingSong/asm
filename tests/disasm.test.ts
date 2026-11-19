@@ -19,6 +19,8 @@ function norm(t: string): string {
 function roundTrip(p: Program): { checked: number; mismatches: string[] } {
   const mismatches: string[] = [];
   let checked = 0;
+  // 用了 80186/80286 指令的程序（.186 / .286）按 286 反汇编，重新汇编时也写 .286P
+  const is286 = (p.cpu ?? 0) > 0;
   for (const seg of p.segments) {
     const entries = p.listing.filter(e => e.segName === seg.name && e.bytes.length).sort((a, b) => a.segOffset - b.segOffset);
     if (!entries.some(e => e.isCode)) continue;
@@ -28,14 +30,14 @@ function roundTrip(p: Program): { checked: number; mismatches: string[] } {
     for (const e of entries.filter(x => x.isCode)) {
       let o = e.segOffset;
       while (o < e.segOffset + e.bytes.length) {
-        const d = disassemble(segBytes, o);
+        const d = disassemble(segBytes, o, is286);
         ins.push({ off: o, d, line: e.line });
         o += d.length;
       }
       if (o !== e.segOffset + e.bytes.length) mismatches.push(`第 ${e.line} 行：指令长度对不上`);
     }
     const starts = new Set(ins.map(x => x.off));
-    const lines = ['X SEGMENT', 'ASSUME CS:X, DS:X, ES:X, SS:X'];
+    const lines = [...(is286 ? ['.286P'] : []), 'X SEGMENT', 'ASSUME CS:X, DS:X, ES:X, SS:X'];
     const used: typeof ins = [];
     for (const e of entries.filter(x => !x.isCode)) {
       lines.push(`ORG ${hexNum(e.segOffset, 4)}`, `DB ${e.bytes.map(b => hexNum(b < 0 ? 0 : b, 2)).join(',')}`);
@@ -62,7 +64,7 @@ function roundTrip(p: Program): { checked: number; mismatches: string[] } {
     if (errs.length) { mismatches.push(...errs.map(er => `重新汇编出错：${lines[er.line - 1]} —— ${er.message}`)); continue; }
     const out = q.segments[0];
     for (const x of used) {
-      const again = disassemble(o => out.bytes[o & 0xffff] ?? 0, x.off);
+      const again = disassemble(o => out.bytes[o & 0xffff] ?? 0, x.off, is286);
       checked++;
       if (norm(again.text) !== norm(x.d.text)) mismatches.push(`第 ${x.line} 行：${x.d.text} 重新汇编后变成 ${again.text}`);
     }

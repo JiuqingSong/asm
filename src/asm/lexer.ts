@@ -80,6 +80,14 @@ export function tokenize(line: string): Token[] {
       i = j;
       continue;
     }
+    // CPU 伪指令 .186 .286 .286P .386 等：点后面紧跟数字
+    const cpuDir = c === '.' ? /^.(8086|8087|186|286|287|386|387|486|586)[cCpP]?(?![A-Za-z0-9_])/.exec(s.slice(i)) : null;
+    if (cpuDir) {
+      const text = cpuDir[0];
+      out.push({ kind: 'id', text, lower: text.toLowerCase(), value: 0, col });
+      i += text.length;
+      continue;
+    }
     // 以点开头的标识符只在后面紧跟字母时成立（.model / .data）
     if (ID_START.test(c) && (c !== '.' || /[A-Za-z]/.test(s[i + 1] ?? ''))) {
       let j = i + 1;

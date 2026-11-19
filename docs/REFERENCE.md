@@ -931,7 +931,8 @@ C:、D: 的硬盘映像经 IDE 第一通道的 ATA 控制器读写（端口 1F0h
 | 条件汇编 | `IF` `IFE` `IFDEF` `IFNDEF` `IFB` `IFNB` `ELSE` `ENDIF` |
 | 其他 | `.STARTUP`、`.EXIT`、`END 入口` |
 | 指令 | 全部 8086 指令（见第 2 节）；条件跳转超出范围时自动扩展成反向条件跳转 + `JMP`（与 MASM 6 相同） |
+| 80186/80286 指令 | 程序开头写 `.186` 或 `.286` 后可用 80186 的 `PUSHA` `POPA` `PUSH 立即数` `IMUL 寄存器, [源,] 立即数` `SHL/SHR… 寄存器或内存, 立即数` `ENTER` `LEAVE` `BOUND` `INS/INSB/INSW` `OUTS/OUTSB/OUTSW`；`.286` 再加 `ARPL` `LAR` `LSL` `VERR` `VERW` `SMSW` `STR` `SLDT` `SGDT` `SIDT`；`.286P` 再加特权指令 `CLTS` `LMSW` `LGDT` `LIDT` `LLDT` `LTR`（划分与 MASM 6.11 相同，编码逐字节一致：tests/ml/i286.asm）。没写这些伪指令时它们仍可当符号名。运行时 CPU 要选 286 或更高，选 8088 时汇编后会提示 |
 
 `MOV 寄存器, 代码标号` 取标号的偏移（和 MASM 一样）。`PUSH SP`、`POP SP` 会给出警告：8086 和 286 上结果不同。常见错误有中文说明，例如"不能把立即数直接送入段寄存器""8086 的移位次数只能是 1 或 CL"。
 
-暂不支持：`STRUC`/`RECORD`、`INCLUDE`、多模块（`EXTRN`/`PUBLIC`）、80186 及以上指令、8087 指令。
+暂不支持：`STRUC`/`RECORD`、`INCLUDE`、多模块（`EXTRN`/`PUBLIC`）、80386 的 32 位指令（`.386` 按 `.286P` 处理并提示）、8087 指令。

@@ -1,4 +1,5 @@
-// 8086 指令编码：操作数（表达式求值结果）-> 机器码字节
+// 8086 指令编码：操作数（表达式求值结果）-> 机器码字节。写了 .186 / .286 / .286P 时还可以用 80186、80286 的指令
+// （编码和 MASM 6.11 逐字节一致：tests/ml/i286.asm）
 import { AsmError } from './lexer.ts';
 import { T_FAR, T_NEAR, type Frame, type Segment, type Sym } from './types.ts';
 
@@ -50,7 +51,24 @@ export interface EncCtx {
   isLong: boolean;
   setLong(): void;
   warn(msg: string): void;
+  /** .186 / .286 / .286P 打开的指令集：0 = 8086，1 = 80186，2 = 80286，3 = 80286 特权指令 */
+  cpu: number;
+  /** 记下用到了哪一级的指令 */
+  useCpu(level: number): void;
 }
+
+/** 80186 新增的指令（PUSH 立即数、三操作数 IMUL、立即数次数的移位在各自的指令里处理） */
+const I186 = new Set(['pusha', 'popa', 'enter', 'leave', 'bound', 'ins', 'insb', 'insw', 'outs', 'outsb', 'outsw']);
+/** 80286 新增的指令：.286 可用的，和只有 .286P 才能用的特权指令（与 MASM 6.11 的划分相同） */
+const I286 = new Set(['arpl', 'lar', 'lsl', 'verr', 'verw', 'smsw', 'str', 'sldt', 'sgdt', 'sidt']);
+const I286P = new Set(['clts', 'lmsw', 'lgdt', 'lidt', 'lldt', 'ltr']);
+/** 0F 00 /n 和 0F 01 /n 两组 */
+const GRP0F00: Record<string, number> = { sldt: 0, str: 1, lldt: 2, ltr: 3, verr: 4, verw: 5 };
+const GRP0F01: Record<string, number> = { sgdt: 0, sidt: 1, lgdt: 2, lidt: 3, smsw: 4, lmsw: 6 };
+/** 80186/80286 指令要哪一级（0 = 不是这些指令）：写了对应的 CPU 伪指令后它们是指令，否则还可以当符号名 */
+export function cpuLevelOf(m: string): number { return I186.has(m) ? 1 : I286.has(m) ? 2 : I286P.has(m) ? 3 : 0; }
+const CPU_NAME = ['8086', '80186', '80286', '80286 的特权指令'];
+const CPU_DIR = ['', '.186（或 .286）', '.286', '.286P'];
 
 type Op =
   | { k: 'reg'; w: boolean; reg: number }
@@ -110,7 +128,7 @@ function fitsS8w(v: number): boolean {
 }
 
 function typeName(size: number): string {
-  return size === 1 ? 'BYTE' : size === 2 ? 'WORD' : size === 4 ? 'DWORD' : size === T_NEAR ? 'NEAR' : size === T_FAR ? 'FAR' : String(size);
+  return size === 1 ? 'BYTE' : size === 2 ? 'WORD' : size === 4 ? 'DWORD' : size === 6 ? 'FWORD' : size === 8 ? 'QWORD' : size === 10 ? 'TBYTE' : size === T_NEAR ? 'NEAR' : size === T_FAR ? 'FAR' : String(size);
 }
 
 export class Encoder {
@@ -236,8 +254,17 @@ export class Encoder {
     if (vals.length !== n) err(n === 0 ? `${mn.toUpperCase()} 不需要操作数` : `${mn.toUpperCase()} 需要 ${n} 个操作数`);
   }
 
+  /** 需要 80186/80286 的指令：没写对应的 CPU 伪指令时报错 */
+  private requireCpu(level: number, what: string): void {
+    if (this.ctx.cpu < level) {
+      err(`${what}是 ${CPU_NAME[level]} 的指令，需要在程序开头写 ${CPU_DIR[level]}；运行时 CPU 要选 286 或更高（8088 上没有这些指令）`);
+    }
+    this.ctx.useCpu(level);
+  }
+
   private encodeInner(mn: string, vals: Val[]): number[] {
-    if (NOT_8086.has(mn)) err(`${mn.toUpperCase()} 不是 8086 指令（本模拟器只支持 8086）`);
+    if (I186.has(mn) || I286.has(mn) || I286P.has(mn)) return this.encode286(mn, vals);
+    if (NOT_8086.has(mn)) err(`${mn.toUpperCase()} 不是 8086/80286 指令（本模拟器的汇编器只支持到 80286）`);
 
     if (mn in SIMPLE) {
       if (mn === 'xlatb' && vals.length) err('XLATB 不需要操作数');
@@ -332,7 +359,14 @@ export class Encoder {
         this.need(vals, 1, mn);
         const a = this.classify(vals[0]);
         const isPush = mn === 'push';
-        if (a.k === 'imm') err(isPush ? 'PUSH 立即数是 80186 才有的指令，8086 需要先把数放进寄存器' : 'POP 的操作数不能是立即数');
+        if (a.k === 'imm') {
+          if (!isPush) err('POP 的操作数不能是立即数');
+          if (this.ctx.cpu < 1) err('PUSH 立即数是 80186 才有的指令：8086 需要先把数放进寄存器；或者在程序开头写 .186（或 .286），运行时 CPU 选 286 或更高');
+          this.ctx.useCpu(1);
+          // 和 MASM 一样：写出来的值在 -128~127 之间才用符号扩展的短格式 6A（0FF80h 这样写的用 68）
+          if (a.v >= -128 && a.v <= 127 && !a.reloc && !a.unknown && !a.frameImm) return [0x6a, a.v & 0xff];
+          return [0x68, ...this.imm(a.v, true, a)];
+        }
         if (a.k === 'sreg') {
           if (!isPush && a.reg === S_CS) err('不能 POP CS');
           return [(a.reg << 3) | (isPush ? 0x06 : 0x07)];
@@ -424,14 +458,17 @@ export class Encoder {
       const m = this.modrm(SHIFT[mn], a);
       if (b.k === 'reg' && !b.w && b.reg === 1) return [...m.prefix, w ? 0xd3 : 0xd2, ...m.bytes];
       if (b.k === 'imm') {
-        if (b.v === 1) return [...m.prefix, w ? 0xd1 : 0xd0, ...m.bytes];
-        err(`8086 的移位次数只能是 1 或 CL；要移 ${b.v} 位，请先 MOV CL, ${b.v}，再写 ${mn.toUpperCase()} ${this.descr(a)}, CL`);
+        if (b.v === 1 && !b.unknown) return [...m.prefix, w ? 0xd1 : 0xd0, ...m.bytes];
+        if (this.ctx.cpu < 1) err(`8086 的移位次数只能是 1 或 CL；要移 ${b.v} 位，请先 MOV CL, ${b.v}，再写 ${mn.toUpperCase()} ${this.descr(a)}, CL（或者在程序开头写 .186 / .286，运行时 CPU 选 286 或更高）`);
+        this.ctx.useCpu(1);
+        if (!b.unknown && (b.v < 0 || b.v > 255)) err('移位次数必须在 0~255 之间');
+        return [...m.prefix, w ? 0xc1 : 0xc0, ...m.bytes, b.v & 0xff];
       }
       err('移位次数只能是 1 或 CL');
     }
 
     if (mn in UNARY) {
-      if (mn === 'imul' && vals.length > 1) err('多操作数的 IMUL 是 80186 以后才有的；8086 只支持 IMUL 源操作数');
+      if (mn === 'imul' && vals.length > 1) return this.imul3(vals);
       this.need(vals, 1, mn);
       const a = this.classify(vals[0]);
       if (a.k === 'imm') err(`${mn.toUpperCase()} 的操作数不能是立即数`);
@@ -459,6 +496,90 @@ export class Encoder {
     }
 
     err(`未知指令：${mn}`);
+  }
+
+  /** IMUL reg, r/m, 立即数 和 IMUL reg, 立即数（= IMUL reg, reg, 立即数）（80186） */
+  private imul3(vals: Val[]): number[] {
+    this.requireCpu(1, '多操作数的 IMUL ');
+    if (vals.length !== 2 && vals.length !== 3) err('IMUL 需要 1 个操作数（8086 的格式），或者 2~3 个操作数：IMUL 寄存器, [寄存器或内存,] 立即数');
+    const d = this.classify(vals[0]);
+    const s = vals.length === 3 ? this.classify(vals[1]) : d;
+    const n = this.classify(vals[vals.length - 1]);
+    if (d.k !== 'reg' || !d.w) err('IMUL 的目的操作数必须是 16 位通用寄存器');
+    if (n.k !== 'imm') err('IMUL 的最后一个操作数必须是立即数');
+    if (s.k === 'reg' && !s.w) err('IMUL 的源操作数必须是 16 位');
+    if (s.k === 'mem' && this.memSize(s) === 1) err('IMUL 的源操作数必须是字（WORD）');
+    if (s.k !== 'reg' && s.k !== 'mem') err('IMUL 的源操作数必须是寄存器或内存');
+    const m = this.modrm(d.reg, s);
+    // 和 ADD 等一样：能符号扩展成 16 位的用短格式 6B（0FFFFh 也算），否则 69
+    if (fitsS8w(n.v) && !n.reloc && !n.unknown) return [...m.prefix, 0x6b, ...m.bytes, n.v & 0xff];
+    return [...m.prefix, 0x69, ...m.bytes, ...this.imm(n.v, true, n)];
+  }
+
+  /** 16 位的寄存器或内存操作数 */
+  private rm16(op: Op, mn: string): void {
+    if (op.k === 'reg' && !op.w) err(`${mn.toUpperCase()} 的操作数必须是 16 位`);
+    if (op.k === 'mem' && this.memSize(op) === 1) err(`${mn.toUpperCase()} 的操作数必须是字（WORD）`);
+    if (op.k !== 'reg' && op.k !== 'mem') err(`${mn.toUpperCase()} 的操作数必须是寄存器或内存`);
+  }
+
+  /** 80186 / 80286 新增的指令 */
+  private encode286(mn: string, vals: Val[]): number[] {
+    this.requireCpu(I186.has(mn) ? 1 : I286.has(mn) ? 2 : 3, `${mn.toUpperCase()} `);
+    const simple: Record<string, number> = { pusha: 0x60, popa: 0x61, leave: 0xc9, insb: 0x6c, insw: 0x6d, outsb: 0x6e, outsw: 0x6f };
+    if (mn in simple) { this.need(vals, 0, mn); return [simple[mn]]; }
+    if (mn === 'clts') { this.need(vals, 0, mn); return [0x0f, 0x06]; }
+    if (mn === 'ins' || mn === 'outs') {
+      // INS 目的, DX（目的固定是 ES:DI）；OUTS DX, 源（源是 DS:SI，可以加段超越）
+      this.need(vals, 2, mn);
+      const isIns = mn === 'ins';
+      const mem = this.classify(vals[isIns ? 0 : 1]), port = this.classify(vals[isIns ? 1 : 0]);
+      if (port.k !== 'reg' || !port.w || port.reg !== 2) err(`${mn.toUpperCase()} 的端口只能是 DX`);
+      const size = this.memSize(mem);
+      if (mem.k !== 'mem' || !size) err(`${mn.toUpperCase()} 需要写明大小的内存操作数，例如 BYTE PTR [${isIns ? 'DI' : 'SI'}]，或改用 ${mn.toUpperCase()}B / ${mn.toUpperCase()}W`);
+      const prefix = isIns ? [] : this.segPrefix(mem);
+      return [...prefix, (isIns ? 0x6c : 0x6e) + (size === 2 ? 1 : 0)];
+    }
+    if (mn === 'enter') {
+      this.need(vals, 2, mn);
+      const a = this.classify(vals[0]), b = this.classify(vals[1]);
+      if (a.k !== 'imm' || b.k !== 'imm') err('ENTER 的两个操作数都必须是立即数：ENTER 局部变量字节数, 嵌套层数');
+      if (!b.unknown && (b.v < 0 || b.v > 255)) err('ENTER 的嵌套层数必须在 0~255 之间');
+      return [0xc8, ...this.imm(a.v, true, a), b.v & 0xff];
+    }
+    this.need(vals, mn in GRP0F00 || mn in GRP0F01 ? 1 : 2, mn);
+    const a = this.classify(vals[0]), b = vals.length > 1 ? this.classify(vals[1]) : a;
+    if (mn === 'bound') {
+      if (a.k !== 'reg' || !a.w) err('BOUND 的第一个操作数必须是 16 位通用寄存器');
+      if (b.k !== 'mem') err('BOUND 的第二个操作数必须是内存（两个字：下界、上界）');
+      const m = this.modrm(a.reg, b);
+      return [...m.prefix, 0x62, ...m.bytes];
+    }
+    if (mn === 'arpl') {
+      this.rm16(a, mn);
+      if (b.k !== 'reg' || !b.w) err('ARPL 的第二个操作数必须是 16 位通用寄存器');
+      const m = this.modrm(b.reg, a);
+      return [...m.prefix, 0x63, ...m.bytes];
+    }
+    if (mn === 'lar' || mn === 'lsl') {
+      if (a.k !== 'reg' || !a.w) err(`${mn.toUpperCase()} 的第一个操作数必须是 16 位通用寄存器`);
+      this.rm16(b, mn);
+      const m = this.modrm(a.reg, b);
+      return [...m.prefix, 0x0f, mn === 'lar' ? 0x02 : 0x03, ...m.bytes];
+    }
+    if (mn in GRP0F00) {
+      this.rm16(a, mn);
+      const m = this.modrm(GRP0F00[mn], a);
+      return [...m.prefix, 0x0f, 0x00, ...m.bytes];
+    }
+    // 0F 01 组：SGDT/SIDT/LGDT/LIDT 只能是内存（6 字节：界限 + 基址），SMSW/LMSW 是 16 位
+    if (mn === 'smsw' || mn === 'lmsw') this.rm16(a, mn);
+    else {
+      if (a.k !== 'mem') err(`${mn.toUpperCase()} 的操作数必须是内存（6 个字节：界限、基址）`);
+      if ((mn === 'lgdt' || mn === 'lidt') && a.size === 1) err(`${mn.toUpperCase()} 的操作数不能是字节，应该是 6 个字节（界限、基址）`);
+    }
+    const m = this.modrm(GRP0F01[mn], a);
+    return [...m.prefix, 0x0f, 0x01, ...m.bytes];
   }
 
   private mov(vals: Val[]): number[] {

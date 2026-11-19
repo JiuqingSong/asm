@@ -88,6 +88,8 @@ export interface ProgramSymbol {
 
 export interface Program {
   ok: boolean;
+  /** 程序用到的最高指令集：0 = 8086，1 = 80186，2 = 80286，3 = 80286 特权指令（汇编器生成的程序才有） */
+  cpu?: number;
   diagnostics: Diag[];
   format: 'exe' | 'com' | 'boot';
   /** format 为 boot 时：从哪个 BIOS 驱动器启动（0 = A:，80h = C:） */

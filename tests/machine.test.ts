@@ -340,7 +340,7 @@ describe('汇编器', () => {
       ['push 5', /80186/],
       ['mov ax, [cx]', /BX、BP、SI、DI/],
       ['jmp nowhere', /未定义的符号：nowhere/],
-      ['pusha', /不是 8086 指令/],
+      ['pusha', /80186 的指令.*.186/],
       ['start mov ax, 1', /后面要加冒号/],
     ];
     for (const [line, re] of cases) {

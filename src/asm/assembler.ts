@@ -3,7 +3,7 @@
 // 采用多遍扫描：每一遍完整处理一次源代码，向前引用使用上一遍得到的符号值，
 // 直到所有符号的地址都不再变化。跳转指令先按短跳转生成，放不下时改为长跳转（跨遍保持）。
 import { AsmError, stripComment, tokenize, type Token } from './lexer.ts';
-import { Encoder, newVal, isMnemonic, isCoreMnemonic, PREFIXES, R_BX, R_BP, R_SI, R_DI, type Val } from './encoder.ts';
+import { Encoder, newVal, isMnemonic, isCoreMnemonic, cpuLevelOf, PREFIXES, R_BX, R_BP, R_SI, R_DI, type Val } from './encoder.ts';
 import {
   T_FAR, T_NEAR, type Diag, type Frame, type Group, type Program, type ProgramSymbol, type Segment, type Sym,
 } from './types.ts';
@@ -57,6 +57,9 @@ class Assembler {
   private assume: (Frame | null)[] = [null, null, null, null];
   private procStack: Sym[] = [];
   private model = '';
+  /** .186 / .286 / .286P 打开的指令集（0 = 8086），以及实际用到的最高一级 */
+  private cpu = 0;
+  private cpuUsed = 0;
   private macros = new Map<string, MacroDef>();
   private localCounter = 0;
   private macroDepth = 0;
@@ -115,6 +118,8 @@ class Assembler {
     this.assume = [null, null, null, null];
     this.procStack = [];
     this.model = '';
+    this.cpu = 0;
+    this.cpuUsed = 0;
     this.macros.clear();
     this.localCounter = 0;
     this.cond = [];
@@ -212,7 +217,9 @@ class Assembler {
     if (w0 === 'exitm') { if (this.macroDepth) throw new ExitMacro(); throw new AsmError('EXITM 只能用在宏里'); }
     if (w0 === 'local') { throw new AsmError('LOCAL 只能写在宏定义的开头'); }
 
-    if (t1 && t0.kind === 'id' && !isCoreMnemonic(w0) && !(w0 in PREFIXES)) {
+    // .186 / .286 之后，PUSHA、INS、STR 这些就是指令（8086 方式下它们还可以当符号名）
+    const newInstr = this.cpu > 0 && cpuLevelOf(w0) > 0;
+    if (t1 && t0.kind === 'id' && !isCoreMnemonic(w0) && !newInstr && !(w0 in PREFIXES)) {
       if (w1 in DATA_DIRS && !(w0 in DATA_DIRS)) { this.defineData(t0, w1, toks.slice(2)); return i; }
       switch (w1) {
         case 'equ': this.equ(t0, toks.slice(2), raw, t1); return i;
@@ -843,10 +850,23 @@ class Assembler {
     this.defineSegSym(name, g);
   }
 
+  /** .8086 / .186 / .286 / .286P …：选择允许的指令集（.8087 等协处理器伪指令不影响） */
+  private cpuDirective(w: string): void {
+    if (/^.(8087|287|387|no87)$/.test(w)) return;
+    if (w === '.8086') this.cpu = 0;
+    else if (w === '.186') this.cpu = 1;
+    else if (w === '.286' || w === '.286c') this.cpu = 2;
+    else if (w === '.286p') this.cpu = 3;
+    else {
+      this.cpu = 3;
+      this.warn(`${w.toUpperCase()}：32 位指令暂不支持，按 .286P 处理（可以用 80186/80286 的指令）`);
+    }
+  }
+
   private directive(w: string, toks: Token[]): boolean {
     const args = toks.slice(1);
     if (IGNORED.has(w)) return true;
-    if (CPU_DIRS.has(w)) return true;
+    if (CPU_DIRS.has(w)) { this.cpuDirective(w); return true; }
     switch (w) {
       case '.model': {
         const m = args[0]?.lower;
@@ -975,7 +995,7 @@ class Assembler {
       const mt = toks[k];
       const mn = mt.lower;
       if (!isMnemonic(mn)) throw new AsmError(`前缀后面应该是指令：${mt.text}`, mt.col);
-      if (prefixes.some(p => p !== 0xf0) && !/^(movs|cmps|stos|lods|scas)[bw]?$/.test(mn)) {
+      if (prefixes.some(p => p !== 0xf0) && !/^(movs|cmps|stos|lods|scas|ins|outs)[bw]?$/.test(mn)) {
         this.warn(`REP 前缀只对串操作指令有意义（${mt.text.toUpperCase()} 不是串操作）`);
       }
       const vals = splitComma(toks.slice(k + 1)).map(part => {
@@ -993,6 +1013,8 @@ class Assembler {
         isLong: this.longJumps.has(stmt),
         setLong() { asm.longJumps.add(stmt); },
         warn: (m: string) => this.warn(m),
+        cpu: this.cpu,
+        useCpu: (level: number) => { if (level > this.cpuUsed) this.cpuUsed = level; },
       }, mn, vals, prefixes);
     }
     this.emit(bytes);
@@ -1154,6 +1176,7 @@ class Assembler {
     return {
       ok: !diags.some(d => d.severity === 'error'),
       diagnostics: diags,
+      cpu: this.cpuUsed,
       format: this.isCom ? 'com' : 'exe',
       loadSeg, pspSeg, chunks, entry, stack, lineToAddrs, addrToLine, symbols, listing,
       segments: this.segList.map(s => ({ name: s.name, addr: base + s.start, size: s.size, loadStart: s.loadStart, bytes: Array.from({ length: s.size }, (_, k) => s.bytes[k] ?? -1) })),

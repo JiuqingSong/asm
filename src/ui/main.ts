@@ -713,6 +713,11 @@ class App {
     const warns = p.diagnostics.filter(d => d.severity === 'warning').length;
     const size = p.chunks.reduce((n, c) => n + c.bytes.length, 0);
     this.addMessage('ok', `${who}汇编成功：${p.format.toUpperCase()} 程序，${size} 字节${warns ? `，${warns} 个警告` : ''}`, s.i);
+    // 用了 80186/80286 的指令（.186 / .286）：8088 上这些操作码是别的指令，程序会跑飞
+    if (p.cpu && s.m.cpuModel === '8088') {
+      this.addMessage('warning', `${who}程序用了 ${p.cpu === 1 ? '80186' : '80286'} 的指令（例如 PUSHA、INSW、SHR AL, 4），8088 上没有这些指令。请把工具栏的 CPU 选成 286 或更高再运行。`, s.i);
+      if (showMessages) this.setTab('messages');
+    }
     if (showMessages && warns) this.setTab('messages');
     return true;
   }
