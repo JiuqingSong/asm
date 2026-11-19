@@ -410,27 +410,42 @@ function signedImm(v: number): string {
 }
 
 /**
- * 反汇编一段代码，使 at 处的指令包含在里面：向前回溯若干字节找一个能"对齐"到 at 的起点，
- * 再向后连续反汇编 count 条。
+ * 反汇编一段代码，使 at 处的指令包含在里面，前面大约有 before 条指令，一共 count 条。
+ *
+ * x86 的指令长短不一，往回找"前面的指令从哪里开始"没有唯一答案：从不同的字节开始解码，可能都能对齐到 at。
+ * 做法是试遍前面几十个字节里的每个起点，挑最可信的一个：
+ * - anchors 是已知的指令起点（执行过的指令、程序入口、引导扇区的 7C00）：路过的越多越可信；
+ * - 解码出来的怪指令（没有文档的操作码、只能写成 DB 的字节）越少越可信；
+ * - 再看回溯得多远：错位的解码通常几条以后就会"归位"，从更远处开始，靠近 at 的部分更可能是对的。
+ * 选好以后只保留 at 前面的 before 条（所以从 7C00 到 at 有十几条指令时也不会把 7C00 那条挤掉）。
  */
-export function disassembleAround(read: ReadByte, at: number, before: number, count: number, cpu: boolean | DisasmMode = false): Instruction[] {
+export function disassembleAround(read: ReadByte, at: number, before: number, count: number, cpu: boolean | DisasmMode = false,
+  anchors?: ReadonlySet<number>): Instruction[] {
   const mask = typeof cpu === 'object' && cpu.code32 ? 0xffffffff : 0xffff;
   const m = (v: number) => (v & mask) >>> 0;
   at = m(at);
-  let bestStart = at, bestN = 0;
-  for (let back = Math.min(before * 6, at); back > 0; back--) {
-    const s = m(at - back);
-    let p = s, n = 0;
-    while (m(at - p) > 0 && m(at - p) <= back && n < 64) {
-      const ins = disassemble(read, p, cpu);
-      p = m(p + ins.length);
-      n++;
+  let bestPath: number[] = [], bestScore = -Infinity;
+  if (before > 0) {
+    for (let back = Math.min(before * 6 + 16, at); back > 0; back--) {
+      const path: number[] = [];
+      let p = m(at - back), weird = 0, hits = 0;
+      while (m(at - p) > 0 && m(at - p) <= back && path.length < 128) {
+        const ins = disassemble(read, p, cpu);
+        path.push(p);
+        if (anchors?.has(p)) hits++;
+        p = m(p + ins.length);
+        if (ins.undocumented || ins.mnemonic === 'DB') weird++;
+      }
+      if (p !== at) continue;
+      // 只看最后 before 条里的怪指令（更前面的会被裁掉，不显示）
+      let shownWeird = 0;
+      for (const q of path.slice(-before)) { const ins = disassemble(read, q, cpu); if (ins.undocumented || ins.mnemonic === 'DB') shownWeird++; }
+      const score = Math.min(hits, 64) * 1000 - shownWeird * 50 - weird + back * 0.01;
+      if (score > bestScore) { bestScore = score; bestPath = path; }
     }
-    if (p === at && n > bestN && n <= before + 2) { bestStart = s; bestN = n; }
-    if (bestN >= before) break;
   }
   const out: Instruction[] = [];
-  let p = bestStart;
+  let p = bestPath.length ? bestPath[Math.max(0, bestPath.length - before)] : at;
   while (out.length < count) {
     const ins = disassemble(read, p, cpu);
     out.push(ins);

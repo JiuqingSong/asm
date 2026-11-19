@@ -109,4 +109,19 @@ describe('反汇编', () => {
     expect(list.map(i => i.offset)).toEqual([0, 3, 6, 9].slice(-4).length === 4 ? list.map(i => i.offset) : []);
     expect(list.some(i => i.offset === 9 && i.text === 'MOV DX,0004h')).toBe(true);
   });
+  it('引导扇区：从 7C00 到当前指令有十几条时，往回找的起点仍然对齐，不会错位解码（也不会挤掉开头的 CLI）', () => {
+    // CLI / XOR AX,AX / MOV DS,AX / MOV ES,AX / MOV SS,AX / MOV SP,7C00h / STI / MOV SI,7C30h /
+    // LODSB / TEST AL,AL / JE / MOV AH,0Eh / INT 10h / JMP SHORT / HLT；7C00 前面是 0
+    const code = [0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0xbc, 0x00, 0x7c, 0xfb, 0xbe, 0x30, 0x7c,
+      0xac, 0x84, 0xc0, 0x74, 0x06, 0xb4, 0x0e, 0xcd, 0x10, 0xeb, 0xf5, 0xf4];
+    const read = (o: number) => (o >= 0x7c00 && o < 0x7c00 + code.length ? code[o - 0x7c00] : 0);
+    const starts = [0x7c00, 0x7c01, 0x7c03, 0x7c05, 0x7c07, 0x7c09, 0x7c0c, 0x7c0d, 0x7c10, 0x7c11, 0x7c13, 0x7c15, 0x7c17, 0x7c19];
+    // 有已知的起点（引导扇区的入口）：前面 13 条正好从 7C00 开始
+    const a = disassembleAround(read, 0x7c19, 13, 14, false, new Set([0x7c00]));
+    expect(a.map(i => i.offset)).toEqual(starts);
+    expect(a[0].text).toBe('CLI');
+    // 没有任何已知起点：显示出来的部分也要对齐（不能出现 7C02 那样的错位）
+    const b = disassembleAround(read, 0x7c17, 8, 9);
+    expect(b.every(i => starts.includes(i.offset))).toBe(true);
+  });
 });

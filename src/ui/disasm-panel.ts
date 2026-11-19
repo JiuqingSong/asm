@@ -107,7 +107,7 @@ export class DisasmPanel {
       const target = this.shown[Math.min(n, this.shown.length - 1)];
       off = n < this.shown.length ? target.offset : (target.offset + target.length) & this.offMask(m, seg);
     } else {
-      off = disassembleAround(read, first, -n, 1, this.mode(m, seg))[0].offset;
+      off = disassembleAround(read, first, -n, 1, this.mode(m, seg), m.knownInstructionStarts(seg))[0].offset;
       if (off === first) off = (first - 1) & this.offMask(m, seg); // 回溯不到对齐的起点时至少退一个字节
     }
     this.view = { seg, off };
@@ -137,7 +137,7 @@ export class DisasmPanel {
     const rows = this.rowsFit();
     const mode = this.mode(m, seg), base = this.base(m, seg);
     const hx = (v: number) => (v > 0xffff ? (v >>> 0).toString(16).toUpperCase().padStart(8, '0') : h4(v));
-    const list = (following ? disassembleAround(read, cpu.ip, 8, rows, mode) : disassembleAround(read, this.view!.off, 0, rows, mode))
+    const list = (following ? disassembleAround(read, cpu.ip, 8, rows, mode, m.knownInstructionStarts(seg)) : disassembleAround(read, this.view!.off, 0, rows, mode))
       .map(i => trapAware(read, seg, i));
     this.shown = list; this.shownSeg = seg;
     if (document.activeElement !== this.input) this.input.value = following ? `${h4(cpu.s[CS])}:${hx(cpu.ip)}` : `${h4(seg)}:${hx(list[0].offset)}`;

@@ -97,6 +97,16 @@ class History {
     this.wpos++;
   }
 
+  /** 最近 n 条记录里 CS = seg 的指令的偏移（反汇编往回找指令起点时用） */
+  recentOffsets(seg: number, n = 4096): Set<number> {
+    const out = new Set<number>();
+    for (let k = 1; k <= Math.min(n, this.count); k++) {
+      const o = ((this.head - k) % this.cap) * 18;
+      if (this.regs[o + 9] === seg) out.add(this.regs[o + 14]);
+    }
+    return out;
+  }
+
   /** 撤销最近一条记录；返回该记录的标志（-1 表示没有记录） */
   undo(cpu: CPU, restore: (addr: number, old: number) => void): number {
     if (this.count === 0) return -1;
@@ -759,6 +769,18 @@ export class Machine {
     const keys = [0x1d, 0x38, 0x53];
     for (const scan of keys) this.pressKey({ scan, ascii: 0, release: false });
     for (const scan of [...keys].reverse()) this.pressKey({ scan: scan | 0x80, ascii: 0, release: true });
+  }
+
+  /** 段 seg 里已知的指令起点（偏移）：最近执行过的指令、程序入口、引导扇区的入口 7C00。反汇编往回找对齐时用 */
+  knownInstructionStarts(seg: number): Set<number> {
+    const out = this.history.recentOffsets(seg);
+    const p = this.program;
+    if (p) {
+      if (p.entry.cs === seg) out.add(p.entry.ip);
+      if (p.format === 'boot' && seg === 0) out.add(0x7c00);
+    }
+    out.add(this.cpu.s[CS] === seg ? this.cpu.ip : -1);
+    return out;
   }
 
   /** BIOS 驱动器号对应的磁盘映像（0、1 软驱，80h、81h 硬盘；从光驱启动时 0 是光盘里的软盘映像，1 是原来的 A:） */
