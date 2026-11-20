@@ -14,6 +14,7 @@ import { Video } from './video.ts';
 import { Mouse, MOUSE_STUB, MOUSE_PTR, MOUSE_VECTOR } from './mouse.ts';
 import { FONT_LO, FONT_HI } from './bios.ts';
 import { builtinFont } from './font8x8.ts';
+import { DEFAULT_CONFIG, type MachineConfig } from './config.ts';
 
 /** CPU 速度选项：每条指令平均消耗的 PIT 时钟数（PIT 为 1.193182 MHz） */
 export const CPU_SPEEDS = [
@@ -144,6 +145,7 @@ class History {
 }
 
 const H_VISIBLE = 1;
+const ABSENT_VIDEO = { read: (_off: number) => 0xff, write: (_off: number, _v: number) => {} };
 /** 历史记录里显卡平面字节的地址从这里开始（内存是 16MB，不会和它重叠） */
 const PLANAR_HISTORY = 0x1000000;
 
@@ -158,6 +160,7 @@ export interface MachineEvents {
 }
 
 export class Machine {
+  readonly config: Readonly<MachineConfig>;
   cpu = new CPU();
   mem = this.cpu.mem;
   pic = new PIC();
@@ -165,11 +168,11 @@ export class Machine {
   pic2 = new PIC();
   dma = new DMA();
   /** IDE 第二通道上的 ATAPI 光驱（IRQ15） */
-  cdrom = new AtapiCdrom(() => this.pic2.raise(7), () => this.pic2.lower(7));
+  cdrom = new AtapiCdrom(() => { if (this.config.cdrom) this.raiseIrq(15); }, () => this.pic2.lower(7));
   /** IDE 第一通道上的 ATA 硬盘（IRQ14）：C: 主盘、D: 从盘，给 Windows 95 的 32 位磁盘驱动用；DOS 经 INT 13h 读写 */
   ide = new IdeChannel({
-    disk: u => this.drives[2 + u],
-    irq: () => this.pic2.raise(6),
+    disk: u => this.config.ide ? this.drives[2 + u] : null,
+    irq: () => { if (this.config.ide) this.raiseIrq(14); },
     irqOff: () => this.pic2.lower(6),
     now: () => this.clock,
     written: () => this.disksChanged(),
@@ -177,10 +180,10 @@ export class Machine {
   /** 软驱控制器（端口 3F0h~3F7h，IRQ6，DMA 2 号通道）：给 Windows 95 这样自己操作软驱的系统用；DOS 经 INT 13h 读写 */
   fdc = new FloppyController({
     disk: d => this.driveFor(d),
-    driveExists: d => d === 0 || d === 1,
+    driveExists: d => this.floppyInstalled(d),
     now: () => this.clock,
-    irq: () => this.pic.raise(6),
-    dma: data => (this.dma.ready(2) ? this.dma.transfer(2, data, this.cpu) : null), // 方向由通道的模式决定（和真机一样）
+    irq: () => { if (this.config.fdc) this.raiseIrq(6); },
+    dma: data => (this.config.dma && this.dma.ready(2) ? this.dma.transfer(2, data, this.cpu) : null), // 方向由通道的模式决定（和真机一样）
     written: d => { const x = this.drives[d]; if (x) x.dirty = true; this.disksChanged(); },
   });
   // ---- 实时钟的中断（IRQ8）：CMOS 寄存器 A 的周期中断、每秒一次的更新结束中断；寄存器 C 是中断标志 ----
@@ -190,7 +193,7 @@ export class Machine {
   /** 下一个实时钟事件的时间（PIT 时钟） */
   private rtcNext = 0;
   kbd = new Keyboard(this.pic);
-  pit = new PIT(() => this.pic.raise(0));
+  pit = new PIT(() => { if (this.config.pit) this.raiseIrq(0); });
   /** 虚拟时间（PIT 时钟数） */
   clock = 0;
   /** 每条指令消耗的 PIT 时钟数（决定虚拟 CPU 的速度） */
@@ -216,8 +219,8 @@ export class Machine {
     this.cpu.is486 = id === '486';
     this.cpu.setFlags(this.cpu.flags); // 位 12-15：8086 为 1，286 为 0
   }
-  com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => (on ? this.pic.raise(4) : this.pic.lower(4)));
-  com2 = new UART('COM2', 0x2f8, 3, () => this.clock, on => (on ? this.pic.raise(3) : this.pic.lower(3)));
+  com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => { if (on && this.config.com1) this.raiseIrq(4); else this.pic.lower(4); });
+  com2 = new UART('COM2', 0x2f8, 3, () => this.clock, on => { if (on && this.config.com2) this.raiseIrq(3); else this.pic.lower(3); });
   /** 连接到另一台机器的串口线 */
   link: NullModem | null = null;
   hle = new Hle(this);
@@ -279,11 +282,12 @@ export class Machine {
   private retrace = 0;
   private unknownPorts = new Set<number>();
 
-  constructor() {
+  constructor(config: Partial<MachineConfig> = {}) {
+    this.config = Object.freeze({ ...DEFAULT_CONFIG, ...config });
     const cpu = this.cpu;
     cpu.io = this.makeBus();
     const pic = this.pic, kbd = this.kbd;
-    pic.slave = this.pic2;
+    pic.slave = this.config.slavePic ? this.pic2 : null;
     this.pic2.reset(0x70, 0xff);
     const mouse = this.mouse;
     // 8259、鼠标的状态一变就让 CPU 重新检查中断；没变时 CPU 不用每条指令都问
@@ -291,9 +295,9 @@ export class Machine {
     pic.onChange = this.pic2.onChange = mouse.onChange = wake;
     cpu.irqGated = true;
     cpu.irq = {
-      pending: () => pic.pending() || mouse.wantsCallback(),
+      pending: () => (this.config.pic && pic.pending()) || (this.mouseDriverEnabled && mouse.wantsCallback()),
       ack: () => {
-        if (!pic.pending()) {
+        if (!this.config.pic || !pic.pending()) {
           // 鼠标事件：桩代码会远调用登记的处理程序
           this.mem[BIOS_SEG * 16 + MOUSE_PTR] = mouse.handlerOff & 0xff;
           this.mem[BIOS_SEG * 16 + MOUSE_PTR + 1] = mouse.handlerOff >> 8;
@@ -309,14 +313,54 @@ export class Machine {
     };
     cpu.trap = (n) => this.hle.handle(n);
     // A0000~BFFFF 的显存都在显卡的 4 个平面里
-    cpu.mmio = this.video;
+    cpu.mmio = this.videoBus;
     cpu.onUnsupported = msg => { this.fatal = msg; };
     cpu.onShutdown = () => this.cpuReset(); // 三重错误：主板复位 CPU
     this.pit.onReload = ch => { if (ch === 2) this.updateSpeaker(); };
     cpu.onWrite = (a, old) => { if (this.history.enabled) this.history.write(a, old); };
     this.video.planar.onWrite = (a, old) => { if (this.history.enabled) this.history.write(PLANAR_HISTORY + a, old); };
     this.com1.onWarn = this.com2.onWarn = msg => this.log(msg);
-    this.com2.peer = this.serialMouse;
+    this.com2.peer = this.config.com2 && this.config.serialMouse ? this.serialMouse : null;
+  }
+
+  get dosEnabled(): boolean { return this.config.dos && this.program?.format !== 'boot'; }
+  get mouseDriverEnabled(): boolean { return this.config.mouseDriver && this.program?.format !== 'boot'; }
+  private get videoBus() { return this.config.vga ? this.video : ABSENT_VIDEO; }
+
+  floppyInstalled(drive: number): boolean {
+    return this.config.fdc && (drive === 0 ? this.config.floppyA : drive === 1 && this.config.floppyB);
+  }
+
+  serviceEnabled(n: number): boolean {
+    if (n === 0x20 || n === 0x21 || n === 0x28 || n === 0x2a) return this.dosEnabled;
+    if (n === 0x33 || n === 0x74 || n === 0x75) return this.mouseDriverEnabled;
+    if (n === 0x10 || n === 0x1f || n === 0x43) return this.config.bios && this.config.vga;
+    if (n === 0x1e) return this.config.bios && (this.floppyInstalled(0) || this.floppyInstalled(1) || this.cdEmu !== null);
+    if (n === 0x41 || n === 0x46) return this.config.bios && this.driveFor(n === 0x41 ? 0x80 : 0x81) !== null;
+    return this.config.bios;
+  }
+
+  private raiseIrq(irq: number): void {
+    if (!this.config.pic) return;
+    if (irq < 8) this.pic.raise(irq);
+    else if (this.config.slavePic) this.pic2.raise(irq - 8);
+  }
+
+  private portEnabled(port: number): boolean {
+    const c = this.config;
+    if (port >= 0x3f8 && port <= 0x3ff) return c.com1;
+    if (port >= 0x2f8 && port <= 0x2ff) return c.com2;
+    if (FloppyController.owns(port)) return c.fdc;
+    if (DMA.owns(port)) return c.dma;
+    if (AtapiCdrom.owns(port)) return c.cdrom;
+    if (IdeChannel.owns(port)) return c.ide;
+    if (port >= 0x3b0 && port <= 0x3df) return c.vga;
+    if (port === 0x20 || port === 0x21) return c.pic;
+    if (port === 0xa0 || port === 0xa1) return c.slavePic;
+    if (port >= 0x40 && port <= 0x43) return c.pit;
+    if (port === 0x60 || port === 0x64) return c.keyboard;
+    if (port === 0x70 || port === 0x71) return c.rtc;
+    return true;
   }
 
   // ======================= 端口 =======================
@@ -324,6 +368,7 @@ export class Machine {
   private makeBus(): IOBus {
     return {
       in8: (port) => {
+        if (!this.portEnabled(port)) { this.unknownPort(port, '读'); return 0xff; }
         if (port >= 0x3f8 && port <= 0x3ff) return this.com1.in8(port - 0x3f8);
         if (port >= 0x2f8 && port <= 0x2ff) return this.com2.in8(port - 0x2f8);
         if (FloppyController.owns(port)) return this.fdc.in8(port);
@@ -349,10 +394,20 @@ export class Machine {
         this.unknownPort(port, '读');
         return 0xff;
       },
-      wide: (port) => port === 0x170 || port === 0x1f0,
-      in16: port => (port === 0x1f0 ? this.ide.in16() : this.cdrom.in16()),
-      out16: (port, v) => { if (port === 0x1f0) this.ide.out16(v); else this.cdrom.out16(v); },
+      wide: (port) => (port === 0x170 && this.config.cdrom) || (port === 0x1f0 && this.config.ide),
+      in16: port => {
+        if (port === 0x1f0 && this.config.ide) return this.ide.in16();
+        if (port === 0x170 && this.config.cdrom) return this.cdrom.in16();
+        this.unknownPort(port, '读');
+        return 0xffff;
+      },
+      out16: (port, v) => {
+        if (port === 0x1f0 && this.config.ide) this.ide.out16(v);
+        else if (port === 0x170 && this.config.cdrom) this.cdrom.out16(v);
+        else this.unknownPort(port, '写');
+      },
       out8: (port, v) => {
+        if (!this.portEnabled(port)) { this.unknownPort(port, '写'); return; }
         if (port >= 0x3f8 && port <= 0x3ff) { this.com1.out8(port - 0x3f8, v); return; }
         if (port >= 0x2f8 && port <= 0x2ff) { this.com2.out8(port - 0x2f8, v); return; }
         if (FloppyController.owns(port)) { this.fdc.out8(port, v); return; }
@@ -466,7 +521,7 @@ export class Machine {
     this.rtcFlags |= fire;
     if (fire & b & 0x70 && !(this.rtcFlags & 0x80)) {
       this.rtcFlags |= 0x80;
-      this.pic2.raise(0);
+      this.raiseIrq(8);
     }
   }
 
@@ -475,14 +530,14 @@ export class Machine {
     const c = this.cmos;
     c.fill(0);
     c[0x0a] = 0x26; c[0x0b] = 0x02;        // 实时钟：32768Hz 晶振、1024Hz 周期；24 小时制，周期中断关闭
-    c[0x10] = 0x44;                       // A:、B: 固定为两台 1.44MB 软驱，与是否插盘无关
-    c[0x14] = 0x41;                       // 设备字节：两个软驱
+    c[0x10] = (this.floppyInstalled(0) ? 0x40 : 0) | (this.floppyInstalled(1) ? 4 : 0);
+    c[0x14] = this.equipmentWord;
     c[0x15] = 0x80; c[0x16] = 0x02;        // 常规内存 640KB
     const ext = this.cpu.is286 ? 15360 : 0;
     c[0x17] = c[0x30] = ext & 0xff; c[0x18] = c[0x31] = ext >> 8;
     // 硬盘类型：12h 的高、低 4 位是 C:、D:，Fh 表示看 19h/1Ah 的扩展类型；47 = 用户自定义，参数在 1Bh~23h、24h~2Ch
     for (const k of [0, 1]) {
-      const d = this.drives[2 + k];
+      const d = this.driveFor(0x80 + k);
       if (!d) continue;
       c[0x12] |= k ? 0x0f : 0xf0;
       c[0x19 + k] = 47;
@@ -557,14 +612,14 @@ export class Machine {
 
   /** 端口 61h 的位 0（定时器 2 号通道门控）和位 1（喇叭数据）都为 1 时，喇叭按 2 号通道的频率发声 */
   private updateSpeaker(): void {
-    const on = (this.port61 & 3) === 3;
+    const on = this.config.speaker && this.config.pit && (this.port61 & 3) === 3;
     const freq = on ? Math.round(1193182 / this.pit.reload[2]) : 0;
     if (freq !== this.speakerFreq) {
       this.speakerFreq = freq;
       this.events.speaker?.(freq);
     }
   }
-  bell(): void { this.events.bell?.(); }
+  bell(): void { if (this.config.speaker) this.events.bell?.(); }
   filesChanged(): void { this.events.filesChanged?.(); }
   consoleOut(ch: number): void {
     if (ch === 0x0a) this.console += '\n';
@@ -609,15 +664,48 @@ export class Machine {
 
   /** 装载程序；name 是程序文件名（写进环境变量块，程序可以由此知道自己的路径） */
   load(program: Program, cmdline = '', name = 'PROGRAM.EXE'): void {
-    const cpu = this.cpu, mem = this.mem;
-    this.program = program;
     const fromCd = program.format === 'boot' && program.bootDrive === CD_BOOT;
+    if (fromCd && !this.config.cdrom) throw new Error('未安装 ATAPI 光驱，不能从光盘启动');
+    const cdEmu = fromCd && !this.cdBootNoEmu ? this.cdBoot : null;
+    let bootImage: Uint8Array | null = null;
+    if (program.format === 'boot') {
+      if (fromCd && this.cdBootNoEmu) bootImage = this.cdBootNoEmu.image;
+      else {
+        const drive = fromCd ? 0 : program.bootDrive ?? 0;
+        const d = this.driveFor(drive, cdEmu);
+        if (!d) throw new Error(`${fromCd ? '光驱' : driveName(drive)} 没有磁盘映像，不能启动`);
+        bootImage = d.readSector(0);
+        if (!bootImage || bootImage[510] !== 0x55 || bootImage[511] !== 0xaa)
+          throw new Error(`${driveName(drive)} 的磁盘不能启动（第一个扇区末尾没有引导标记 55AAh；空白的硬盘需要先用启动软盘分区、格式化）`);
+      }
+      const start = fromCd && this.cdBootNoEmu ? (this.cdBootNoEmu.loadSeg || 0x7c0) * 16 : 0x7c00;
+      if (start + bootImage.length > this.mem.length) throw new Error('引导映像超出当前 CPU 的可用内存');
+    }
+    this.program = program;
     this.cdNoEmu = fromCd ? this.cdBootNoEmu : null;
-    this.cdEmu = fromCd && !this.cdNoEmu ? this.cdBoot : null;
-    mem.fill(0);
+    this.cdEmu = cdEmu;
+    this.mem.fill(0);
+    this.installFirmware();
+    if (program.format === 'boot') this.loadBootSector(program.bootDrive ?? 0, bootImage!);
+    else this.loadProgram(program, cmdline, name);
+    this.resetDevices();
+    this.hle.reset();
+    this.hle.clearWarnings();
+    this.unknownPorts.clear();
+    this.history.clear();
+    this.console = '';
+    this.instructions = 0;
+    this.status = 'ready';
+    this.poweredOff = false;
+    this.loadTail();
+  }
+
+  private installFirmware(): void {
+    const mem = this.mem;
     // 中断向量表与 BIOS 桩代码
     const bios = BIOS_SEG * 16;
     for (let n = 0; n < 256; n++) {
+      if (!this.serviceEnabled(n)) continue;
       let off = n * STUB_SIZE;
       if (n === 8) off = STUB_INT8;
       else if (n === 9) off = STUB_INT9;
@@ -630,17 +718,20 @@ export class Machine {
       else mem.set([TRAP_OPCODE, n, 0xcf], a);
     }
     // INT 8：时钟滴答 -> 调用 INT 1Ch -> EOI
-    mem.set([TRAP_OPCODE, 0x08, 0xcd, 0x1c, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT8);
+    if (this.config.bios) mem.set([TRAP_OPCODE, 0x08, 0xcd, 0x1c, 0x50, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT8);
     // 鼠标回调：保存寄存器 -> 陷阱（装入 AX~DI）-> CALL FAR CS:[0E20] -> 恢复寄存器 -> 陷阱（回调结束）-> IRET
-    mem.set([0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x1e, 0x06, TRAP_OPCODE, MOUSE_VECTOR, 0x2e, 0xff, 0x1e, MOUSE_PTR & 0xff, MOUSE_PTR >> 8,
-      0x07, 0x1f, 0x5d, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, TRAP_OPCODE, MOUSE_VECTOR + 1, 0xcf], bios + MOUSE_STUB);
-    mem[MOUSE_VECTOR * 4] = MOUSE_STUB & 0xff; mem[MOUSE_VECTOR * 4 + 1] = MOUSE_STUB >> 8;
-    mem[MOUSE_VECTOR * 4 + 2] = BIOS_SEG & 0xff; mem[MOUSE_VECTOR * 4 + 3] = BIOS_SEG >> 8;
+    if (this.mouseDriverEnabled) {
+      mem.set([0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x1e, 0x06, TRAP_OPCODE, MOUSE_VECTOR, 0x2e, 0xff, 0x1e, MOUSE_PTR & 0xff, MOUSE_PTR >> 8,
+        0x07, 0x1f, 0x5d, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, TRAP_OPCODE, MOUSE_VECTOR + 1, 0xcf], bios + MOUSE_STUB);
+      mem[MOUSE_VECTOR * 4] = MOUSE_STUB & 0xff; mem[MOUSE_VECTOR * 4 + 1] = MOUSE_STUB >> 8;
+      mem[MOUSE_VECTOR * 4 + 2] = BIOS_SEG & 0xff; mem[MOUSE_VECTOR * 4 + 3] = BIOS_SEG >> 8;
+    }
+    if (!this.config.bios) return;
     // INT 9：读键盘 -> 放入缓冲区 -> EOI
     // 先用 IN AL,60h 真的读一次键盘端口（Windows 增强模式的 DOS 窗口里，键盘驱动截获这个读操作送出扫描码），再进陷阱
     mem.set([0x50, 0xe4, 0x60, TRAP_OPCODE, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     // INT 10h：陷阱，切换显示模式后再用 OUT 指令写 VGA 寄存器（见 vgarom.ts）
-    mem.set(int10Stub(0x10), bios + STUB_INT10);
+    if (this.config.vga) mem.set(int10Stub(0x10), bios + STUB_INT10);
     IRQ_VECTORS.forEach((n, k) => {
       const off = IRQ_STUBS + k * 16;
       const trap = n === 0x0e || n === 0x70 || n === 0x76 ? [TRAP_OPCODE, n] : [];
@@ -653,11 +744,14 @@ export class Machine {
     mem.set([0xea, 0x5b, 0xe0, 0x00, 0xf0], 0xffff0);
     mem.set([TRAP_OPCODE, 0x19, 0xcf], bios + 0xe05b);
     // 软盘参数表（INT 1Eh 指向它，DOS 的引导扇区会复制并修改它）
-    mem.set([0xdf, 0x02, 0x25, 0x02, 0x12, 0x1b, 0xff, 0x6c, 0xf6, 0x0f, 0x08], bios + DPT_OFF);
-    mem[0x1e * 4] = DPT_OFF & 0xff; mem[0x1e * 4 + 1] = DPT_OFF >> 8;
+    if (this.serviceEnabled(0x1e)) {
+      mem.set([0xdf, 0x02, 0x25, 0x02, 0x12, 0x1b, 0xff, 0x6c, 0xf6, 0x0f, 0x08], bios + DPT_OFF);
+      mem[0x1e * 4] = DPT_OFF & 0xff; mem[0x1e * 4 + 1] = DPT_OFF >> 8;
+    }
     // 硬盘参数表（INT 41h、46h 指向第一、二个硬盘的）
     for (const [k, vec] of [[2, 0x41], [3, 0x46]] as const) {
-      const d = this.drives[k], t = bios + FDPT_OFF + (k - 2) * 16;
+      if (!this.serviceEnabled(vec)) continue;
+      const d = this.driveFor(0x80 + k - 2), t = bios + FDPT_OFF + (k - 2) * 16;
       if (d && !d.floppy) {
         mem[t] = d.geo.cylinders & 0xff; mem[t + 1] = d.geo.cylinders >> 8; mem[t + 2] = d.geo.heads;
         mem[t + 12] = d.geo.cylinders & 0xff; mem[t + 13] = d.geo.cylinders >> 8; mem[t + 14] = d.geo.sectors;
@@ -666,36 +760,41 @@ export class Machine {
       mem[vec * 4] = off & 0xff; mem[vec * 4 + 1] = off >> 8;
     }
     // 8×8 字库：INT 43h 指向前 128 个字符，INT 1Fh 指向后 128 个
-    if (Machine.font) {
+    if (Machine.font && this.config.vga) {
       mem.set(Machine.font.subarray(0, 1024), bios + FONT_LO);
       mem.set(Machine.font.subarray(1024, 2048), bios + FONT_HI);
     }
-    for (const [vec, off] of [[0x43, FONT_LO], [0x1f, FONT_HI]] as const) {
+    for (const [vec, off] of this.config.vga ? [[0x43, FONT_LO], [0x1f, FONT_HI]] as const : []) {
       mem[vec * 4] = off & 0xff; mem[vec * 4 + 1] = off >> 8; mem[vec * 4 + 2] = BIOS_SEG & 0xff; mem[vec * 4 + 3] = BIOS_SEG >> 8;
     }
     // BIOS 数据区
     const bda = 0x400;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
     // 设备字：位 0 有软驱，位 6~7 软驱数 − 1，位 4~5 = 00 表示 EGA/VGA（显卡有自己的 BIOS）
-    w16(bda + 0x10, 0x0041); // 固定安装 A:、B:，插拔介质不改变软驱数量
+    w16(bda + 0x10, this.cdEmu ? (this.floppyInstalled(0) ? 0x41 : 1) : this.equipmentWord);
     // EGA/VGA 的信息：87h 显存 256KB、显示器是彩色的；88h 开关设置；89h VGA 的模式设置选项
-    mem[bda + 0x87] = 0x60; mem[bda + 0x88] = 0x09; mem[bda + 0x89] = 0x11; mem[bda + 0x8a] = 0x0b;
-    // 显卡 BIOS 的 ROM：C000:0000 起是 55AAh 标志和长度（32KB），程序据此判断有 EGA/VGA 显卡
-    mem.set([0x55, 0xaa, 0x40], 0xc0000);
-    mem.set(Array.from('IBM VGA COMPATIBLE BIOS (AsmPerfect 86)', c => c.charCodeAt(0)), 0xc001e);
-    mem[bda + 0x75] = (this.drives[2] ? 1 : 0) + (this.drives[3] ? 1 : 0); // 硬盘个数
+    if (this.config.vga) {
+      mem[bda + 0x87] = 0x60; mem[bda + 0x88] = 0x09; mem[bda + 0x89] = 0x11; mem[bda + 0x8a] = 0x0b;
+      // 显卡 BIOS 的 ROM：C000:0000 起是 55AAh 标志和长度（32KB），程序据此判断有 EGA/VGA 显卡
+      mem.set([0x55, 0xaa, 0x40], 0xc0000);
+      mem.set(Array.from('IBM VGA COMPATIBLE BIOS (AsmPerfect 86)', c => c.charCodeAt(0)), 0xc001e);
+    }
+    mem[bda + 0x75] = (this.driveFor(0x80) ? 1 : 0) + (this.driveFor(0x81) ? 1 : 0);
     w16(bda + 0x13, 640);
     w16(bda + 0x1a, 0x1e); w16(bda + 0x1c, 0x1e);
-    mem[bda + 0x49] = 3;
-    w16(bda + 0x4a, 80);
-    w16(bda + 0x4c, 4000);
-    w16(bda + 0x60, 0x0607);
-    w16(bda + 0x63, 0x3d4);
+    if (this.config.vga) {
+      mem[bda + 0x49] = 3;
+      w16(bda + 0x4a, 80);
+      w16(bda + 0x4c, 4000);
+      w16(bda + 0x60, 0x0607);
+      w16(bda + 0x63, 0x3d4);
+      mem[bda + 0x84] = 24;
+    }
     w16(bda + 0x80, 0x1e); w16(bda + 0x82, 0x3e);
-    mem[bda + 0x84] = 24;
-    if (program.format === 'boot') this.loadBootSector(program.bootDrive ?? 0);
-    else this.loadProgram(program, cmdline, name);
-    // 设备
+  }
+
+  private resetDevices(): void {
+    const cpu = this.cpu;
     this.pic.reset(8, 0xb8);
     this.pic2.reset(0x70, 0xff);
     this.dma.reset();
@@ -712,48 +811,31 @@ export class Machine {
     this.video.reset();
     this.video.loadModeRegs(3);
     this.video.clearText();
-    cpu.mmio = this.video;
+    cpu.mmio = this.videoBus;
     cpu.resetProtected();
     cpu.setA20(false);
     this.kbcOutputPending = this.kbcWriteOutput = false;
     this.port92 = 0;
     this.initCmos();
-    this.rtcNextSecond = 0; this.rtcSchedule();
+    this.rtcNextSecond = 0;
+    if (this.config.rtc) this.rtcSchedule(); else this.rtcNext = Infinity;
     this.mouse.powerOn();
     this.com1.reset();
     this.com2.reset();
-    this.hle.reset();
-    this.hle.clearWarnings();
-    this.unknownPorts.clear();
-    this.history.clear();
-    this.console = '';
-    this.instructions = 0;
-    this.status = 'ready';
-    this.poweredOff = false;
-    this.loadTail();
   }
 
   /** 开机：把启动盘的第一个扇区读到 0000:7C00，从那里开始执行（DL = 驱动器号） */
-  private loadBootSector(drive: number): void {
+  private loadBootSector(drive: number, image: Uint8Array): void {
     const cpu = this.cpu, mem = this.mem;
-    // 和 BIOS 一样按 A:、C: 的顺序：A: 没有盘时从 C: 启动
     let entry = { cs: 0, ip: 0x7c00 };
     if (drive === CD_BOOT && this.cdNoEmu) {
       // 不模拟：把引导程序装到它指定的段（默认 07C0h，这时从 0000:7C00 开始执行），DL = 光驱的驱动器号
       const seg = this.cdNoEmu.loadSeg || 0x7c0;
-      mem.set(this.cdNoEmu.image, seg * 16);
+      mem.set(image, seg * 16);
       if (seg !== 0x7c0) entry = { cs: seg, ip: 0 };
     } else {
-      if (drive === CD_BOOT) {
-        if (!this.cdEmu) throw new Error('光驱里没有可以启动的光盘');
-        drive = 0;
-      }
-      if (drive === 0 && !this.driveFor(0) && this.drives[2]) drive = 0x80;
-      const d = this.driveFor(drive);
-      if (!d) throw new Error(`${driveName(drive)} 没有磁盘映像，不能启动`);
-      const sec = d.readSector(0)!;
-      if (sec[510] !== 0x55 || sec[511] !== 0xaa) throw new Error(`${driveName(drive)} 的磁盘不能启动（第一个扇区末尾没有引导标记 55AAh；空白的硬盘需要先用启动软盘分区、格式化）`);
-      mem.set(sec, 0x7c00);
+      if (drive === CD_BOOT) drive = 0;
+      mem.set(image, 0x7c00);
     }
     // 开机自检时 BIOS 按 CMOS 时钟设置"午夜以来的滴答数"，DOS 由此得到当前时间
     const now = new Date();
@@ -775,7 +857,7 @@ export class Machine {
   /** 关机：屏幕变黑，喇叭不响，程序停止（磁盘映像的内容保留） */
   powerOff(message = '已关机'): void {
     const mem = this.mem;
-    this.cpu.mmio = this.video;
+    this.cpu.mmio = this.videoBus;
     this.video.reset();
     this.video.loadModeRegs(3);
     mem[0x449] = 3;
@@ -831,16 +913,20 @@ export class Machine {
   }
 
   /** BIOS 驱动器号对应的磁盘映像（0、1 软驱，80h、81h 硬盘；从光驱启动时 0 是光盘里的软盘映像，1 是原来的 A:） */
-  driveFor(drive: number): Disk | null {
-    if (drive === 0) return this.cdEmu ?? this.drives[0];
-    if (drive === 1) return this.cdEmu ? this.drives[0] : this.drives[1];
-    if (drive === 0x80 || drive === 0x81) return this.drives[drive - 0x80 + 2];
+  driveFor(drive: number, cdEmu = this.cdEmu): Disk | null {
+    if (drive === 0) return cdEmu ?? (this.floppyInstalled(0) ? this.drives[0] : null);
+    if (drive === 1) return cdEmu ? (this.floppyInstalled(0) ? this.drives[0] : null) : this.floppyInstalled(1) ? this.drives[1] : null;
+    if ((drive === 0x80 || drive === 0x81) && this.config.ide) return this.drives[drive - 0x80 + 2];
     return null;
   }
 
-  /** 装载汇编出来的程序或 EXE/COM：PSP、环境变量、内存控制块、程序映像和寄存器 */
-  private loadProgram(program: Program, cmdline: string, name: string): void {
-    const cpu = this.cpu, mem = this.mem;
+  private get equipmentWord(): number {
+    const n = Number(this.floppyInstalled(0)) + Number(this.floppyInstalled(1));
+    return n ? 1 | ((n - 1) << 6) : 0;
+  }
+
+  private installDosEnvironment(program: Program, cmdline: string, name: string): void {
+    const mem = this.mem;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
     // PSP
     const psp = program.pspSeg * 16;
@@ -861,6 +947,12 @@ export class Machine {
     mem[psp + 0x80] = cmd.length;
     for (let k = 0; k < cmd.length; k++) mem[psp + 0x81 + k] = cmd.charCodeAt(k) & 0xff;
     mem[psp + 0x81 + cmd.length] = 0x0d;
+  }
+
+  /** 代码和入口寄存器不依赖 DOS，PSP 等兼容环境按配置安装 */
+  private loadProgram(program: Program, cmdline: string, name: string): void {
+    const cpu = this.cpu, mem = this.mem;
+    if (this.dosEnabled) this.installDosEnvironment(program, cmdline, name);
     // 程序映像
     for (const c of program.chunks) mem.set(c.bytes, c.addr);
     // 寄存器
@@ -877,7 +969,7 @@ export class Machine {
     cpu.waiting = false;
     if (program.format === 'com') {
       cpu.s[DS] = cpu.s[ES] = cpu.s[SS] = cpu.s[CS] = program.pspSeg;
-      w16(program.pspSeg * 16 + 0xfffe, 0);
+      if (this.dosEnabled) cpu.ww(program.pspSeg, 0xfffe, 0);
     }
   }
 
@@ -931,7 +1023,7 @@ export class Machine {
     cpu.step();
     this.instructions++;
     if (this.busy) this.advanceTime(this.busyClocks()); else this.advanceInstr();
-    this.kbd.tick(1);
+    if (this.config.keyboard) this.kbd.tick(1);
   }
 
   private recordHistory(): void {
@@ -942,9 +1034,10 @@ export class Machine {
 
   /** HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据 */
   private execHalted(): void {
-    const dt = Math.max(1, Math.min(this.pit.clocksToNextTick(), this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), Math.ceil(this.fdc.next - this.clock), Math.ceil(this.ide.next - this.clock)));
+    const next = Math.min(this.config.pit ? this.pit.clocksToNextTick() : Infinity, this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), this.config.fdc ? Math.ceil(this.fdc.next - this.clock) : Infinity, this.config.ide ? Math.ceil(this.ide.next - this.clock) : Infinity);
+    const dt = Number.isFinite(next) ? Math.max(1, next) : this.clocksPerInstr;
     this.advanceTime(dt);
-    this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
+    if (this.config.keyboard) this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
     this.cpu.step();
   }
 
@@ -954,7 +1047,7 @@ export class Machine {
   /** 推进虚拟时间：定时器、串口 */
   private advanceTime(dt: number): void {
     this.clock += dt;
-    this.pit.advance(dt);
+    if (this.config.pit) this.pit.advance(dt);
     this.devicesAfterClock();
   }
 
@@ -965,7 +1058,7 @@ export class Machine {
   private advanceInstr(): void {
     const dt = this.clocksPerInstr;
     this.clock += dt;
-    this.pit.advance(dt);
+    if (this.config.pit) this.pit.advance(dt);
     this.devicesAfterClock();
   }
 
@@ -979,24 +1072,25 @@ export class Machine {
 
   /** 推进串口和鼠标，再算出下一次需要推进的时间 */
   private tickSerial(): void {
-    this.com1.tick(this.clock);
-    this.com2.tick(this.clock);
+    if (this.config.com1) this.com1.tick(this.clock);
+    if (this.config.com2) this.com2.tick(this.clock);
     this.mouse.tick(this.clock);
     this.com1.touched = this.com2.touched = false;
     const m = this.mouse;
     this.serialDx = m.rawDx; this.serialDy = m.rawDy; this.serialBtn = m.buttons;
     const sm = this.serialMouse, p1 = this.com1.peer, p2 = this.com2.peer;
+    const attached = this.config.com2 && p2 === sm;
     // 双机串口线、别的外设、排队的按键、鼠标还有要发的移动：每条指令都推进（和以前一样）
-    if (this.link || (p1 !== null && p1 !== sm) || (p2 !== null && p2 !== sm) || m.queued || sm.hasPendingMotion()) this.serialNext = 0;
-    else this.serialNext = Math.min(this.com1.nextEvent(), this.com2.nextEvent(), sm.nextArrival());
+    if (this.link || (p1 !== null && p1 !== sm) || (p2 !== null && p2 !== sm) || m.queued || (attached && sm.hasPendingMotion())) this.serialNext = 0;
+    else this.serialNext = Math.min(this.config.com1 ? this.com1.nextEvent() : Infinity, this.config.com2 ? this.com2.nextEvent() : Infinity, attached ? sm.nextArrival() : Infinity);
   }
 
   /** 光驱、硬盘、软驱：有事要做时才调用（顺序和原来逐项检查一样） */
   private diskTick(): void {
-    if (this.cdrom.pending) this.cdrom.poll();
-    if (this.ide.pending) this.ide.poll();
-    if (this.clock >= this.ide.next) this.ide.tick();
-    if (this.clock >= this.fdc.next) this.fdc.tick();
+    if (this.config.cdrom && this.cdrom.pending) this.cdrom.poll();
+    if (this.config.ide && this.ide.pending) this.ide.poll();
+    if (this.config.ide && this.clock >= this.ide.next) this.ide.tick();
+    if (this.config.fdc && this.clock >= this.fdc.next) this.fdc.tick();
   }
 
   /** 机器空闲（等待键盘、已停止）时，让时间流逝到 t（双机运行时保持两台机器的时间同步） */
@@ -1234,10 +1328,11 @@ export class Machine {
   // ======================= 键盘 =======================
 
   pressKey(e: KeyEvent): void {
-    this.kbd.push(e);
+    if (this.config.keyboard) this.kbd.push(e);
   }
 
   typeText(text: string, scanFor: (ch: string) => number): void {
+    if (!this.config.keyboard) return;
     for (const ch of text) {
       const scan = scanFor(ch);
       const ascii = ch === '\n' ? 0x0d : ch.charCodeAt(0) & 0xff;

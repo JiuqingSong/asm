@@ -1,6 +1,7 @@
 // 布局检查：拖动三条分隔条、逐个最大化四个窗口（开发版）
 // 用法：node tools/ui-layout.mjs <截图目录>
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -17,7 +18,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const sizes = () => page.evaluate(() => {
   const r = s => { const e = document.querySelector(s); const b = e.getBoundingClientRect(); return e.offsetParent === null ? '隐藏' : `${Math.round(b.width)}×${Math.round(b.height)}`; };

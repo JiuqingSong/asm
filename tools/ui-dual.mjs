@@ -1,6 +1,7 @@
 // 双机界面检查：串口聊天示例 + （如果提供）send.asm/receive.asm 文件传输
 // 用法：node tools/ui-dual.mjs <截图目录> [send.asm] [receive.asm]
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -17,15 +18,15 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 page.on('console', m => { if (m.type() === 'error') errors.push(m.text()); });
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
-await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await page.goto(process.env.URL || 'http://localhost:5317/', { waitUntil: 'networkidle0' });
+await enterMode(page, 'dual');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const status = () => page.$eval('#status', e => e.textContent);
 
 if (process.env.SPEED) await page.select('#speed', process.env.SPEED);
 await page.select('#examples', 'chat');
 await sleep(400);
-console.log('模式：', await page.$eval('#mode', e => e.value), '标签：', await page.$eval('#ed-tabs', e => e.innerText.replace(/\n/g, ' | ')));
+console.log('模式：', await page.$eval('#mode-name', e => e.textContent), '标签：', await page.$eval('#ed-tabs', e => e.innerText.replace(/\n/g, ' | ')));
 await page.click('#btn-run');
 await sleep(500);
 const screens = await page.$$('.screen');

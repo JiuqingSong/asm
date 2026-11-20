@@ -14,7 +14,7 @@ function store(s: Saved): void {
   try { localStorage.setItem(KEY, JSON.stringify(s)); } catch { /* 无痕模式等情况下忽略 */ }
 }
 
-export function setupLayout(onChange: () => void): void {
+export function setupLayout(onChange: () => void): () => void {
   const layout = document.querySelector('.layout') as HTMLElement;
   const root = document.documentElement;
   const screenPane = layout.querySelector('.screen-pane') as HTMLElement;
@@ -112,4 +112,8 @@ export function setupLayout(onChange: () => void): void {
     const p = layout.querySelector('.pane.maxed') as HTMLElement | null;
     if (p) toggleMax(p);
   });
+  return () => {
+    const pane = layout.querySelector<HTMLElement>('.pane.maxed');
+    if (pane) toggleMax(pane);
+  };
 }

@@ -8,24 +8,24 @@
 </head>
 <body>
   <div id="app">
+    <section id="launcher">
+      <h1>AsmPerfect 86</h1>
+      <p>选择启动方式。进入之前不会装载程序或配置虚拟 PC 环境。</p>
+      <div class="start-cards">
+        <button data-start="debug"><strong>直接调试</strong><span>选择设备和 BIOS / DOS 服务，编写并调试汇编程序</span></button>
+        <button data-start="dual"><strong>双机对联</strong><span>使用默认配置，两台机器通过 COM1 串口连接</span></button>
+        <button data-start="full"><strong>完整模拟</strong><span>选择设备，从软盘、硬盘或光盘启动操作系统</span></button>
+      </div>
+      <p id="startup-error" role="alert"></p>
+    </section>
     <header class="toolbar">
       <div class="brand">AsmPerfect <span>86</span> <small id="version" class="version"></small></div>
       <div class="group">
-        <select id="examples" title="打开示例程序">
-          <option value="">示例程序…</option>
-        </select>
-        <button id="btn-open" title="打开 .asm 文件到当前编辑器">打开</button>
-        <button id="btn-save" title="保存当前编辑器为 .asm 文件">保存</button>
-      </div>
-      <div class="group">
-        <select id="mode" title="单机，或者两台机器用串口线连接">
-          <option value="single">单机</option>
-          <option value="dual">双机（串口连接）</option>
-        </select>
+        <button id="btn-home" title="停止当前会话，保存磁盘并返回启动选择页">启动选择</button>
+        <span id="mode-name"></span>
         <select id="cpu" title="CPU 型号：决定虚拟 CPU 的速度；286/386 下 PUSH SP 等少数指令的行为与 8086 不同"></select>
       </div>
       <div class="group">
-        <button id="btn-assemble" title="汇编并装载 (F7)">汇编</button>
         <button id="btn-run" class="primary" title="运行 (F5)">▶ 运行</button>
         <button id="btn-pause" title="暂停 (F6)">❚❚ 暂停</button>
         <select id="speed" title="运行速度">
@@ -38,6 +38,9 @@
         </select>
       </div>
       <div class="group">
+        <label class="check" title="串口鼠标捕获时全屏显示 DOS 屏幕，并申请将 Esc 传入虚拟机；右 Ctrl 释放（需要浏览器支持键盘锁定并授权）"><input type="checkbox" id="fullscreen-capture" /> 全屏捕获</label>
+      </div>
+      <div class="group">
         <label class="check" title="记录每条指令执行前的状态，才能后退。从磁盘启动时默认不记录（记录要多花约 20% 的时间）；随时可以勾上，从勾上那一刻开始记录"><input type="checkbox" id="record-history" /> 记录</label>
         <button id="btn-back" title="后退一步 (Ctrl+Shift+F11)">⟲ 后退</button>
         <button id="btn-step" title="单步进入 (F11)">↓ 单步</button>
@@ -46,9 +49,6 @@
         <button id="btn-reset" title="重新开始 (Ctrl+F5)">⟳ 重启</button>
         <button id="btn-cad" title="按下 Ctrl+Alt+Del（浏览器里按这三个键会被 Windows 系统截走，所以用这个按钮）。DOS 下是热启动；Windows 等程序会自己处理">Ctrl+Alt+Del</button>
         <button id="btn-power" title="关机：停止虚拟机，屏幕变黑，磁盘映像马上保存。从磁盘启动的 DOS 最好在 DOS 里运行 SHUTDOWN 关机（它会先把缓冲区写进磁盘）">⏻ 关机</button>
-      </div>
-      <div class="group">
-        <label class="check" title="在每行代码后面显示地址和机器码"><input type="checkbox" id="show-bytes" /> 机器码</label>
       </div>
       <div class="spacer"></div>
       <div id="status" class="status">就绪</div>
@@ -59,14 +59,28 @@
       <section class="pane editor-pane">
         <div class="pane-head ed-head">
           <div id="ed-tabs" class="ed-tabs"></div>
+          <div class="editor-tools">
+            <button id="btn-new" title="清空当前编辑器和文件名">新建</button>
+            <button id="btn-open" title="打开 .asm 文件到当前编辑器">打开</button>
+            <select id="examples" title="打开示例程序">
+              <option value="">示例程序…</option>
+            </select>
+            <button id="btn-save" title="保存当前编辑器为 .asm 文件">保存</button>
+            <button id="btn-assemble" title="汇编并装载 (F7)">汇编</button>
+            <label class="check" title="在每行代码后面显示地址和机器码"><input type="checkbox" id="show-bytes" /> 机器码</label>
+          </div>
           <span id="dirty-note" class="note"></span>
-          <button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button>
+          <div class="editor-actions">
+            <button id="btn-export" title="根据当前源码生成 DOS EXE 或 COM，并下载到本机">生成 EXE/COM</button>
+            <button class="max-btn" title="最大化 / 还原（也可以双击标题栏）">⛶</button>
+          </div>
         </div>
         <div id="editor"></div>
       </section>
       <div class="splitter h" data-split="screen" title="拖动调整大小，双击恢复"></div>
 
       <section class="pane screen-pane">
+        <div class="capture-hint">全屏捕获：右 Ctrl 释放鼠标并返回窗口；Esc 交给虚拟机（长按 Esc 可强制退出）。</div>
         <div class="screens">
           <div class="screen-box" data-i="0">
             <div class="pane-head">
@@ -141,18 +155,49 @@
         </div>
         <div class="tab-body hidden" id="tab-messages"></div>
         <div class="tab-body hidden" id="tab-files">
-          <div id="drives"></div>
-          <div class="drives-head">文件：模拟的 DOS 直接读写的文件（运行汇编程序、EXE/COM 时使用）</div>
-          <div class="mem-bar">
+          <div class="drives-head dos-files">文件：模拟的 DOS 直接读写的文件（运行汇编程序、EXE/COM 时使用）</div>
+          <div class="mem-bar dos-files">
             <button id="file-upload">上传文件到虚拟磁盘</button>
             <span id="file-target" class="note"></span>
           </div>
-          <div id="files"></div>
+          <div id="files" class="dos-files"></div>
+          <div id="drives"></div>
         </div>
       </section>
       </div>
     </main>
   </div>
+  <dialog id="startup-config" class="startup-dialog">
+    <form>
+      <h2 id="config-title"></h2>
+      <p>CPU 和基础内存始终保留。取消设备后不会自动补装；依赖它们的程序可能无法工作。</p>
+      <label>CPU <select id="config-cpu"></select></label>
+      <div id="config-options"></div>
+      <label id="config-images-option" class="check">
+        <input type="checkbox" id="config-images" /> 显示磁盘映像文件系统（软盘、硬盘和光驱）
+      </label>
+      <p id="config-warnings" class="config-warnings"></p>
+      <div class="dialog-actions">
+        <button type="button" id="config-defaults">恢复默认</button>
+        <span class="spacer"></span>
+        <button type="button" id="config-cancel">取消</button>
+        <button type="submit" class="primary">进入环境</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="boot-choice" class="startup-dialog">
+    <h2>选择启动设备</h2>
+    <p>可以先在下方装入或更换映像。重启会再次询问；客体热启动沿用本次启动源。</p>
+    <div class="dialog-actions">
+      <button data-boot="0">从 A: 启动</button>
+      <button data-boot="128">从 C: 启动</button>
+      <button data-boot="224">从光盘启动</button>
+      <span class="spacer"></span>
+      <button id="boot-cancel">取消</button>
+    </div>
+    <p id="boot-error" class="config-warnings" role="alert"></p>
+    <div id="boot-media"></div>
+  </dialog>
   <input type="file" id="file-input" accept=".asm,.inc,.txt" hidden />
   <input type="file" id="disk-input" hidden multiple />
   <script type="module" src="/src/ui/main.ts"></script>

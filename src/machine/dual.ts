@@ -12,8 +12,8 @@ export class DualMachine {
   readonly m: [Machine, Machine];
   readonly link: NullModem;
 
-  constructor(wiring: Wiring = 'loopback-rts') {
-    this.m = [new Machine(), new Machine()];
+  constructor(wiring: Wiring = 'loopback-rts', machines: [Machine, Machine] = [new Machine(), new Machine()]) {
+    this.m = machines;
     this.link = new NullModem(this.m[0].com1, this.m[1].com1, wiring);
     this.m[0].link = this.link;
     this.m[1].link = this.link;

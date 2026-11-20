@@ -122,6 +122,12 @@ export class Hle {
 
   // ---------- 入口 ----------
   handle(n: number): boolean {
+    if (!this.m.serviceEnabled(n)) {
+      const msg = `当前环境未安装 INT ${hex(n)}h 服务`;
+      this.warnOnce(msg);
+      this.m.requestBreak(msg);
+      return true;
+    }
     switch (n) {
       case 0x00: return this.divideError();
       case 0x01: case 0x04: return true;
@@ -180,6 +186,9 @@ export class Hle {
   }
 
   private clock(): boolean {
+    if ((this.ah === 0x02 || this.ah === 0x04) && !this.m.config.rtc) {
+      this.ah = 0x86; this.retFlag(CF, true); return true;
+    }
     const d = new Date();
     const bcd = (v: number) => ((Math.floor(v / 10) % 10) << 4) | (v % 10);
     switch (this.ah) {
@@ -301,10 +310,13 @@ export class Hle {
     if (ah === 0x4b && drive === 0 && this.m.cdFloppyBoot) return this.cdBootStatus();
     const d = this.m.driveFor(drive);
     const hard = drive >= 0x80;
+    const installed = this.m.cdFloppyBoot
+      ? drive === 0 || (drive === 1 && this.m.floppyInstalled(0))
+      : this.m.floppyInstalled(drive);
     const c = (r[CX] >> 8) | ((r[CX] & 0xc0) << 2), s = r[CX] & 0x3f, h = r[DX] >> 8;
     const notReady = () => this.diskStatus(drive, hard ? 0x01 : 0x80); // 硬盘：无效命令；软驱：超时（没有盘）
     switch (ah) {
-      case 0x00: case 0x0d: this.diskStatus(drive, d || drive === 0 || drive === 1 ? 0 : 0x01); return true; // 复位
+      case 0x00: case 0x0d: this.diskStatus(drive, d || installed ? 0 : 0x01); return true; // 复位
       case 0x01: { // 读上次的状态
         const st = cpu.rb(BDA, hard ? 0x74 : 0x41);
         this.ah = st; this.retFlag(CF, st !== 0);
@@ -350,7 +362,7 @@ export class Hle {
         return true;
       }
       case 0x08: { // 读驱动器参数
-        if (!hard && drive > 1) { this.diskStatus(drive, 0x01); return true; }
+        if (!hard && !installed && !d) { r[DX] = 0; this.diskStatus(drive, 0x01); return true; }
         const count = hard ? cpu.rb(BDA, 0x75) : (cpu.rw(BDA, 0x10) & 1 ? ((cpu.rw(BDA, 0x10) >> 6) & 3) + 1 : 0);
         if (!d) {
           if (hard) { r[DX] = 0; this.diskStatus(drive, 0x01); return true; }
@@ -374,7 +386,7 @@ export class Hle {
           this.ah = 3; this.retFlag(CF, false);
           return true;
         }
-        this.ah = drive <= 1 ? 2 : 0; this.retFlag(CF, false);
+        this.ah = installed || d ? 2 : 0; this.retFlag(CF, false);
         return true;
       }
       case 0x16: // 软盘有没有换过：换过返回 AH=06h、CF=1（只报告一次）
@@ -448,6 +460,9 @@ export class Hle {
 
   /** INT 14h：串口 BIOS（只回答状态，不收发） */
   private serialBios(): boolean {
+    if (!(this.cpu.r[DX] === 0 ? this.m.config.com1 : this.cpu.r[DX] === 1 && this.m.config.com2)) {
+      this.ah = 0x80; this.al = 0; return true;
+    }
     if (this.ah === 0x00 || this.ah === 0x03) { this.ah = 0x60; this.al = 0x30; return true; }
     this.ah = 0x80; // 超时
     return true;

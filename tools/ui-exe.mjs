@@ -1,6 +1,7 @@
 // 在浏览器里直接运行一个 DOS 可执行文件（开发版），打开中文显示，截图
 // 用法：node tools/ui-exe.mjs <截图目录> <EXE 文件> [其他要放进虚拟磁盘的文件...]
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
@@ -17,7 +18,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const files = [exe, ...extra].map(f => [basename(f).toUpperCase(), Array.from(readFileSync(f))]);

@@ -1,6 +1,7 @@
 // 磁盘映像里的文件（开发版）：放入硬盘映像，浏览目录，新建目录，上传文件，再从 C: 启动用 DIR 查看
 // 用法：node tools/ui-fs.mjs <截图目录> <装好 DOS 的硬盘映像> <要放进去的文件...>
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { mkdirSync } from 'node:fs';
 import { join, basename } from 'node:path';
 
@@ -17,10 +18,9 @@ page.on('dialog', d => d.accept(d.type() === 'prompt' ? 'games' : undefined));
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); indexedDB.deleteDatabase('asm86-disks'); } catch { /* */ } });
 await page.goto(process.env.URL || 'http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page, 'full');
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 await page.select('#speed', '0');
-await page.click('.tabs button[data-tab="files"]');
 await sleep(300);
 let [ch] = await Promise.all([page.waitForFileChooser(), page.click('#drives button[data-act="insert"][data-drive="2"]')]);
 await ch.accept([hd]);
@@ -43,7 +43,7 @@ await ch.accept(files);
 await sleep(1500);
 console.log('GAMES 里：', await list());
 await page.screenshot({ path: join(out, 'fs-1.png') });
-await page.click('#drives button[data-act="boot"][data-from="128"]');
+await page.click('#boot-choice button[data-boot="128"]');
 await sleep(8000);
 await page.focus('.screen');
 await page.keyboard.type('dir games', { delay: 30 });

@@ -1,6 +1,7 @@
 // "原机速度"检查：示例程序按真实时间运行所需的秒数
 // 用法：node tools/ui-realtime.mjs [url]
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 
 const url = process.argv[2] ?? 'http://localhost:5317/';
 const browser = await puppeteer.launch({
@@ -15,7 +16,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto(url, { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const status = () => page.$eval('#status', e => e.textContent);
 

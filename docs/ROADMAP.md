@@ -1,6 +1,6 @@
 # AsmPerfect 86 开发计划
 
-最后更新：2026-11-18（版本 0.59，速度优化）。下次继续时，先读"现状"和"工作约定"，再从"下一步"里挑一项。
+最后更新：启动入口与可选设备配置重构（尚未发布）。下次继续时，先读"现状"和"工作约定"，再从"下一步"里挑一项。
 
 ## 现状
 
@@ -22,6 +22,7 @@
 | EGA/VGA 平面模式 | 0Dh、0Eh、10h、12h：4 个平面在 `Video.planar` 里，CPU 读写 A000 段经 `cpu.mmio` 交给图形控制器；属性控制器调色板 → DAC；反向执行能撤销平面写入；鼠标范围随模式变化。用户的 Turbo Pascal + EGAVGA.BGI 程序（中文界面、鼠标）能正常运行 | 测试 + `tools/ui-bgi.mjs`、`tools/run-exe.ts <EXE> "" <条数> <截图.png>` |
 | 鼠标 | INT 33h 驱动：常用功能、事件回调（经 BIOS 桩代码远调用用户程序）、文本/图形光标；按键变化排队，至少保持 30 毫秒虚拟时间 | 测试 + `tools/ui-mouse.mjs` |
 | 运行 DOS 程序 | 虚拟磁盘上的 EXE/COM 直接运行；DOS 内存控制块链（48h/49h/4Ah）、环境变量块；中文显示（GBK + 制表符识别） | 1996 年的 QuickBASIC 程序 SCRMK.EXE（PKLITE 压缩）能运行并显示中文菜单 |
+| 启动入口与设备配置 | 网页初始不创建虚拟 PC；直接调试按需安装硬件/BIOS/浅层 DOS/内置鼠标驱动；双机直接进入串口环境；完整模拟保留 BIOS、由磁盘系统提供 DOS 和鼠标驱动，隐藏源码；工具栏重启选设备，Ctrl+Alt+Del 沿用当前设备 | `tests/config.test.ts`、`tests/cdboot.test.ts`；`tools/ui-startup-check.mjs`；真实 MS-DOS 6.22 硬盘启动并运行 VER |
 
 ## 下一步（按建议顺序）
 

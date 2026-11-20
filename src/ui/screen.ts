@@ -3,6 +3,15 @@ import { SCAN, type KeyEvent } from '../machine/devices.ts';
 import { modeInfo, MODE_UNCHAINED, type Video } from '../machine/video.ts';
 import type { Mouse } from '../machine/mouse.ts';
 
+interface KeyboardLock {
+  lock(keys: string[]): Promise<void>;
+  unlock(): void;
+}
+
+type CapturePermissions = Permissions & {
+  query(descriptor: { name: 'keyboard-lock' }): Promise<PermissionStatus>;
+};
+
 const LOW = ' ☺☻♥♦♣♠•◘○◙♂♀♪♫☼►◄↕‼¶§▬↨↑↓→←∟↔▲▼';
 const HIGH = 'ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ';
 
@@ -104,9 +113,17 @@ export class Screen {
   onMouseRel: ((dx: number, dy: number, buttons: number) => void) | null = null;
   /** 程序在用串口鼠标（它自己画光标、只要相对移动量）：单击屏幕时捕获鼠标 */
   relative = false;
-  /** 捕获状态变化（界面据此提示"按 Esc 释放鼠标"） */
+  fullscreenCapture = false;
+  /** 捕获状态变化（界面据此提示"按右 Ctrl 释放鼠标"） */
   onCapture: ((captured: boolean) => void) | null = null;
+  onCaptureError: ((message: string) => void) | null = null;
   private get captured(): boolean { return document.pointerLockElement === this.el; }
+  private wasCaptured = false;
+  private capturing = false;
+  private releasingControlRight = false;
+  private keyboardLock: KeyboardLock | undefined;
+  private keyboardPermission: PermissionStatus | undefined;
+  private fullscreenOwner: HTMLElement | null = null;
   private rows: HTMLElement[] = [];
   private vramView = new Uint8Array(COLS * ROWS * 2);
   /** 中文显示：像 UCDOS 那样把 GBK 编码显示成汉字 */
@@ -169,14 +186,25 @@ export class Screen {
     el.addEventListener('mousemove', mouse);
     el.addEventListener('mousedown', e => {
       if (this.relative && !this.captured && e.button === 0) {
-        // 程序用的是串口鼠标：捕获鼠标（浏览器的光标消失，移动量全部交给程序），按 Esc 释放
-        try { void (this.el.requestPointerLock() as unknown as Promise<void> | undefined)?.catch?.(() => { /* 不允许捕获 */ }); } catch { /* 不支持 */ }
+        void this.capture();
         return;
       }
       mouse(e);
       if (e.button !== 0) e.preventDefault();
     });
-    document.addEventListener('pointerlockchange', () => this.onCapture?.(this.captured));
+    document.addEventListener('pointerlockchange', () => this.captureChanged());
+    document.addEventListener('fullscreenchange', () => {
+      if (this.fullscreenOwner && document.fullscreenElement !== this.fullscreenOwner) this.release();
+    });
+    const hostKey = (e: KeyboardEvent, release: boolean) => {
+      if (e.code !== 'ControlRight' || (!this.captured && !this.releasingControlRight)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this.releasingControlRight = !release;
+      if (!release) this.release();
+    };
+    document.addEventListener('keydown', e => hostKey(e, false), true);
+    document.addEventListener('keyup', e => hostKey(e, true), true);
     el.addEventListener('mouseup', mouse);
     el.addEventListener('contextmenu', e => { if (this.onMouse) e.preventDefault(); });
     el.addEventListener('keydown', e => this.key(e, false));
@@ -184,7 +212,7 @@ export class Screen {
     // 切到别的窗口（例如 Alt+Tab）时，松开键的事件发生在别处，虚拟机收不到：
     // 当作这些键都已松开，否则 BIOS 会一直以为 Alt、Ctrl、Shift 还按着
     el.addEventListener('blur', () => this.releaseAll());
-    window.addEventListener('blur', () => this.releaseAll());
+    window.addEventListener('blur', () => { this.releaseAll(); this.releasingControlRight = false; });
     const wrap = el.parentElement!;
     new ResizeObserver(() => this.fit(wrap)).observe(wrap);
     window.addEventListener('resize', () => this.fit(wrap));
@@ -196,7 +224,7 @@ export class Screen {
     // 等宽字体中一个字符约 0.6em 宽，行高 1.18em。
     // 窗口被拖动调整过大小或最大化时，按窗口的高度放大；否则屏幕高度不超过浏览器窗口的 40%
     const pane = wrap.closest('.screen-pane');
-    const sized = !!pane && (pane.classList.contains('sized') || pane.classList.contains('maxed'));
+    const sized = !!pane && (pane.classList.contains('sized') || pane.classList.contains('maxed') || document.fullscreenElement === pane);
     const byWidth = w / COLS / 0.6;
     const byHeight = sized ? (wrap.clientHeight - 16) / ROWS / 1.18 : (window.innerHeight * 0.4) / ROWS / 1.18;
     const size = Math.max(6, Math.min(sized ? 48 : 15, Math.floor(Math.min(byWidth, byHeight) * 10) / 10));
@@ -213,6 +241,98 @@ export class Screen {
 
   /** 虚拟屏幕高度（串口鼠标的纵向比例用） */
   private get virtualHeight(): number { return this.graphicsMode >= 0 ? modeInfo(this.graphicsMode).height : 200; }
+
+  private captureError(message: string, error: unknown): void {
+    if (this.onCaptureError) this.onCaptureError(message + '：' + (error instanceof Error ? error.message : String(error)));
+    else console.error(message, error);
+  }
+
+  private captureChanged(): void {
+    const captured = this.captured;
+    if (captured === this.wasCaptured) return;
+    this.wasCaptured = captured;
+    if (!captured) {
+      this.releaseAll();
+      this.onMouseRel?.(0, 0, 0);
+      if (!this.capturing) this.endCapture();
+    }
+    if (!captured || !this.fullscreenCapture || !this.capturing) this.onCapture?.(captured);
+  }
+
+  private lockPointer(): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const finish = (error?: unknown) => {
+        document.removeEventListener('pointerlockchange', changed);
+        document.removeEventListener('pointerlockerror', failed);
+        if (error) reject(error);
+        else { this.captureChanged(); resolve(); }
+      };
+      const changed = () => { if (this.captured) finish(); };
+      const failed = () => finish(new Error('浏览器拒绝了鼠标捕获，请检查网站权限后重新点击屏幕'));
+      document.addEventListener('pointerlockchange', changed);
+      document.addEventListener('pointerlockerror', failed);
+      try {
+        const request = this.el.requestPointerLock();
+        if (request) void request.then(() => finish(), finish);
+      } catch (error) { finish(error); }
+    });
+  }
+
+  private async capture(): Promise<void> {
+    if (this.capturing) return;
+    this.capturing = true;
+    try {
+      if (this.fullscreenCapture) {
+        const keyboard = (navigator as Navigator & { keyboard?: KeyboardLock }).keyboard;
+        const pane = this.el.closest<HTMLElement>('.screen-pane') ?? this.el;
+        if (!keyboard?.lock || !keyboard.unlock || !pane.requestFullscreen || !document.fullscreenEnabled)
+          throw new Error('全屏捕获需要支持键盘锁定的 Chrome/Edge 和 HTTPS（本机 localhost 也可）；请改用普通捕获');
+        if (document.fullscreenElement && document.fullscreenElement !== pane)
+          throw new Error('请先退出当前全屏，再点击 DOS 屏幕进行全屏捕获');
+        this.keyboardLock = keyboard;
+        // 全屏会消耗用户激活，先发起键盘和鼠标锁定，不能逐个 await。
+        const requests = [keyboard.lock(['Escape']), this.lockPointer()];
+        if (!document.fullscreenElement) {
+          this.fullscreenOwner = pane;
+          requests.push(pane.requestFullscreen());
+        }
+        const results = await Promise.allSettled(requests);
+        const failed = results.find(r => r.status === 'rejected');
+        if (failed?.status === 'rejected') throw failed.reason;
+        const permission = await (navigator.permissions as CapturePermissions).query({ name: 'keyboard-lock' });
+        if (permission.state !== 'granted')
+          throw new Error(permission.state === 'denied' ? '浏览器拒绝了键盘锁定权限，请在网站权限中允许后重试' : '请允许网站的键盘锁定权限后重新点击屏幕');
+        if (!this.captured || document.fullscreenElement !== pane) throw new Error('全屏捕获已取消，请重新点击屏幕');
+        this.keyboardPermission = permission;
+        permission.onchange = () => {
+          if (permission.state !== 'granted') {
+            this.release();
+            this.captureError('键盘锁定权限已撤销', new Error('已停止全屏捕获，请检查网站权限后重试'));
+          }
+        };
+        this.onCapture?.(true);
+      } else {
+        await this.lockPointer();
+      }
+    } catch (error) {
+      this.release();
+      this.captureError('鼠标捕获失败', error);
+    } finally {
+      this.capturing = false;
+      if (!this.captured) this.endCapture();
+    }
+  }
+
+  private endCapture(): void {
+    if (this.keyboardPermission) this.keyboardPermission.onchange = null;
+    this.keyboardPermission = undefined;
+    this.keyboardLock?.unlock();
+    this.keyboardLock = undefined;
+    const owner = this.fullscreenOwner;
+    this.fullscreenOwner = null;
+    if (owner && document.fullscreenElement === owner)
+      void document.exitFullscreen().catch(error => this.captureError('退出捕获全屏失败', error));
+  }
 
   /** 释放鼠标捕获 */
   release(): void { if (this.captured) document.exitPointerLock(); }

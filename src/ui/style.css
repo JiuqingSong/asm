@@ -57,6 +57,31 @@ html, body { margin: 0; height: 100%; }
 body { background: var(--bg); color: var(--text); font: 13px/1.4 var(--ui); overflow: hidden; }
 .mono { font-family: var(--mono); }
 .hidden { display: none !important; }
+body:not(.has-session) .toolbar, body:not(.has-session) .layout { display: none; }
+body.has-session #launcher { display: none; }
+#launcher { max-width: 1000px; margin: auto; padding: 48px 24px; overflow: auto; }
+#launcher h1 { font-size: 32px; }
+.start-cards { display: flex; flex-wrap: wrap; gap: 18px; margin-top: 30px; }
+.start-cards button { flex: 1 1 220px; padding: 28px 20px; text-align: left; height: auto; white-space: normal; }
+.start-cards strong { display: block; font-size: 20px; margin-bottom: 14px; }
+.start-cards span { display: block; line-height: 1.8; }
+.startup-dialog { margin: auto; width: min(900px, 94vw); max-height: 90vh; overflow: auto; padding: 24px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); }
+.startup-dialog::backdrop { background: #0009; }
+.startup-dialog h2 { margin: 0 0 12px; }
+.startup-dialog p { margin: 12px 0; }
+#config-options { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin: 24px 0; }
+#config-options label { white-space: normal; align-items: flex-start; }
+.config-warnings { white-space: pre-line; color: var(--muted); line-height: 1.8; }
+#config-warnings { height: 5.4em; overflow-y: auto; scrollbar-gutter: stable; }
+.dialog-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+.full-mode .editor-pane, .full-mode [data-split="screen"], .full-mode .cmdline,
+.full-mode .dos-files, body:not(.show-disk-images) #drives { display: none; }
+.full-mode .screen-pane, .full-mode .screen-pane.sized { flex: 1; height: auto; min-height: 0; }
+.full-mode .screens, .full-mode .screen-box, .full-mode .screen-wrap { flex: 1; min-height: 0; }
+.full-mode .screen-wrap { align-items: center; }
+.full-mode .info-pane { height: var(--info-h, 50%); max-height: 75%; }
+.no-video .screen-wrap { visibility: hidden; }
+.no-video::after { content: '未安装 VGA 显卡'; padding: 20px; color: var(--muted); }
 .spacer { flex: 1; }
 .note { color: var(--muted); font-size: 12px; }
 
@@ -126,9 +151,11 @@ body.resizing.h { cursor: row-resize; }
 #cmdline { height: 23px; width: 140px; font-size: 12px; font-weight: 400; }
 
 /* ---------- 屏幕 ---------- */
+.capture-hint { display: none; }
+.screen-pane:fullscreen .capture-hint { display: block; padding: 6px 10px; color: var(--accent); }
 .screen-wrap { padding: 8px; background: #0b0b0b; border-radius: 0 0 7px 7px; display: flex; justify-content: center; }
-.screen-pane.sized .screen-wrap, .screen-pane.maxed .screen-wrap { flex: 1; min-height: 0; overflow: hidden; align-items: center; }
-.screen-pane.sized .screens, .screen-pane.maxed .screens { min-height: 0; }
+.screen-pane.sized .screen-wrap, .screen-pane.maxed .screen-wrap, .screen-pane:fullscreen .screen-wrap { flex: 1; min-height: 0; overflow: hidden; align-items: center; }
+.screen-pane.sized .screens, .screen-pane.maxed .screens, .screen-pane:fullscreen .screens { min-height: 0; }
 .screen { box-shadow: 0 0 0 1px #2a2a2a; }
 .screen {
   position: relative; font-family: var(--mono); line-height: 1.18; white-space: pre; color: #aaa; background: #000;
@@ -248,9 +275,13 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 .screen-box { flex: 1; min-width: 0; display: flex; flex-direction: column; }
 .screens .screen-box + .screen-box { border-left: 1px solid var(--border); }
 .screen-box.active .screen-title { color: var(--accent); }
-.ed-head { padding: 0 6px 0 0; }
-.ed-tabs { display: flex; align-self: stretch; }
-.ed-tabs button { border: none; border-radius: 0; background: none; height: 100%; padding: 0 12px; color: var(--muted); border-bottom: 2px solid transparent; font-weight: 600; }
+.ed-head { padding: 2px 6px 2px 0; flex-wrap: wrap; }
+.editor-tools, .editor-actions { display: flex; align-items: center; gap: 6px; }
+.editor-tools { flex-wrap: wrap; min-width: 0; font-weight: 400; }
+.editor-tools #examples { width: 160px; }
+.editor-actions { margin-left: auto; flex: none; }
+.ed-tabs { display: flex; align-self: stretch; min-width: 0; }
+.ed-tabs button { border: none; border-radius: 0; background: none; height: 100%; padding: 0 12px; color: var(--muted); border-bottom: 2px solid transparent; font-weight: 600; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ed-tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
 .ed-tabs button .tag { color: var(--accent); margin-right: 6px; }
 .ed-tabs button .mod { color: var(--warn); }

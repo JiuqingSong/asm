@@ -54,7 +54,6 @@ async function isoDisk(name: string, f: Blob): Promise<Disk> {
 export interface DriveHost {
   machines(): { m: Machine; tag: string; i: number }[];
   dual(): boolean;
-  boot(i: number, drive: number): void;
   message(kind: 'ok' | 'error', text: string, i: number): void;
 }
 
@@ -68,6 +67,7 @@ export class DrivesPanel {
   /** 往映像里上传文件用的文件选择框 */
   private fileInput: HTMLInputElement;
   private saveTimers = new Map<string, number>();
+  private pendingSaves = new Set<Promise<void>>();
 
   constructor(el: HTMLElement, host: DriveHost) {
     this.el = el; this.host = host;
@@ -93,6 +93,7 @@ export class DrivesPanel {
 
   /** 页面打开时：从浏览器里恢复上次的磁盘映像 */
   async restore(): Promise<void> {
+    this.browse = null;
     try {
       for (const { m, i } of this.host.machines()) {
         for (let k = 0; k < 4; k++) {
@@ -100,13 +101,13 @@ export class DrivesPanel {
           try {
             if (v?.iso) m.drives[k] = await isoDisk(v.name, v.iso);
             else if (v?.data) m.drives[k] = new Disk(v.name, new Uint8Array(v.data), v.floppy);
-          } catch { /* 坏的记录：跳过 */ }
+          } catch (e) { this.host.message('error', `恢复 ${LETTERS[k]} 映像失败：${(e as Error).message}`, i); }
         }
         const cd = await dbGet(`${i}:cd`);
         if (cd?.iso) m.cdrom.insert(new BlobSource(cd.iso), cd.name);
         m.cdrom.onChange = () => this.render(); // 程序弹出光盘时刷新
       }
-    } catch { /* 浏览器不允许使用 IndexedDB：映像只保存在内存里 */ }
+    } catch (e) { this.host.message('error', `无法恢复保存的磁盘映像：${(e as Error).message}`, 0); }
     this.render();
   }
 
@@ -119,25 +120,41 @@ export class DrivesPanel {
       if (!d || !d.dirty) continue;
       const key = `${i}:${k}`;
       clearTimeout(this.saveTimers.get(key));
-      this.saveTimers.set(key, window.setTimeout(() => this.persist(i, k), 2000));
+      this.saveTimers.set(key, window.setTimeout(() => { this.saveTimers.delete(key); void this.persist(i, k); }, 2000));
     }
     this.render();
   }
 
   /** 关机时：马上把改过的映像存进浏览器（不等定时器） */
-  flushAll(i: number): void {
+  async flushAll(i: number): Promise<void> {
     for (let k = 0; k < 4; k++) {
       const key = `${i}:${k}`;
-      if (this.saveTimers.has(key)) { clearTimeout(this.saveTimers.get(key)); this.saveTimers.delete(key); this.persist(i, k); }
+      clearTimeout(this.saveTimers.get(key));
+      this.saveTimers.delete(key);
+    }
+    await Promise.all(this.pendingSaves);
+    const m = this.machine(i);
+    for (let k = 0; k < 4; k++) {
+      if (m.drives[k]?.dirty) await this.persist(i, k);
     }
   }
 
-  private persist(i: number, k: number): void {
+  private persist(i: number, k: number): Promise<void> {
     const m = this.host.machines().find(x => x.i === i)?.m;
-    if (!m) return;
+    if (!m) return Promise.reject(new Error('保存映像时找不到对应虚拟机'));
     const d = m.drives[k];
     const rec: DriveRecord | null = !d ? null : d.isoFile ? { name: d.name, floppy: false, iso: d.isoFile } : { name: d.name, floppy: d.floppy, data: d.data };
-    dbPut(`${i}:${k}`, rec).catch(() => { /* 存不下就算了 */ });
+    return this.saveRecord(i, String(k), rec);
+  }
+
+  private saveRecord(i: number, k: string, record: DriveRecord | null): Promise<void> {
+    const saving = dbPut(`${i}:${k}`, record).catch(e => {
+      this.host.message('error', `保存 ${k === 'cd' ? '光盘' : LETTERS[Number(k)]} 映像失败：${(e as Error).message}。请下载映像备份`, i);
+      throw e;
+    });
+    this.pendingSaves.add(saving);
+    void saving.then(() => this.pendingSaves.delete(saving), () => this.pendingSaves.delete(saving));
+    return saving;
   }
 
   private machine(i: number): Machine { return this.host.machines().find(x => x.i === i)!.m; }
@@ -150,11 +167,11 @@ export class DrivesPanel {
     if (b.dataset.act === 'cd-eject') {
       const i = +b.dataset.i!;
       this.machine(i).cdrom.eject();
-      dbPut(`${i}:cd`, null).catch(() => { /* 不要紧 */ });
+      void this.saveRecord(i, 'cd', null);
       this.render();
       return;
     }
-    if (!b.dataset.drive && b.dataset.act !== 'boot') return;
+    if (!b.dataset.drive) return;
     const i = +b.dataset.i!, k = +(b.dataset.drive ?? 0), m = this.machine(i);
     switch (b.dataset.act) {
       case 'browse': {
@@ -178,7 +195,6 @@ export class DrivesPanel {
         setTimeout(() => URL.revokeObjectURL(a.href), 1000);
         return;
       }
-      case 'boot': b.blur(); this.host.boot(i, +b.dataset.from!); return; // 让按钮失去焦点：否则之后按回车会再按一次"启动"
     }
     this.render();
   }
@@ -321,8 +337,8 @@ export class DrivesPanel {
       : `<div class="file-row"><span class="fn">${esc(e.name)}</span><span class="note">${e.size.toLocaleString()} 字节</span><span class="note">${date(e.date)}</span><button data-act="fs-get" data-name="${esc(e.name)}">下载</button><button data-act="fs-del" data-name="${esc(e.name)}">删除</button></div>`);
     return `<div class="fs-box">${head}<span class="note">${v.fat16 ? 'FAT16' : 'FAT12'}${v.label ? '，卷标 ' + esc(v.label) : ''}，剩余 ${kb(v.freeBytes())}</span></div>` +
       `<div class="mem-bar">${b.path ? '<button data-act="fs-up">↑ 上一级</button>' : ''}<button data-act="fs-upload" title="选择电脑上的文件放进这个目录（文件名会换成 DOS 的 8.3 格式）">上传文件到这里</button>` +
-      `<button data-act="fs-mkdir">新建目录</button><button data-act="fs-copy" title="把下面"文件"列表里的全部文件复制到这个目录">复制"文件"列表到这里</button>` +
-      UTILITIES.map(u => `<button data-act="fs-util" data-name="${u.name}" title="${esc(u.description)}">放入${u.name === 'MOUSE.COM' ? '鼠标驱动 ' : u.name === 'SHUTDOWN.COM' ? '关机程序 ' : ''}${u.name}</button>`).join('') + '</div>' +
+      `<button data-act="fs-mkdir">新建目录</button><button class="dos-files" data-act="fs-copy" title="把下面"文件"列表里的全部文件复制到这个目录">复制"文件"列表到这里</button>` +
+      UTILITIES.filter(u => u.name !== 'MOUSE.COM' || this.machine(b.i).mouseDriverEnabled).map(u => `<button data-act="fs-util" data-name="${u.name}" title="${esc(u.description)}">放入${u.name === 'MOUSE.COM' ? '鼠标驱动 ' : u.name === 'SHUTDOWN.COM' ? '关机程序 ' : ''}${u.name}</button>`).join('') + '</div>' +
       (rows.length ? rows.join('') : '<div class="empty">这个目录是空的</div>') + '</div>';
   }
 
@@ -334,7 +350,7 @@ export class DrivesPanel {
     if (k === CD) {
       const m = this.machine(i);
       m.cdrom.insert(new BlobSource(f), f.name);
-      dbPut(`${i}:cd`, { name: f.name, floppy: false, iso: f }).catch(() => { /* 存不下就算了 */ });
+      void this.saveRecord(i, 'cd', { name: f.name, floppy: false, iso: f });
       const iso = await isIsoFile(f);
       this.host.message('ok', `光驱里放入了 ${f.name}${iso ? '' : '（这个文件不像 ISO9660 光盘映像，DOS 可能读不出来）'}。DOS 下要在 CONFIG.SYS 里装光驱驱动（例如 DEVICE=OAKCDROM.SYS /D:MSCD001），` +
         `AUTOEXEC.BAT 里运行 MSCDEX /D:MSCD001；Windows 95 会自己认出光驱。映像不会读进内存，读到哪里才从文件里读哪一段`, i);
@@ -379,6 +395,7 @@ export class DrivesPanel {
       if (this.host.dual()) parts.push(`<div class="pane-head sub">${tag} 机</div>`);
       for (let k = 0; k < 4; k++) {
         const d = m.drives[k];
+        const installed = k < 2 ? m.floppyInstalled(k) : m.config.ide;
         const at = `data-i="${i}" data-drive="${k}"`;
         const info = d ? `<span class="fn" title="${esc(d.name)}">${esc(d.name)}</span><span class="note" title="${d.geometryText}">${d.description}${d.dirty ? '，已修改' : ''}</span>`
           : `<span class="note">（空）</span>`;
@@ -394,17 +411,14 @@ export class DrivesPanel {
         }
         if (d && !d.iso) btns = `<button data-act="browse" ${at} title="查看、放入、取出映像里的文件">${this.browse?.i === i && this.browse.k === k ? '收起文件' : '文件'}</button>` + btns;
         if (d) btns += (d.iso ? '' : `<button data-act="download" ${at} title="把映像文件下载到电脑上保存">下载</button>`) + `<button data-act="eject" ${at} title="${k < 2 ? '取出软盘' : '拿掉这个硬盘（浏览器里保存的映像也会删除）'}">${k < 2 ? '取出' : '移除'}</button>`;
-        parts.push(`<div class="file-row drive-row"><b class="dl">${LETTERS[k]}</b>${info}<span class="spacer"></span>${btns}</div>`);
+        parts.push(`<div class="file-row drive-row"><b class="dl">${LETTERS[k]}</b>${installed ? '' : '<span class="note">未安装（映像保留）</span>'}${info}<span class="spacer"></span>${btns}</div>`);
         if (this.browse && this.browse.i === i && this.browse.k === k) parts.push(this.renderBrowser());
       }
       const disc = m.cdrom.discName;
-      parts.push(`<div class="file-row drive-row"><b class="dl" title="IDE 第二通道上的 ATAPI 光驱">光驱</b>` +
+      parts.push(`<div class="file-row drive-row"><b class="dl" title="IDE 第二通道上的 ATAPI 光驱">光驱</b>${m.config.cdrom ? '' : '<span class="note">未安装（映像保留）</span>'}` +
         (disc ? `<span class="fn" title="${esc(disc)}">${esc(disc)}</span><span class="note">${Math.round(m.cdrom.discSize / 1024 / 1024)}MB</span>` : '<span class="note">（没有光盘）</span>') +
         `<span class="spacer"></span><button data-act="cd-insert" data-i="${i}" title="选择一个光盘映像文件（.iso）放进光驱">${disc ? '换光盘' : '放入光盘'}</button>` +
         (disc ? `<button data-act="cd-eject" data-i="${i}" title="取出光盘">弹出</button>` : '') + '</div>');
-      parts.push(`<div class="drive-boot"><button data-act="boot" data-i="${i}" data-from="0" ${m.drives[0] ? '' : 'disabled'} title="像开机一样从 A: 的软盘启动">从 A: 启动</button>` +
-        `<button data-act="boot" data-i="${i}" data-from="128" ${m.drives[2] ? '' : 'disabled'} title="从 C: 硬盘启动（A: 里有软盘时也从 C: 启动）">从 C: 启动</button>` +
-        `<button data-act="boot" data-i="${i}" data-from="224" ${m.cdrom.discName ? '' : 'disabled'} title="从光驱里的可启动光盘启动（El Torito 软盘模拟：光盘里的启动软盘当作 A:，原来的 A: 变成 B:）">从光驱启动</button></div>`);
     }
     this.el.innerHTML = parts.join('');
   }

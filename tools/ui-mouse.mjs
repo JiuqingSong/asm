@@ -1,6 +1,7 @@
 // 鼠标检查：鼠标画图示例（图形模式）和文本模式的鼠标光标（开发版）
 // 用法：node tools/ui-mouse.mjs <截图目录>
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -17,7 +18,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // 图形模式：画两笔，中间点右键换颜色

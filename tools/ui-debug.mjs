@@ -1,6 +1,7 @@
 // 调试功能检查：运行到光标处、跳出、反汇编、修改寄存器（开发版）
 // 用法：node tools/ui-debug.mjs <截图目录> [可执行文件]
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { readFileSync, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
@@ -17,7 +18,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const status = () => page.$eval('#status', e => e.textContent);
 const where = () => page.$eval('#cs-ip', e => e.textContent);

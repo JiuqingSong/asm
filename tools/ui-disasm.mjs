@@ -2,6 +2,7 @@
 // 用法：node tools/ui-disasm.mjs <截图目录> <EXE 文件> [地址]
 //   和 EXE 在同一个目录里的文件都放进虚拟磁盘
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { readFileSync, readdirSync, statSync, mkdirSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
@@ -18,7 +19,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 const dir = dirname(exe);

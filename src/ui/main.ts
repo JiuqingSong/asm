@@ -3,6 +3,7 @@ import { setupLayout } from './layout.ts';
 import { DrivesPanel } from './drives.ts';
 import { bootProgram, driveName } from '../machine/boot.ts';
 import { assemble } from '../asm/assembler.ts';
+import { generateExecutable } from '../asm/executable.ts';
 import type { Diag, Program } from '../asm/types.ts';
 import { Machine, CPU_SPEEDS, CD_BOOT, type StopReason, type CpuSpeedId } from '../machine/machine.ts';
 import { readElTorito } from '../machine/iso.ts';
@@ -23,6 +24,8 @@ import { DisasmPanel, currentInstruction } from './disasm-panel.ts';
 import { RegisterPanel, StackPanel, VarsPanel, MemoryPanel, takeSnapshot, h2, h4, type Snapshot } from './panels.ts';
 import { EXAMPLES } from './examples.ts';
 import { INSTR_HELP, DIRECTIVE_HELP, DOS_FUNCS, BIOS_FUNCS } from './help.ts';
+import { DEFAULT_CONFIG, configWarnings, type MachineConfig, type StartupMode } from '../machine/config.ts';
+import { StartupPanel } from './startup.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
@@ -43,6 +46,8 @@ interface Session {
   model: monaco.editor.ITextModel;
   program: Program | null;
   dirty: boolean;
+  /** 上次载入、保存或新建时的文档版本，独立于是否需要重新汇编。 */
+  sourceVersion: number;
   fileName: string;
   screen: Screen;
   box: HTMLElement;
@@ -60,7 +65,12 @@ interface Session {
 }
 
 class App {
-  dual = new DualMachine(this.loadWiring());
+  dual!: DualMachine;
+  startupMode: StartupMode | null = null;
+  private startup: StartupPanel;
+  private choosingBoot = false;
+  private loading = false;
+  private resetLayout: () => void = () => {};
   editor: EditorView;
   sessions: Session[] = [];
   active = 0;
@@ -87,32 +97,48 @@ class App {
       onBreakpointsChanged: model => this.syncBreakpoints(this.byModel(model)),
       hover: (model, w, line, text) => this.hover(this.byModel(model), w, line, text),
     });
+    this.startup = new StartupPanel(
+      (mode, config, cpu, showDiskImages) => this.launch(mode, config, cpu, showDiskImages),
+      () => CPU_SPEEDS.find(c => c.id === store.get('cpu'))?.id ?? '8088',
+      message => { $('startup-error').textContent = message; this.addMessage('error', message); },
+    );
+    this.bindUi();
+  }
+
+  private createSessions(): void {
     const boxes = document.querySelectorAll<HTMLElement>('.screen-box');
     for (let i = 0; i < 2; i++) {
       const box = boxes[i];
+      const model = this.editor.createModel('');
       const s: Session = {
-        i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model: this.editor.createModel(''), program: null, dirty: true,
+        i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model, program: null, dirty: true, sourceVersion: model.getAlternativeVersionId(),
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
         cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(), record: true,
       };
       s.screen.onKey = e => this.key(s, e);
       s.screen.onMouseRel = (dx, dy, buttons) => {
         if (!s.program || (s.dirty && !s.binary)) return;
+        if (!s.m.mouseDriverEnabled && s.m.com2.peer !== s.m.serialMouse) return;
         s.m.mouse.moveRel(dx, dy);
         s.m.mouse.queueButtons(buttons, s.m.clock);
         this.afterKey(s);
       };
       s.screen.onCapture = captured => {
-        if (captured) this.setStatus('鼠标已被 DOS 屏幕捕获（程序在用串口鼠标）。按 Esc 释放鼠标', 'running');
+        if (captured) this.setStatus(s.screen.fullscreenCapture
+          ? '鼠标已全屏捕获，Esc 交给虚拟机。按右 Ctrl 释放并退出捕获全屏'
+          : '鼠标已捕获。按右 Ctrl 释放；普通捕获中 Esc 仍由浏览器保留', 'running');
         else if (this.run === 'run') this.setStatus(this.runText(), 'running');
+        else this.setStatus('鼠标已释放', '');
       };
+      s.screen.onCaptureError = message => { this.addMessage('error', message, s.i); this.setStatus(message, 'error'); this.setTab('messages'); };
       s.screen.onMouse = (fx, fy, buttons) => {
         if (!s.program || (s.dirty && !s.binary)) return;
+        if (!s.m.mouseDriverEnabled && s.m.com2.peer !== s.m.serialMouse) return;
         s.m.mouse.moveTo(fx * 640, fy * s.m.mouse.screenH);
         s.m.mouse.queueButtons(buttons, s.m.clock);
-        if (this.run === 'idle') {
+        if (this.run === 'idle' && s.m.config.vga) {
           const mem = s.m.mem, bda = 0x400;
-          s.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), s.m.video, s.m.mouse);
+          s.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), s.m.video, s.m.mouseDriverEnabled ? s.m.mouse : undefined);
         }
         this.afterKey(s); // 等键盘的程序可能要处理鼠标回调
       };
@@ -135,6 +161,8 @@ class App {
         if (text) { e.preventDefault(); s.m.typeText(text.replace(/\r?\n/g, '\r'), scanForChar); this.afterKey(s); }
       });
       this.sessions.push(s);
+      s.cmdline.onchange = () => store.set('cmdline' + (s.i ? '.b' : ''), s.cmdline.value);
+      s.screen.setChinese(store.get('chinese') === '1');
     }
     this.stack.onLineClick = l => this.editor.revealLine(this.cur.model, l);
     this.vars.onLineClick = l => this.editor.revealLine(this.cur.model, l);
@@ -148,8 +176,6 @@ class App {
     this.disasm.onRunTo = lin => this.runTo(this.cur, lin);
     this.disasm.onLine = l => this.editor.revealLine(this.cur.model, l);
 
-    this.bindUi();
-    this.restore();
   }
 
   get cur(): Session { return this.sessions[this.active]; }
@@ -170,6 +196,81 @@ class App {
     return w && w in WIRING_DESC ? (w as Wiring) : 'loopback-rts';
   }
 
+  private async launch(mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages = mode !== 'debug'): Promise<void> {
+    if (this.startupMode) await this.goHome();
+    this.startupMode = mode;
+    this.active = 0;
+    this.resetLayout();
+    this.messages = [];
+    this.dual = new DualMachine(this.loadWiring(), [new Machine(config), new Machine(config)]);
+    if (!this.sessions.length) this.createSessions();
+    else for (const s of this.sessions) {
+      const events = s.m.events;
+      s.m = this.dual.m[s.i];
+      s.m.events = events;
+      s.program = null;
+      s.binary = null;
+      s.snap = null;
+      s.addrBps.clear();
+      s.dirty = true;
+    }
+    store.set('cpu', cpu);
+    document.body.classList.add('has-session');
+    document.body.classList.toggle('full-mode', mode === 'full');
+    document.body.classList.toggle('show-disk-images', mode !== 'debug' || showDiskImages);
+    $('mode-name').textContent = { debug: '直接调试', dual: '双机对联', full: '完整模拟' }[mode];
+    $('startup-error').textContent = '';
+    this.restore();
+    this.loading = true;
+    const workspace = document.querySelector<HTMLElement>('.layout')!;
+    const toolbar = document.querySelector<HTMLElement>('.toolbar')!;
+    workspace.inert = toolbar.inert = true;
+    try { await this.drives!.restore(); }
+    finally { this.loading = false; workspace.inert = toolbar.inert = false; }
+    for (const warning of configWarnings(config)) this.addMessage('warning', warning);
+    if (mode === 'full') {
+      this.setTab('files');
+      await this.chooseBoot();
+    }
+    window.dispatchEvent(new Event('resize'));
+  }
+
+  private async goHome(): Promise<void> {
+    if (!this.startupMode || this.loading) return;
+    if (this.live.some(s => s.program?.format === 'boot' && !s.m.poweredOff) &&
+      !confirm('返回启动选择将关闭当前虚拟机。客体系统尚未写回的缓存可能丢失；建议先在客体中安全关机。继续吗？')) throw new Error('已取消返回启动选择');
+    this.stop();
+    document.exitPointerLock();
+    this.save();
+    this.loading = true;
+    const workspace = document.querySelector<HTMLElement>('.layout')!;
+    const toolbar = document.querySelector<HTMLElement>('.toolbar')!;
+    workspace.inert = toolbar.inert = true;
+    try {
+      for (const s of this.live) await this.drives!.flushAll(s.i);
+      this.dual.link.disconnect();
+      for (const s of this.sessions) { s.m.powerOff(); s.m.unload(); }
+      this.startupMode = null;
+      document.body.classList.remove('has-session', 'full-mode', 'show-disk-images');
+      this.setStatus('请选择启动方式', '');
+    } finally { this.loading = false; workspace.inert = toolbar.inert = false; }
+  }
+
+  private async chooseBoot(): Promise<void> {
+    if (this.choosingBoot || this.startupMode !== 'full') return;
+    this.choosingBoot = true;
+    const running = this.run !== 'idle';
+    this.stop();
+    this.cur.screen.release();
+    this.drives?.render();
+    try {
+      const started = await this.startup.boot(this.cur.m, async drive =>
+        drive === CD_BOOT ? this.runCdBoot(this.cur) : this.runBoot(this.cur, drive));
+      if (!started && running) this.start();
+      else if (!started) this.setStatus('未选择启动设备。点“重启”或“运行”重新选择', '');
+    } finally { this.choosingBoot = false; }
+  }
+
   private restore(): void {
     const cpu = (store.get('cpu') as CpuSpeedId) || '8088';
     $<HTMLSelectElement>('cpu').value = CPU_SPEEDS.some(c => c.id === cpu) ? cpu : '8088';
@@ -180,18 +281,27 @@ class App {
     const sp = store.get('speed');
     if (sp) $<HTMLSelectElement>('speed').value = sp;
     $<HTMLInputElement>('show-bytes').checked = store.get('showBytes') === '1';
+    $<HTMLInputElement>('fullscreen-capture').checked = store.get('fullscreenCapture') === '1';
+    for (const s of this.sessions) s.screen.fullscreenCapture = $<HTMLInputElement>('fullscreen-capture').checked;
     for (const s of this.sessions) {
       const key = s.i === 0 ? '' : '.b';
       const src = store.get('source' + key);
       const ex = EXAMPLES.find(e => e.id === (s.i === 0 ? 'hello' : 'chat'))!;
-      this.editor.setText(s.model, src ?? ex.source);
-      s.fileName = src ? store.get('file' + key) || '未命名.asm' : ex.id + '.asm';
+      const text = src ?? ex.source;
+      if (s.model.getValue() !== text) this.editor.setText(s.model, text);
+      s.sourceVersion = s.model.getAlternativeVersionId();
+      s.fileName = src !== null ? store.get('file' + key) ?? '未命名.asm' : ex.id + '.asm';
       s.cmdline.value = store.get('cmdline' + key) ?? '';
     }
     this.showDoc(this.cur);
-    this.setMode(store.get('mode') === 'dual' ? 'dual' : 'single', false);
-    for (const s of this.live) this.assemble(s, false);
-    this.loadAll();
+    this.setMode(this.startupMode === 'dual' ? 'dual' : 'single', false);
+    if (this.startupMode !== 'full') {
+      for (const s of this.live) this.assemble(s, false);
+      this.loadAll();
+    } else {
+      this.setTab('files');
+      this.render(true);
+    }
   }
 
   private bindUi(): void {
@@ -201,17 +311,19 @@ class App {
     const cpuSel = $<HTMLSelectElement>('cpu');
     for (const c of CPU_SPEEDS) cpuSel.add(new Option(c.name, c.id));
     cpuSel.onchange = () => { this.applyCpu(); store.set('cpu', cpuSel.value); };
-    $<HTMLSelectElement>('mode').onchange = e => this.setMode((e.target as HTMLSelectElement).value as 'single' | 'dual', true);
+    $('btn-home').onclick = () => { void this.goHome().catch(e => this.addMessage('error', (e as Error).message)); };
     const wiring = $<HTMLSelectElement>('wiring');
     for (const [k, v] of Object.entries(WIRING_DESC)) wiring.add(new Option(v, k));
-    wiring.value = this.dual.link.wiring;
+    wiring.value = this.loadWiring();
     wiring.onchange = () => { this.dual.link.setWiring(wiring.value as Wiring); store.set('wiring', wiring.value); this.renderTab(); };
     $<HTMLSelectElement>('uart-mode').onchange = () => { this.applySerialSettings(); store.set('uartMode', $<HTMLSelectElement>('uart-mode').value); };
     $<HTMLInputElement>('disk-latency').onchange = () => { this.applySerialSettings(); store.set('diskLatency', $<HTMLInputElement>('disk-latency').checked ? '1' : '0'); };
 
+    $('btn-new').onclick = () => this.newFile();
     $('btn-open').onclick = () => $<HTMLInputElement>('file-input').click();
     $<HTMLInputElement>('file-input').onchange = e => this.openFile(e.target as HTMLInputElement);
     $('btn-save').onclick = () => this.saveFile();
+    $('btn-export').onclick = () => this.exportExecutable();
     $('btn-assemble').onclick = () => { this.stop(); this.assembleAll(true); };
     $('btn-run').onclick = () => this.start();
     $('btn-pause').onclick = () => this.pause();
@@ -244,6 +356,11 @@ class App {
       store.set('showBytes', on ? '1' : '0');
       for (const s of this.sessions) this.editor.showBytes(s.model, s.dirty ? null : s.program, on);
     };
+    $<HTMLInputElement>('fullscreen-capture').onchange = e => {
+      const on = (e.target as HTMLInputElement).checked;
+      store.set('fullscreenCapture', on ? '1' : '0');
+      for (const s of this.sessions) s.screen.fullscreenCapture = on;
+    };
     for (const b of document.querySelectorAll<HTMLButtonElement>('.tabs button[data-tab]')) b.onclick = () => this.setTab(b.dataset.tab!);
     const memAddr = $<HTMLInputElement>('mem-addr');
     memAddr.onchange = () => { this.memory.expr = memAddr.value; this.renderTab(); };
@@ -269,7 +386,6 @@ class App {
       const el = (e.target as HTMLElement).closest('[data-flag]') as HTMLElement | null;
       if (el) this.toggleFlag(+el.dataset.flag!);
     });
-    for (const s of this.sessions) s.cmdline.onchange = () => store.set('cmdline' + (s.i ? '.b' : ''), s.cmdline.value);
     const cn = document.querySelectorAll<HTMLInputElement>('.cn-toggle');
     const setChinese = (on: boolean) => {
       for (const c of cn) c.checked = on;
@@ -281,6 +397,7 @@ class App {
     if (store.get('chinese') === '1') setChinese(true);
 
     window.addEventListener('keydown', e => {
+      if (!this.startupMode || this.loading || document.querySelector('dialog[open]')) return;
       const k = e.key;
       // 从磁盘启动、DOS 屏幕有焦点时，功能键交给虚拟机（调试请用工具栏按钮）
       if (/^F\d+$/.test(k) && (e.target as HTMLElement).closest?.('.screen') && this.cur.program?.format === 'boot') return;
@@ -288,25 +405,26 @@ class App {
       if (k === 'F5' && e.ctrlKey) this.restart();
       else if (k === 'F5') this.start();
       else if (k === 'F6') this.pause();
-      else if (k === 'F7') { this.stop(); this.assembleAll(true); }
+      else if (k === 'F7' && this.startupMode !== 'full') { this.stop(); this.assembleAll(true); }
       else if (k === 'F10' && e.ctrlKey) this.runToCursor();
       else if (k === 'F10') this.step(true);
       else if (k === 'F11' && e.shiftKey && e.ctrlKey) this.back();
       else if (k === 'F11' && e.shiftKey) this.step('out');
       else if (k === 'F11') this.step(false);
-      else if (k === 's' && e.ctrlKey) this.saveFile();
+      else if (k === 's' && e.ctrlKey && this.startupMode !== 'full') this.saveFile();
       else handled = false;
       if (handled) { e.preventDefault(); e.stopPropagation(); }
     }, true);
 
-    setupLayout(() => window.dispatchEvent(new Event('resize')));
+    this.resetLayout = setupLayout(() => window.dispatchEvent(new Event('resize')));
     this.drives = new DrivesPanel($('drives'), {
       machines: () => this.live.map(x => ({ m: x.m, tag: x.tag, i: x.i })),
       dual: () => this.mode === 'dual',
-      boot: (i, drive) => { if (drive === CD_BOOT) void this.runCdBoot(this.sessions[i]); else this.runBoot(this.sessions[i], drive); },
-      message: (kind, text, i) => { this.addMessage(kind, text, i); if (kind === 'error') this.setTab('messages'); },
+      message: (kind, text, i) => {
+        this.addMessage(kind, text, i);
+        if (kind === 'error') { this.setTab('messages'); $('boot-error').textContent = text; }
+      },
     });
-    void this.drives.restore();
     const screenPane = document.querySelector('.screen-pane') as HTMLElement;
     new ResizeObserver(() => {
       document.documentElement.style.setProperty('--screen-h', screenPane.offsetHeight + 'px');
@@ -331,8 +449,6 @@ class App {
   private setMode(mode: 'single' | 'dual', userAction: boolean): void {
     this.stop();
     this.mode = mode;
-    $<HTMLSelectElement>('mode').value = mode;
-    store.set('mode', mode);
     const dual = mode === 'dual';
     if (dual) this.dual.link.connect(); else this.dual.link.disconnect();
     this.sessions[1].box.classList.toggle('hidden', !dual);
@@ -368,7 +484,7 @@ class App {
     for (const s of this.live) {
       const b = document.createElement('button');
       b.className = s.i === this.active ? 'active' : '';
-      b.innerHTML = (this.mode === 'dual' ? `<span class="tag">${s.tag} 机</span>` : '') + (s.binary ? esc(s.binary) + ' <span class="note">可执行文件</span>' : esc(s.fileName)) + (!s.binary && s.dirty && s.program ? ' <span class="mod">●</span>' : '');
+      b.innerHTML = (this.mode === 'dual' ? `<span class="tag">${s.tag} 机</span>` : '') + (s.binary ? esc(s.binary) + ' <span class="note">可执行文件</span>' : esc(s.fileName || '未命名')) + (!s.binary && s.dirty && s.program ? ' <span class="mod">●</span>' : '');
       b.title = s.dirty ? '已修改，运行时会自动重新汇编' : s.fileName;
       b.onclick = () => this.setActive(s.i);
       el.appendChild(b);
@@ -393,16 +509,50 @@ class App {
     }
   }
 
-  private loadExample(id: string): void {
+  private sourceModified(s: Session): boolean {
+    return s.model.getAlternativeVersionId() !== s.sourceVersion;
+  }
+
+  private newFile(): void {
+    const s = this.cur;
+    if (this.sourceModified(s) && !confirm('当前代码已修改，确定放弃修改并新建空白源文件吗？')) return;
+    this.stop();
+    s.binary = null;
+    this.editor.setText(s.model, '');
+    s.sourceVersion = s.model.getAlternativeVersionId();
+    s.fileName = '';
+    s.program = null;
+    s.dirty = true;
+    s.snap = null;
+    s.addrBps.clear();
+    s.m.unload();
+    s.screen.allKeys = false;
+    this.editor.setProgram(s.model, null, [], false);
+    this.showDoc(s);
+    this.messages = this.messages.filter(m => m.who !== s.i);
+    this.renderMessageCount();
+    this.renderTabs();
+    this.setStatus('已新建空白源文件', '');
+    this.render(true);
+    this.save();
+  }
+
+  private loadExample(id: string, confirmed = false): void {
     const ex = EXAMPLES.find(e => e.id === id);
     if (!ex) return;
     const targets = ex.pair ? this.sessions : [this.cur];
     const where = ex.pair ? 'A 机和 B 机' : this.mode === 'dual' ? `${this.cur.tag} 机` : '当前编辑器';
-    if (targets.some(s => s.model.getValue().trim()) && !confirm(`用示例"${ex.title}"替换${where}中的代码？`)) return;
+    const needsConfirm = targets.some(s => this.startupMode === 'debug' ? this.sourceModified(s) : s.model.getValue().trim());
+    if (!confirmed && needsConfirm && !confirm(`用示例"${ex.title}"替换${where}中的代码？`)) return;
+    if (ex.pair && this.startupMode !== 'dual') {
+      void this.launch('dual', DEFAULT_CONFIG, this.cur.m.cpuModel).then(() => this.loadExample(id, true)).catch(e => this.addMessage('error', (e as Error).message));
+      return;
+    }
     this.stop();
     for (const s of targets) {
       s.binary = null;
       this.editor.setText(s.model, ex.source);
+      s.sourceVersion = s.model.getAlternativeVersionId();
       s.fileName = ex.id + '.asm';
       s.dirty = true;
     }
@@ -423,9 +573,11 @@ class App {
     catch { text = new TextDecoder('gbk').decode(buf); }
     this.stop();
     const s = this.cur;
+    if (this.startupMode === 'debug' && this.sourceModified(s) && !confirm(`当前代码已修改，确定用 "${f.name}" 替换吗？`)) return;
     s.binary = null;
     this.showDoc(s);
     this.editor.setText(s.model, text.replace(/\x1a+$/, ''));
+    s.sourceVersion = s.model.getAlternativeVersionId();
     s.fileName = f.name;
     s.dirty = true;
     this.assemble(s, false);
@@ -439,9 +591,62 @@ class App {
     const blob = new Blob([s.model.getValue().replace(/\r?\n/g, '\r\n')], { type: 'text/plain' });
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = s.fileName.endsWith('.asm') ? s.fileName : s.fileName + '.asm';
+    const name = s.fileName || '未命名.asm';
+    a.download = name.endsWith('.asm') ? name : name + '.asm';
+    a.click();
+    s.sourceVersion = s.model.getAlternativeVersionId();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  }
+
+  private exportExecutable(): void {
+    const s = this.cur;
+    const fail = (text: string) => {
+      this.addMessage('error', text, s.i);
+      this.setStatus(text, 'error');
+      this.setTab('messages');
+    };
+    if (s.binary) { fail('当前窗口是可执行文件说明，请先切回汇编源码再生成 EXE/COM'); return; }
+    let program: Program;
+    try { program = assemble(s.model.getValue()); }
+    catch (e) {
+      console.error(e);
+      fail('汇编器内部错误：' + (e as Error).message);
+      return;
+    }
+    this.messages = this.messages.filter(m => m.who !== s.i);
+    for (const d of program.diagnostics) this.addDiag(d, s.i);
+    this.renderMessageCount();
+    if (this.tab === 'messages') this.renderMessages();
+    this.editor.setDiagnostics(s.model, program.diagnostics);
+    if (!program.ok) {
+      const n = program.diagnostics.filter(d => d.severity === 'error').length;
+      this.setStatus(`生成失败：源码有 ${n} 个汇编错误`, 'error');
+      this.setTab('messages');
+      return;
+    }
+    let bytes: Uint8Array;
+    try { bytes = generateExecutable(program); }
+    catch (e) { fail('生成失败：' + (e as Error).message); return; }
+    const extension = program.format === 'com' ? 'com' : 'exe';
+    const input = prompt(`已生成 ${extension.toUpperCase()}，请输入下载文件名：`, (s.fileName || '未命名.asm').replace(/\.asm$/i, '') + '.' + extension);
+    if (input === null) { this.setStatus('已取消下载可执行文件', ''); return; }
+    let name = input.trim();
+    if (!name || /[\\/:*?"<>|\u0000-\u001f]/.test(name) || name.endsWith('.')) {
+      fail('文件名不能为空，也不能包含路径、末尾句点或 \\ / : * ? " < > | 等字符');
+      return;
+    }
+    if (/\.(exe|com)$/i.test(name) && !name.toLowerCase().endsWith('.' + extension)) {
+      fail(`当前程序生成的是 ${extension.toUpperCase()}，请使用 .${extension} 扩展名`);
+      return;
+    }
+    if (!name.toLowerCase().endsWith('.' + extension)) name += '.' + extension;
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([bytes.slice()], { type: 'application/octet-stream' }));
+    a.download = name;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+    this.addMessage('ok', `已生成并下载 ${name}（${bytes.length} 字节）`, s.i);
+    this.setStatus(`已下载 ${name}`, '');
   }
 
   private async uploadToDisk(input: HTMLInputElement): Promise<void> {
@@ -457,60 +662,49 @@ class App {
    * 从光驱启动：读出光盘的 El Torito 启动信息。软盘模拟时光盘里的启动软盘这次就是 A:，原来的 A: 变成 B:；
    * 不模拟时把引导程序装入内存，光驱是 E0h 号盘（引导程序用 INT 13h 扩展功能读光盘）
    */
-  private async runCdBoot(s: Session): Promise<void> {
+  private async runCdBoot(s: Session): Promise<boolean> {
     const src = s.m.cdrom.source;
-    const fail = (msg: string) => { this.addMessage('error', msg, s.i); this.setTab('messages'); };
-    if (!src) { fail('光驱里没有光盘'); return; }
+    const fail = (msg: string) => { this.addMessage('error', msg, s.i); $('boot-error').textContent = msg; };
+    if (!src) { fail('光驱里没有光盘'); return false; }
     let r;
-    try { r = await readElTorito(src); } catch (e) { fail('读光盘出错：' + (e as Error).message); return; }
-    if (typeof r === 'string') { fail(r); return; }
+    try { r = await readElTorito(src); } catch (e) { fail('读光盘出错：' + (e as Error).message); return false; }
+    if (typeof r === 'string') { fail(r); return false; }
     if (r.kind === 'floppy') { s.m.cdBoot = new Disk(`${s.m.cdrom.discName} 的启动软盘`, r.image, true); s.m.cdBootNoEmu = null; }
     else { s.m.cdBoot = null; s.m.cdBootNoEmu = { image: r.image, loadSeg: r.loadSeg, rba: r.rba, count: r.count }; }
-    this.runBoot(s, CD_BOOT);
+    return this.runBoot(s, CD_BOOT);
   }
 
   /** 从磁盘映像启动（像开机一样：读引导扇区，运行真的 DOS 等系统） */
-  private runBoot(s: Session, drive: number): void {
+  private runBoot(s: Session, drive: number): boolean {
     const noemu = drive === CD_BOOT ? s.m.cdBootNoEmu : null;
-    let d = noemu ? null : drive === CD_BOOT ? s.m.cdBoot : s.m.driveFor(drive);
-    if (drive === 0 && !d && s.m.drives[2]) { drive = 0x80; d = s.m.drives[2]; }
-    if (!d && !noemu) { this.addMessage('error', `${driveName(drive)} 没有磁盘映像`, s.i); this.setTab('messages'); return; }
+    const d = noemu ? null : drive === CD_BOOT ? s.m.cdBoot : s.m.driveFor(drive, null);
     const name = d?.name ?? s.m.cdrom.discName ?? '光盘';
-    if (d && (d.readSector(0)![510] !== 0x55 || d.readSector(0)![511] !== 0xaa)) {
-      this.addMessage('error', `${driveName(drive)} 的磁盘不能启动：第一个扇区末尾没有引导标记 55AAh${d.floppy ? '（这张软盘没有格式化成启动盘）' : '（空白硬盘需要先用启动软盘分区、格式化，例如运行 DOS 的安装程序）'}`, s.i);
-      this.setTab('messages');
-      return;
-    }
     this.stop();
-    const text = [
-      `; 从 ${driveName(drive)} 启动：${name}`,
-      ';',
-      '; 像开机一样：BIOS 把磁盘的第一个扇区（引导扇区）读到 0000:7C00 执行，',
-      '; 引导扇区再装入磁盘上的操作系统（例如 DOS 的 IO.SYS、MSDOS.SYS）。',
-      '; 从这里开始，INT 21h 等功能都由磁盘上真的 DOS 提供，模拟器只提供 BIOS 和硬件。',
-      ';',
-      '; 点一下 DOS 屏幕就可以用键盘操作；这时功能键（F1~F12）都交给虚拟机，',
-      '; 调试请用工具栏的按钮（暂停、单步……），反汇编页里可以看到正在执行的代码。',
-      '; 在"虚拟磁盘"页里可以换软盘（例如安装程序要第 2 张盘时）；写进映像的内容会保存在浏览器里。',
-      '; 想要原机的速度就选"原机速度"，想快一点就选"全速"。',
-      ';',
-      '; 回到源程序：点"汇编"，或者从"示例程序"、"打开"载入源程序。',
-    ].join('\n');
-    if (!s.binModel) s.binModel = this.editor.createModel('');
-    this.editor.setText(s.binModel, text);
+    const program = bootProgram(drive);
+    try { s.m.load(program); }
+    catch (e) {
+      const message = (e as Error).message;
+      this.addMessage('error', message, s.i);
+      $('boot-error').textContent = message;
+      return false;
+    }
     s.binary = `[${driveName(drive)} 启动]`;
-    s.program = bootProgram(drive);
+    s.program = program;
     s.record = false;
     this.applyHistory(s);
     s.dirty = false;
-    if (this.active !== s.i) this.setActive(s.i); else this.showDoc(s);
+    s.snap = null;
+    s.screen.allKeys = true;
+    this.syncBreakpoints(s);
+    this.memory.go(program.dataSeg, 0);
     this.renderTabs();
     this.addMessage('ok', noemu ? `从光驱启动（${name}，不模拟方式：引导程序 ${noemu.count * 512} 字节装在 ${(noemu.loadSeg || 0x7c0).toString(16).toUpperCase()}0h，光驱是 E0h 号盘）`
       : drive === CD_BOOT ? `从光驱启动（${name}，当作 A:${s.m.drives[0] ? '；原来的 A: 这次是 B:' : ''}）` : `从 ${driveName(drive)} 启动（${name}）`, s.i);
-    this.loadAll();
+    this.render(true);
     this.start();
     s.screen.focus();
     requestAnimationFrame(() => s.screen.focus()); // 点按钮之后焦点可能又回到按钮上，再设一次
+    return true;
   }
 
   /** 直接装载并运行虚拟磁盘上的 EXE/COM 文件（没有源码） */
@@ -723,6 +917,7 @@ class App {
   }
 
   private assembleAll(showMessages: boolean): boolean {
+    if (this.startupMode === 'full') return false;
     let ok = true;
     for (const s of this.live) ok = this.assemble(s, showMessages) && ok;
     if (ok) this.loadAll();
@@ -749,6 +944,7 @@ class App {
   }
 
   private ensureReady(): boolean {
+    if (this.startupMode === 'full') return !!this.cur.program;
     if (this.live.some(s => !s.binary && (s.dirty || !s.program))) return this.assembleAll(true);
     return true;
   }
@@ -777,6 +973,8 @@ class App {
   private get finished(): boolean { return this.live.every(s => s.m.status === 'exited' || s.m.status === 'error' || s.m.status === 'empty'); }
 
   start(): void {
+    if (!this.startupMode || this.loading) return;
+    if (this.startupMode === 'full' && !this.cur.program) { void this.chooseBoot(); return; }
     if (this.run !== 'idle') return;
     if (!this.ensureReady()) return;
     const done = this.mode === 'single' ? this.cur.m.status === 'exited' || this.cur.m.status === 'error' : this.finished;
@@ -943,13 +1141,15 @@ class App {
         !confirm('DOS 可能还有没写进磁盘的数据（DOS 的缓冲区、SMARTDRV 的写缓存），直接关机可能丢失或损坏文件，和真机拔电源一样。\n\n更安全的做法：在 DOS 里运行 SHUTDOWN（磁盘映像的"文件"浏览器里可以放入 SHUTDOWN.COM），它会先写回缓冲区再关机。\n\n仍然直接关机吗？')) return;
     this.stop();
     for (const s of on) s.m.powerOff();
-    for (const s of on) this.drives?.flushAll(s.i);
-    this.setStatus('已关机。点"重启"或"从 A:/C: 启动"可以重新开机', '');
+    for (const s of on) void this.drives?.flushAll(s.i).catch(e => this.addMessage('error', `保存映像失败：${(e as Error).message}`, s.i));
+    this.setStatus('已关机。点“重启”可以重新开机', '');
     this.addMessage('info', '已关机', this.active);
     this.render(true);
   }
 
   restart(): void {
+    if (!this.startupMode || this.loading) return;
+    if (this.startupMode === 'full') { void this.chooseBoot(); return; }
     this.stop();
     if (this.live.some(s => !s.binary && (s.dirty || !s.program))) { this.assembleAll(true); return; }
     this.loadAll();
@@ -974,8 +1174,8 @@ class App {
     switch (r) {
       case 'exit': {
         if (m.poweredOff) {
-          this.drives?.flushAll(s.i);
-          this.setStatus(tag + m.message + '。点"重启"或"从 A:/C: 启动"可以重新开机', '');
+          void this.drives?.flushAll(s.i).catch(e => this.addMessage('error', `保存映像失败：${(e as Error).message}`, s.i));
+          this.setStatus(tag + m.message + '。点“重启”可以重新开机', '');
           this.addMessage('info', m.message, s.i);
           break;
         }
@@ -1038,6 +1238,7 @@ class App {
   private applyHistory(s: Session): void { s.m.setHistory(s.record && this.mode !== 'dual'); }
 
   private updateButtons(): void {
+    if (!this.startupMode || !this.sessions.length) return;
     const running = this.run !== 'idle';
     const rec = $<HTMLInputElement>('record-history');
     rec.checked = this.cur.record && this.mode !== 'dual';
@@ -1048,6 +1249,7 @@ class App {
   }
 
   render(full: boolean): void {
+    if (!this.startupMode || !this.sessions.length) return;
     const s = this.cur, m = s.m;
     const line = s.program && !s.dirty ? s.program.addrToLine.get(m.linearIP) ?? null : null;
     const info = line ? `第 ${line} 行` : s.program && m.status !== 'empty' ? `${m.inBios() ? 'BIOS/DOS：' : ''}${currentInstruction(m).text}` : '';
@@ -1056,9 +1258,10 @@ class App {
     this.stack.setProgram(s.program);
     this.stack.render(m, s.snap);
     for (const x of this.live) {
+      x.box.classList.toggle('no-video', !x.m.config.vga);
       const mem = x.m.mem, bda = 0x400;
       x.screen.relative = x.m.serialMouse.active;
-      x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video, x.m.mouse);
+      if (x.m.config.vga) x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video, x.m.mouseDriverEnabled ? x.m.mouse : undefined);
     }
     if (full || this.run === 'animate') {
       for (const x of this.live) {
@@ -1071,6 +1274,7 @@ class App {
   }
 
   private renderTab(): void {
+    if (!this.startupMode || !this.sessions.length) return;
     const s = this.cur;
     switch (this.tab) {
       case 'vars': this.vars.render(s.m, s.snap); break;

@@ -1,6 +1,7 @@
 // 图形模式检查：VGA 示例、画线示例的截图（开发版）
 // 用法：node tools/ui-gfx.mjs <截图目录>
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -17,7 +18,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch { /* */ } });
 await page.goto('http://localhost:5317/', { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const status = () => page.$eval('#status', e => e.textContent);
 

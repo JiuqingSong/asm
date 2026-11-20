@@ -1,6 +1,7 @@
 // 用无头浏览器检查界面：截图 + 执行一组操作
 // 用法：node tools/ui-check.mjs <输出目录> [url]
 import puppeteer from 'puppeteer-core';
+import { enterMode } from './ui-session.mjs';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
@@ -20,7 +21,7 @@ page.on('pageerror', e => errors.push('pageerror: ' + e.message));
 page.on('console', m => { if (m.type() === 'error') errors.push('console: ' + m.text()); });
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); } catch {} });
 await page.goto(url, { waitUntil: 'networkidle0' });
-await page.waitForSelector('.monaco-editor');
+await enterMode(page);
 await new Promise(r => setTimeout(r, 800));
 const shot = async (name) => { await page.screenshot({ path: join(out, name + '.png') }); };
 const status = () => page.$eval('#status', e => e.textContent);

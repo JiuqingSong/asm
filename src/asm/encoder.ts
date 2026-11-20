@@ -133,10 +133,14 @@ function typeName(size: number): string {
 
 export class Encoder {
   ctx!: EncCtx;
+  relocationOffset: number | null = null;
+  private relocationTail = 0;
 
   encode(ctx: EncCtx, mn: string, vals: Val[], prefixes: number[]): number[] {
     this.ctx = ctx;
+    this.relocationTail = 0;
     const out = this.encodeInner(mn, vals);
+    this.relocationOffset = this.relocationTail ? prefixes.length + out.length - this.relocationTail : null;
     return [...prefixes, ...out];
   }
 
@@ -246,6 +250,7 @@ export class Encoder {
       if (w ? v < -65536 || v > 65535 : v < -256 || v > 255) {
         err(`立即数 ${v} 超出${w ? '16' : '8'} 位范围`);
       }
+      if (w && op.k === 'imm' && op.frameImm) this.relocationTail = 2;
     }
     return w ? [v & 0xff, (v >> 8) & 0xff] : [v & 0xff];
   }
@@ -545,7 +550,10 @@ export class Encoder {
       const a = this.classify(vals[0]), b = this.classify(vals[1]);
       if (a.k !== 'imm' || b.k !== 'imm') err('ENTER 的两个操作数都必须是立即数：ENTER 局部变量字节数, 嵌套层数');
       if (!b.unknown && (b.v < 0 || b.v > 255)) err('ENTER 的嵌套层数必须在 0~255 之间');
-      return [0xc8, ...this.imm(a.v, true, a), b.v & 0xff];
+      const bytes = [0xc8, ...this.imm(a.v, true, a), b.v & 0xff];
+      // ENTER 的字立即数后面还有一个嵌套深度字节。
+      if (this.relocationTail) this.relocationTail++;
+      return bytes;
     }
     this.need(vals, mn in GRP0F00 || mn in GRP0F01 ? 1 : 2, mn);
     const a = this.classify(vals[0]), b = vals.length > 1 ? this.classify(vals[1]) : a;
@@ -654,6 +662,7 @@ export class Encoder {
         return [0x0e, 0xe8, d & 0xff, d >> 8];
       }
       const seg = t.frame ? ctx.loadSeg + t.frame.para : 0;
+      if (t.frame) this.relocationTail = 2;
       return [isCall ? 0x9a : 0xea, t.n & 0xff, (t.n >> 8) & 0xff, seg & 0xff, (seg >> 8) & 0xff];
     }
     if (!sameFrame) err(`${name} 的目标 ${t.sym?.name ?? ''} 在另一个段中，需要写 ${name} FAR PTR ${t.sym?.name ?? '标号'}`);

@@ -74,6 +74,7 @@ class Assembler {
   private undefRefs = new Map<string, { line: number; col: number; name: string }>();
   private curLine = 0;
   private encoder = new Encoder();
+  private relocations = new Map<Segment, Set<number>>();
   private segOrderCounter = 0;
   private isCom = false;
 
@@ -128,6 +129,7 @@ class Assembler {
     this.entry = null;
     this.startupEntry = null;
     this.listing = [];
+    this.relocations.clear();
     this.stmtIndex = 0;
     this.undefRefs.clear();
     for (const g of this.groupMap.values()) g.segments = [];
@@ -569,15 +571,23 @@ class Assembler {
 
   // ======================= 数据定义 =======================
 
-  private emit(bytes: number[]): void {
+  private emit(bytes: number[], fixups: number[] = []): void {
     const seg = this.requireSeg();
+    const start = seg.pc;
+    let relocations = this.relocations.get(seg);
     for (const b of bytes) {
+      relocations?.delete(seg.pc);
+      relocations?.delete(seg.pc - 1);
       seg.bytes[seg.pc] = b;
       seg.pc++;
       if (seg.pc > 0x10000) throw new AsmError(`段 ${seg.name} 超过 64KB`);
     }
     if (bytes.length) seg.emitted = true;
     if (seg.pc > seg.size) seg.size = seg.pc;
+    if (fixups.length) {
+      if (!relocations) this.relocations.set(seg, relocations = new Set());
+      for (const offset of fixups) relocations.add(start + offset);
+    }
   }
 
   private defineData(nameTok: Token | null, dir: string, toks: Token[]): void {
@@ -623,7 +633,8 @@ class Assembler {
           const s0 = seg.pc;
           const c = this.dataItems(body, size);
           const chunk = seg.bytes.slice(s0, seg.pc);
-          for (let k = 1; k < n; k++) this.emit(chunk);
+          const fixups = [...(this.relocations.get(seg) ?? [])].filter(at => at >= s0 && at + 1 < seg.pc).map(at => at - s0);
+          for (let k = 1; k < n; k++) this.emit(chunk, fixups);
           if (n === 0) { seg.pc = s0; }
           count += c * n;
         }
@@ -651,15 +662,15 @@ class Assembler {
         this.emit([n & 0xff]);
       } else if (size === 2) {
         if (!v.unknown && (n < -32768 || n > 65535)) throw new AsmError(`数值 ${n} 超出字范围（-32768~65535）`);
-        this.emit([n & 0xff, (n >> 8) & 0xff]);
+        this.emit([n & 0xff, (n >> 8) & 0xff], v.frameImm ? [0] : []);
       } else if (size === 4 && v.frame) {
         const segv = this.loadSeg + v.frame.para;
-        this.emit([n & 0xff, (n >> 8) & 0xff, segv & 0xff, (segv >> 8) & 0xff]);
+        this.emit([n & 0xff, (n >> 8) & 0xff, segv & 0xff, (segv >> 8) & 0xff], [2]);
       } else {
         const bytes: number[] = [];
         let x = BigInt.asUintN(size * 8, BigInt(Math.trunc(n)));
         for (let k = 0; k < size; k++) { bytes.push(Number(x & 0xffn)); x >>= 8n; }
-        this.emit(bytes);
+        this.emit(bytes, v.frameImm && size >= 2 ? [0] : []);
       }
       count++;
     }
@@ -989,6 +1000,7 @@ class Assembler {
     const stmt = this.stmtIndex++;
     const start = seg.pc;
     let bytes: number[];
+    let fixups: number[] = [];
     if (k >= toks.length) {
       bytes = prefixes;
     } else {
@@ -1016,8 +1028,9 @@ class Assembler {
         cpu: this.cpu,
         useCpu: (level: number) => { if (level > this.cpuUsed) this.cpuUsed = level; },
       }, mn, vals, prefixes);
+      if (this.encoder.relocationOffset !== null) fixups = [this.encoder.relocationOffset];
     }
-    this.emit(bytes);
+    this.emit(bytes, fixups);
     this.listing.push({ line: this.curLine, seg, offset: start, bytes, isCode: true });
   }
 
@@ -1179,6 +1192,7 @@ class Assembler {
       cpu: this.cpuUsed,
       format: this.isCom ? 'com' : 'exe',
       loadSeg, pspSeg, chunks, entry, stack, lineToAddrs, addrToLine, symbols, listing,
+      relocations: [...this.relocations].flatMap(([seg, offsets]) => [...offsets].map(offset => base + seg.start + offset)).sort((a, b) => a - b),
       segments: this.segList.map(s => ({ name: s.name, addr: base + s.start, size: s.size, loadStart: s.loadStart, bytes: Array.from({ length: s.size }, (_, k) => s.bytes[k] ?? -1) })),
       imageStart: this.isCom ? pspSeg * 16 + 0x100 : base,
       imageEnd,

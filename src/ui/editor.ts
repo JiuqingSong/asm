@@ -233,7 +233,7 @@ export class EditorView {
   }
 
   // ---------- 汇编结果 ----------
-  setProgram(model: monaco.editor.ITextModel, p: Program | null, diags: Diag[], showBytes: boolean): void {
+  setDiagnostics(model: monaco.editor.ITextModel, diags: Diag[]): void {
     monaco.editor.setModelMarkers(model, 'asm', diags.map(d => {
       const lineLen = d.line >= 1 && d.line <= model.getLineCount() ? model.getLineMaxColumn(d.line) : 1;
       return {
@@ -243,6 +243,10 @@ export class EditorView {
         startColumn: d.col >= 0 ? d.col + 1 : 1, endColumn: lineLen,
       };
     }));
+  }
+
+  setProgram(model: monaco.editor.ITextModel, p: Program | null, diags: Diag[], showBytes: boolean): void {
+    this.setDiagnostics(model, diags);
     this.doc(model).codeLines = new Set(p ? [...p.lineToAddrs.keys()] : []);
     this.setBreakpoints(model, this.breakpointLines(model));
     this.showBytes(model, p, showBytes);

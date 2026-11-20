@@ -99,6 +99,8 @@ export interface Program {
   pspSeg: number;
   /** 需要拷入内存的块：线性地址 + 字节 */
   chunks: { addr: number; bytes: Uint8Array }[];
+  /** 需要 DOS 装载器重定位的段地址字（线性地址；汇编器输出时提供） */
+  relocations?: number[];
   entry: { cs: number; ip: number };
   stack: { ss: number; sp: number };
   /** 源码行 -> 该行生成的指令起始线性地址 */

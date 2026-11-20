@@ -47,6 +47,25 @@ describe('从光驱启动（El Torito 软盘模拟）', () => {
     expect(await readElTorito(new BytesSource(iso))).toMatch(/硬盘模拟/);
   });
 
+  it.each([{ fdc: false }, { floppyA: false }])('没有物理 A: 时仍可模拟光盘软驱，BDA 不枚举被替换的物理 B:（%j）', config => {
+    const m = new Machine(config);
+    m.drives[1] = new Disk('B.IMG', floppy(0x11), true);
+    m.cdBoot = new Disk('CD', floppy(0x42), true);
+    m.load(bootProgram(CD_BOOT));
+    expect(m.mem[0x7c02]).toBe(0x42);
+    expect(m.mem[0x410] & 0xc1).toBe(1);
+    expect(m.cmos[0x10]).toBe(config.fdc === false ? 0 : 4);
+    expect(m.driveFor(1)).toBeNull();
+    m.cpu.r[0] = 0x0800;
+    m.cpu.r[2] = 0;
+    m.hle.handle(0x13);
+    expect(m.cpu.r[2] & 0xff).toBe(1);
+    m.cpu.r[0] = 0x0800;
+    m.cpu.r[2] = 1;
+    m.hle.handle(0x13);
+    expect(m.cpu.r[0] >> 8).not.toBe(0);
+  });
+
   it('不模拟方式：引导程序装到 7C00，DL = E0h，用 INT 13h 扩展功能（41h、42h、48h、4Bh）读光盘', async () => {
     const iso = buildIso([{ path: 'README.TXT', data: new Uint8Array(10) }], 'NOEMU', floppy(0));
     const cat = 19 * 2048, bootLba = iso[cat + 40] | (iso[cat + 41] << 8);
