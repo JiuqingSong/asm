@@ -1,4 +1,5 @@
 export interface MachineConfig {
+  fpu: boolean;
   bios: boolean;
   dos: boolean;
   mouseDriver: boolean;
@@ -23,6 +24,7 @@ export interface MachineConfig {
 export type StartupMode = 'debug' | 'dual' | 'full';
 
 export const DEFAULT_CONFIG: Readonly<MachineConfig> = Object.freeze({
+  fpu: false,
   bios: true, dos: true, mouseDriver: true,
   pic: true, slavePic: true, pit: true, keyboard: true, dma: true, rtc: true,
   vga: true, speaker: true, com1: true, com2: true, fdc: true,
@@ -30,6 +32,7 @@ export const DEFAULT_CONFIG: Readonly<MachineConfig> = Object.freeze({
 });
 
 export const CONFIG_OPTIONS: { key: keyof MachineConfig; label: string; software?: boolean }[] = [
+  { key: 'fpu', label: 'x87 数学协处理器（80387 / 486DX，仅 386、486）' },
   { key: 'bios', label: 'BIOS 服务（中断、数据区、ROM 参数表）', software: true },
   { key: 'dos', label: '浅层 DOS（INT 20h/21h、PSP、环境变量、MCB）', software: true },
   { key: 'mouseDriver', label: '内置鼠标驱动（INT 33h）', software: true },

@@ -195,7 +195,7 @@ export class DMA {
 /** 0~3 号通道的页寄存器（80h 开始的序号）：0 号是 87h、1 号 83h、2 号 81h、3 号 82h */
 const PAGE_PORT = [7, 3, 1, 2];
 
-/** 8253 可编程定时器（只模拟 0 号通道产生 IRQ0 和 2 号通道的频率设置） */
+/** 8254 可编程定时器：0 号通道产生 IRQ0，2 号通道用于喇叭和计时 */
 export class PIT {
   reload = [0x10000, 0x10000, 0x10000];
   private counter = 0x10000;
@@ -204,6 +204,11 @@ export class PIT {
   private writeLow = [true, true, true];
   private readLow = [true, true, true];
   private pendingLow = [0, 0, 0];
+  private mode = [3, 2, 3];
+  private statusLatch = [-1, -1, -1];
+  private nullCount = [false, false, false];
+  private counter2 = 0x10000;
+  private gate2 = false;
   private onTick: () => void;
   /** 某个通道的计数值被重新设定（喇叭用 2 号通道） */
   onReload: ((ch: number) => void) | null = null;
@@ -213,6 +218,12 @@ export class PIT {
   }
 
   advance(clocks: number): void {
+    if (this.gate2) {
+      this.counter2 -= clocks;
+      if (this.mode[2] === 2 || this.mode[2] === 3) {
+        if (this.counter2 <= 0) this.counter2 += (Math.floor(-this.counter2 / this.reload[2]) + 1) * this.reload[2];
+      } else this.counter2 = Math.max(0, this.counter2);
+    }
     this.counter -= clocks;
     while (this.counter <= 0) {
       this.counter += this.reload[0];
@@ -225,10 +236,32 @@ export class PIT {
     return Math.max(0, this.counter);
   }
 
+  setGate2(high: boolean): void {
+    if (high && !this.gate2 && [1, 2, 3, 5].includes(this.mode[2])) this.counter2 = this.reload[2];
+    this.gate2 = high;
+  }
+
+  get output2(): boolean {
+    if (this.mode[2] === 0 || this.mode[2] === 1) return this.counter2 === 0;
+    if (!this.gate2) return true;
+    if (this.mode[2] === 2) return this.counter2 > 1;
+    if (this.mode[2] === 3) return this.counter2 > Math.floor(this.reload[2] / 2);
+    return this.counter2 !== 0;
+  }
+
+  private count(ch: number): number {
+    return (ch === 0 ? Math.max(0, this.counter) : ch === 2 ? Math.ceil(this.counter2) : 0) & 0xffff;
+  }
+
   in8(port: number): number {
     const ch = port & 3;
     if (ch === 3) return 0xff;
-    let v = this.latch[ch] >= 0 ? this.latch[ch] : ch === 0 ? Math.max(0, this.counter) & 0xffff : 0;
+    if (this.statusLatch[ch] >= 0) {
+      const status = this.statusLatch[ch];
+      this.statusLatch[ch] = -1;
+      return status;
+    }
+    let v = this.latch[ch] >= 0 ? this.latch[ch] : this.count(ch);
     let res: number;
     if (this.access[ch] === 1) res = v & 0xff;
     else if (this.access[ch] === 2) res = (v >> 8) & 0xff;
@@ -246,10 +279,23 @@ export class PIT {
     const ch = port & 3;
     if (ch === 3) {
       const sel = v >> 6;
-      if (sel === 3) return;
+      if (sel === 3) {
+        for (let k = 0; k < 3; k++) if (v & (2 << k)) {
+          if (!(v & 0x20) && this.latch[k] < 0) this.latch[k] = this.count(k);
+          if (!(v & 0x10) && this.statusLatch[k] < 0) {
+            this.statusLatch[k] = (k === 2 && this.output2 ? 0x80 : 0)
+              | (this.nullCount[k] ? 0x40 : 0) | (this.access[k] << 4) | (this.mode[k] << 1);
+          }
+        }
+        return;
+      }
       const acc = (v >> 4) & 3;
-      if (acc === 0) { this.latch[sel] = sel === 0 ? Math.max(0, this.counter) & 0xffff : 0; this.readLow[sel] = true; return; }
+      if (acc === 0) { if (this.latch[sel] < 0) this.latch[sel] = this.count(sel); return; }
       this.access[sel] = acc;
+      const mode = (v >> 1) & 7;
+      this.mode[sel] = mode >= 6 ? mode - 4 : mode;
+      this.nullCount[sel] = true;
+      this.latch[sel] = this.statusLatch[sel] = -1;
       this.writeLow[sel] = true;
       this.readLow[sel] = true;
       return;
@@ -257,6 +303,8 @@ export class PIT {
     const set = (val: number) => {
       this.reload[ch] = val === 0 ? 0x10000 : val;
       if (ch === 0) this.counter = this.reload[0];
+      if (ch === 2) this.counter2 = this.reload[2];
+      this.nullCount[ch] = false;
       this.onReload?.(ch);
     };
     if (this.access[ch] === 1) set(v);

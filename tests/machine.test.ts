@@ -1017,6 +1017,25 @@ end start`);
     expect(m.drives[2]!.geo).toEqual({ cylinders: 65, heads: 16, sectors: 63 });
   });
 
+  it('引导程序调用 INT 18h 时显示启动失败并停止，不返回继续执行', async () => {
+    const { Disk, blankHardDisk } = await import('../src/machine/disk.ts');
+    const { bootProgram } = await import('../src/machine/boot.ts');
+    const img = blankHardDisk(32);
+    img.set([0xcd, 0x18, 0xc6, 0x06, 0x00, 0x05, 0x58, 0xf4], 0); // int 18h / mov byte ptr [0500h],'X' / hlt
+    img[510] = 0x55; img[511] = 0xaa;
+    const m = new Machine({ dos: false, mouseDriver: false });
+    m.drives[2] = new Disk('C.IMG', img, false);
+    m.load(bootProgram(0x80));
+    m.run(10_000);
+    expect(m.console).toContain('No bootable system found.');
+    expect(m.video.peek(0xb8000 + 160)).toBe('N'.charCodeAt(0));
+    expect(m.status).toBe('exited');
+    expect(m.exitCode).toBe(1);
+    expect(m.message).toMatch(/启动失败.*INT 18h/);
+    expect(m.cpu.halted).toBe(true);
+    expect(m.mem[0x500]).toBe(0);
+  });
+
   it('Ctrl+Alt+Del：从磁盘启动时热启动', async () => {
     const { Disk, blankFloppy } = await import('../src/machine/disk.ts');
     const { bootProgram } = await import('../src/machine/boot.ts');

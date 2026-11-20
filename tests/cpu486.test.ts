@@ -67,6 +67,44 @@ describe('486', () => {
     expect((f.r32(AX) >> 8) & 0xf).toBe(4);
   });
 
+  it('LOCK CMPXCHG：8/16/32 位内存目标允许比较成功与失败', () => {
+    for (const size of [1, 2, 4]) {
+      const prefix = size === 4 ? [0x66] : [];
+      const instruction = [...prefix, 0xf0, 0x0f, size === 1 ? 0xb0 : 0xb1, 0x0e, 0x00, 0x40];
+      const c = run([
+        0xb8, 0x00, 0x00, 0xb9, 0x09, 0x00,
+        ...instruction,
+        0x9c, 0x5b,
+        ...instruction,
+        0xf4,
+      ]);
+      expect(c.mem[0x4000]).toBe(9);
+      expect(c.mem[0x4001]).toBe(0);
+      expect(c.r[AX]).toBe(9);
+      expect(c.r[BX] & ZF).toBe(ZF);
+      expect(c.flags & ZF).toBe(0);
+      expect(c.ip).toBe(0x2000 + 9 + instruction.length * 2);
+    }
+  });
+
+  it('LOCK XADD：8/16/32 位内存目标允许交换并相加', () => {
+    for (const size of [1, 2, 4]) {
+      const prefix = size === 4 ? [0x66] : [];
+      const instruction = [...prefix, 0xf0, 0x0f, size === 1 ? 0xc0 : 0xc1, 0x0e, 0x00, 0x40];
+      const c = run([0xb9, 0x05, 0x00, ...instruction, ...instruction, 0xf4]);
+      expect(c.mem[0x4000]).toBe(5);
+      expect(c.r[CX]).toBe(5);
+      expect(c.ip).toBe(0x2000 + 4 + instruction.length * 2);
+    }
+  });
+
+  it('LOCK CMPXCHG/XADD 不允许寄存器目标，也不允许在 386 上执行', () => {
+    for (const op of [0xb0, 0xb1, 0xc0, 0xc1]) {
+      expect(run([0xf0, 0x0f, op, 0xc8, 0xf4]).ip).toBe(0x3001);
+      expect(run([0xf0, 0x0f, op, 0x0e, 0x00, 0x40, 0xf4], false).ip).toBe(0x3001);
+    }
+  });
+
   it('386 上这些指令是无效操作码（INT 6）', () => {
     for (const code of [[0x0f, 0xc8], [0x0f, 0xa2], [0x0f, 0xc1, 0xcb], [0x0f, 0xb1, 0xd1], [0x0f, 0x09]]) {
       const c = run([...code, 0xf4], false);

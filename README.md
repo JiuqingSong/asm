@@ -23,7 +23,8 @@ npm run build      # 生成静态网页到 dist/
 - **面板**：寄存器（高低字节分开、刚改变的值高亮）、标志位、栈（标出返回地址来自哪一行）、变量、内存、DOS 屏幕（80×25 彩色文本）、虚拟磁盘。四个窗口之间的分隔条可以拖动调整大小（双击恢复，大小会记住），每个窗口都可以最大化（标题栏右边的按钮或双击标题栏，Esc 还原）
 - **硬件**：中断向量表、8259 中断控制器、8253 定时器（IRQ0 → INT 8 → INT 1Ch）、键盘控制器（IRQ1 → INT 9，端口 60h 扫描码）、8250 串口（COM1/COM2，含回环模式）。程序可以像在真机上一样挂接中断
 - **双机模式**：两台虚拟 PC 的 COM1 用虚拟交叉线连接，按虚拟时间同步运行。可选接线方式（全握手 / 部分握手 / 三线制）、串口芯片（真实 8250 / 带缓冲和硬件流控的虚拟串口），面板上显示 DTR/RTS/CTS/DSR 信号和线路上的每个字节
-- **CPU 型号**：8088、286、386、486 四档。286 档是 80286：186/286 的指令、16MB 内存、A20 门和完整的 16 位保护模式（HIMEM.SYS、Windows 3.0 和 3.1 的标准模式可以运行）；386 档是 80386：32 位寄存器和指令、32 位保护模式、分页、虚拟 8086 模式（实模式指令用 SingleStepTests/80386 真机测试集验证）。能运行 Windows 3.1 的 386 增强模式，能安装并运行 Windows 95；486 档是不带浮点单元的 80486（BSWAP、XADD、CMPXCHG、INVLPG、CPUID，EFLAGS 的 AC/ID 位，CR0.WP）
+- **CPU 型号**：8088、286、386、486 四档。286 档是 80286：186/286 的指令、16MB 内存、A20 门和完整的 16 位保护模式（HIMEM.SYS、Windows 3.0 和 3.1 的标准模式可以运行）；386 档是 80386：32 位寄存器和指令、32 位保护模式、分页、虚拟 8086 模式（实模式指令用 SingleStepTests/80386 真机测试集验证）。能运行 Windows 3.1 的 386 增强模式，能安装并运行 Windows 95；486 档支持 BSWAP、XADD、CMPXCHG、INVLPG、CPUID，EFLAGS 的 AC/ID 位和 CR0.WP，默认相当于不带浮点单元的 486SX
+- **可选数学协处理器**：直接调试和完整模拟启动前可为 386/486 勾选 x87（默认不安装，8088/286 不可选），分别相当于 386+80387 / 486DX。80 位寄存器、浮点运算、异常、保存/恢复、单步回退和反汇编；寄存器面板可展开查看 x87 状态。数值核心使用本地内嵌的 Berkeley SoftFloat WASM。已验证 Win95 桌面及英文 Win98 SE 安装向导至产品密钥页，尚未验证 Win98 完整安装
 - **原机速度**：按所选 CPU 的真实速度运行（虚拟时间与真实时间同步），延时、时钟、波特率和声音都与原机一致；也可以全速运行或按每秒 1~100 步动画执行
 - **PC 喇叭**：8253 的 2 号通道 + 端口 61h，用 Web Audio 发声（示例：两只老虎）
 - **直接运行 DOS 程序**：直接调试始终显示独立文件区，把 EXE/COM 上传后点"运行"（MZ 重定位、PKLITE 等自解压程序、DOS 内存控制块链）；磁盘映像区需在启动前勾选"显示磁盘映像文件系统"（默认不勾选）。完整模拟只显示磁盘映像区，双机保留两个区域
@@ -67,6 +68,23 @@ node tools/serial-demo.ts send.asm recv.asm 286 buffered   # 双机串口文件�
 ```
 
 `test:cpu` 需要先把测试集下载到 `test-data/8088/`（约 730MB，见 https://github.com/SingleStepTests/8088 的 `v2` 目录）；`test:cpu386` 需要 `test-data/80386/`（约 600MB，https://github.com/SingleStepTests/80386 的 `v1_ex_real_mode` 目录，MOO 格式）。
+
+### SoftFloat 数值核心
+
+使用 [Berkeley SoftFloat 3e](https://www.jhauser.us/arithmetic/SoftFloat.html) 的原始 C 源码和 `8086` 专用 NaN 规则，位于 `vendor/softfloat/`。上游归档 https://www.jhauser.us/arithmetic/SoftFloat-3e.zip 的 SHA256 为 `21130ce885d35c1fe73fc1e1bf2244178167e05c6747cad5f450cc991714c746`；`Makefile` 保留其 FAST_INT64 构建的源文件清单。许可证见 [vendor/softfloat/COPYING.txt](vendor/softfloat/COPYING.txt)，网页发布同时包含 `softfloat-license.txt`。
+
+普通开发、测试和发布不需要 C 编译器：生成的 WASM 已内嵌在 `src/cpu/softfloat-wasm.ts`，不会联网获取数值核心。修改 C 接口或编译选项后，使用 Zig 0.14.1 重新生成：
+
+```powershell
+$env:ZIG = 'C:\path\to\zig.exe'
+npm run build:softfloat
+npm test
+npm run build
+```
+
+基本四则运算、平方根、舍入和转换由 SoftFloat 完成；x87 状态机及高精度定点超越函数由 TypeScript 实现。暂不保证超越函数与某一代实体 387 的每个末位完全相同，也未完成全部特殊值和未屏蔽异常的真机差分验证。汇编器暂未增加 x87 助记符，可运行外部编译的 EXE/COM 或用 `DB` 写机器码。
+
+`tools/softfloat/reference.c` 可用支持 x86 内联汇编的 GCC/Clang 编译为本机测试程序，再运行 `node tools/check-x87.ts <reference.exe>` 做真机差分。该检查不是普通测试的前提；若主机安全策略禁止执行，不绕过限制。本次验证环境的应用程序控制策略阻止了该程序，因此不能将差分检查记为通过。
 
 ## 开发计划
 

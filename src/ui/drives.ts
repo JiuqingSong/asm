@@ -2,7 +2,7 @@
 // 映像保存在浏览器的 IndexedDB 里，刷新页面后还在（硬盘上装好的 DOS 不会丢）。
 // 光盘映像不读进内存：保存的是文件本身（Blob），DOS 读到哪里才从文件里读哪一段。
 import type { Machine } from '../machine/machine.ts';
-import { Disk, blankHardDisk, blankFloppy, isFloppySize } from '../machine/disk.ts';
+import { Disk, blankHardDisk, blankFloppy, isFloppyImage } from '../machine/disk.ts';
 import { FatVolume } from '../machine/fat.ts';
 import { IsoDisk, BlobSource, isIsoFile } from '../machine/iso.ts';
 import { UTILITIES, buildUtility } from '../dos/utilities.ts';
@@ -370,10 +370,13 @@ export class DrivesPanel {
         return;
       }
       const data = new Uint8Array(await f.arrayBuffer());
-      if (floppy && !isFloppySize(data.length)) throw new Error(`${f.name} 不是标准大小的软盘映像（${data.length} 字节）。硬盘映像请放进 C: 或 D:，光盘映像（.iso）请放进 D:`);
-      this.machine(i).drives[k] = new Disk(f.name, data, floppy);
+      if (floppy && !isFloppyImage(data)) throw new Error(`${f.name} 不是标准大小的软盘映像（${data.length} 字节）。硬盘映像请放进 C: 或 D:，光盘映像（.iso）请放进 D:`);
+      const disk = new Disk(f.name, data, floppy);
+      this.machine(i).drives[k] = disk;
       this.persist(i, k);
-      this.host.message('ok', `${LETTERS[k]} 放入了 ${f.name}`, i);
+      const note = floppy && data.length !== disk.data.length
+        ? `（识别并忽略了尾部 ${data.length - disk.data.length} 字节说明，按 ${disk.description} 软盘装入；保存和下载为标准原始映像，原文件未修改）` : '';
+      this.host.message('ok', `${LETTERS[k]} 放入了 ${f.name}${note}`, i);
     } catch (e) {
       this.host.message('error', (e as Error).message, i);
     }

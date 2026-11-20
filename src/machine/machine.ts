@@ -15,6 +15,7 @@ import { Mouse, MOUSE_STUB, MOUSE_PTR, MOUSE_VECTOR } from './mouse.ts';
 import { FONT_LO, FONT_HI } from './bios.ts';
 import { builtinFont } from './font8x8.ts';
 import { DEFAULT_CONFIG, type MachineConfig } from './config.ts';
+import { X87, type FpuSnapshot } from '../cpu/x87.ts';
 
 /** CPU 速度选项：每条指令平均消耗的 PIT 时钟数（PIT 为 1.193182 MHz） */
 export const CPU_SPEEDS = [
@@ -69,12 +70,20 @@ class History {
   count = 0;          // 有效条数
   private wpos = 0;   // 已记录的内存写入总数
   enabled = true;
+  private fpu = new Map<number, FpuSnapshot>();
 
-  clear(): void { this.head = 0; this.pos = 0; this.count = 0; this.wpos = 0; }
+  clear(): void { this.head = 0; this.pos = 0; this.count = 0; this.wpos = 0; this.fpu.clear(); }
+
+  recordFpu(cpu: CPU): void {
+    if (!this.count || !cpu.fpu) return;
+    const i = (this.head - 1) % this.cap;
+    if (!this.fpu.has(i)) this.fpu.set(i, cpu.fpu.snapshot());
+  }
 
   // 每条指令都调用一次：直接读 CPU 的寄存器数组，不经过 r32() 之类的函数
   begin(cpu: CPU, flags: number): void {
     const i = this.pos;
+    if (this.fpu.size) this.fpu.delete(i);
     const o = i * 18;
     const r = this.regs, lo = cpu.r, hi = cpu.rh, s = cpu.s;
     r[o] = lo[0] | (hi[0] << 16); r[o + 1] = lo[1] | (hi[1] << 16);
@@ -125,6 +134,8 @@ class History {
     this.count--;
     const i = this.head % this.cap;
     this.pos = i;
+    const fpu = this.fpu.get(i);
+    if (fpu && cpu.fpu) { cpu.fpu.restore(fpu); this.fpu.delete(i); }
     const start = this.wstart[i];
     for (let w = this.wpos - 1; w >= start; w--) {
       const j = w & (this.wcap - 1);
@@ -211,12 +222,26 @@ export class Machine {
 
   /** 选择 CPU 型号：决定速度和指令集（8088、80286、80386） */
   setCpu(id: CpuSpeedId): void {
+    const hadFpu = this.cpu.fpuEnabled;
     const s = CPU_SPEEDS.find(x => x.id === id)!;
     this.cpuModel = id;
     this.clocksPerInstr = s.clocks;
     this.cpu.is286 = s.is286;
     this.cpu.is386 = id === '386' || id === '486';
     this.cpu.is486 = id === '486';
+    this.cpu.updateFpuIrq();
+    if (hadFpu !== this.cpu.fpuEnabled) {
+      this.cpu.fpu?.init();
+      this.cpu.updateFpuIrq();
+      this.history.clear();
+      if (this.program) {
+        if (this.config.bios) this.mem[0x410] = (this.mem[0x410] & ~2) | (this.cpu.fpuEnabled ? 2 : 0);
+        this.cmos[0x14] = (this.cmos[0x14] & ~2) | (this.cpu.fpuEnabled ? 2 : 0);
+        let sum = 0;
+        for (let k = 0x10; k <= 0x2d; k++) sum += this.cmos[k];
+        this.cmos[0x2e] = sum >> 8; this.cmos[0x2f] = sum;
+      }
+    }
     this.cpu.setFlags(this.cpu.flags); // 位 12-15：8086 为 1，286 为 0
   }
   com1 = new UART('COM1', 0x3f8, 4, () => this.clock, on => { if (on && this.config.com1) this.raiseIrq(4); else this.pic.lower(4); });
@@ -285,6 +310,12 @@ export class Machine {
   constructor(config: Partial<MachineConfig> = {}) {
     this.config = Object.freeze({ ...DEFAULT_CONFIG, ...config });
     const cpu = this.cpu;
+    if (this.config.fpu) {
+      cpu.fpu = new X87();
+      cpu.fpu.onChange = () => { if (this.history.enabled) this.history.recordFpu(cpu); };
+      cpu.onFpuIrq = active => { if (active) this.raiseIrq(13); else this.pic2.lower(5); };
+      cpu.fpu.onError = () => cpu.updateFpuIrq();
+    }
     cpu.io = this.makeBus();
     const pic = this.pic, kbd = this.kbd;
     pic.slave = this.config.slavePic ? this.pic2 : null;
@@ -379,7 +410,7 @@ export class Machine {
           case 0x60:
             if (this.kbcOutputPending) { this.kbcOutputPending = false; return this.kbcOutputPort(); } // 命令 D0h 的回答
             return this.kbd.in60();
-          case 0x61: return (this.port61 & 0xcf) | ((Math.floor(this.clock / 18) & 1) << 4); // 位 4：内存刷新，约每 15 微秒翻转一次（AT 机上程序用它计时）
+          case 0x61: return (this.port61 & 0xcf) | (this.pit.output2 ? 0x20 : 0) | ((Math.floor(this.clock / 18) & 1) << 4); // 位 4：内存刷新，位 5：PIT 通道 2 输出
           case 0x64: return this.kbd.outputFull || this.kbd.queue.length || this.kbcOutputPending ? 0x15 : 0x14;
           case 0x92: return this.cpu.a20Enabled ? 0x02 : 0x00;
           case 0x71: return this.cmosRead();
@@ -419,7 +450,7 @@ export class Machine {
             return;
           }
           case 0x40: case 0x41: case 0x42: case 0x43: this.pit.out8(port, v); return;
-          case 0x61: this.port61 = v; this.updateSpeaker(); return;
+          case 0x61: this.port61 = v; this.pit.setGate2(!!(v & 1)); this.updateSpeaker(); return;
           case 0x64: // 键盘控制器（8042）的命令
             switch (v) {
               case 0xd0: this.kbcOutputPending = true; return;  // 读输出端口：下一次读 60h 得到
@@ -449,7 +480,15 @@ export class Machine {
           case 0x71: this.cmosWrite(v); return;
           case 0xa0: case 0xa1: this.pic2.out8(port & 0x21, v); return;
           case 0x70: this.cmosIndex = v & 0x7f; return;
-          case 0xf0: case 0xf1: return; // 数学协处理器的复位端口：Turbo Pascal 等检测协处理器时会写
+          case 0xf0:
+            if (this.cpu.fpuEnabled) this.pic2.lower(5);
+            return;
+          case 0xf1:
+            if (this.cpu.fpuEnabled) {
+              if (this.history.enabled) this.history.recordFpu(this.cpu);
+              this.cpu.fpu!.init();
+            }
+            return;
           case 0x3d4: this.video.crtcIndex = v; return;
           case 0x3d5: {
             const vc = this.video, ci = vc.crtcIndex & 31;
@@ -732,11 +771,13 @@ export class Machine {
     mem.set([0x50, 0xe4, 0x60, TRAP_OPCODE, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf], bios + STUB_INT9);
     // INT 10h：陷阱，切换显示模式后再用 OUT 指令写 VGA 寄存器（见 vgarom.ts）
     if (this.config.vga) mem.set(int10Stub(0x10), bios + STUB_INT10);
-    IRQ_VECTORS.forEach((n, k) => {
+    const irqVectors = this.config.fpu ? [...IRQ_VECTORS, 0x75] : IRQ_VECTORS;
+    irqVectors.forEach((n, k) => {
       const off = IRQ_STUBS + k * 16;
       const trap = n === 0x0e || n === 0x70 || n === 0x76 ? [TRAP_OPCODE, n] : [];
       const eoi = n >= 0x70 ? [0xb0, 0x20, 0xe6, 0xa0, 0xe6, 0x20] : [0xb0, 0x20, 0xe6, 0x20]; // mov al,20h / (out 0A0h,al) / out 20h,al
-      mem.set([...trap, 0x50, ...eoi, 0x58, 0xcf], bios + off);  // （陷阱）push ax / EOI / pop ax / iret
+      const fpu = n === 0x75 ? [0x30, 0xc0, 0xe6, 0xf0, 0xcd, 0x02] : [];
+      mem.set([...trap, 0x50, ...fpu, ...eoi, 0x58, 0xcf], bios + off);
       mem[n * 4] = off & 0xff; mem[n * 4 + 1] = off >> 8;
     });
     mem.set(diskRom(0x13 * STUB_SIZE, FDPT_OFF), bios + DISK_ROM);
@@ -805,6 +846,7 @@ export class Machine {
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
     this.port61 = 0;
+    this.pit.setGate2(false);
     this.updateSpeaker();
     this.kbd.clear();
     this.clock = 0;
@@ -922,7 +964,7 @@ export class Machine {
 
   private get equipmentWord(): number {
     const n = Number(this.floppyInstalled(0)) + Number(this.floppyInstalled(1));
-    return n ? 1 | ((n - 1) << 6) : 0;
+    return (n ? 1 | ((n - 1) << 6) : 0) | (this.cpu.fpuEnabled ? 2 : 0);
   }
 
   private installDosEnvironment(program: Program, cmdline: string, name: string): void {

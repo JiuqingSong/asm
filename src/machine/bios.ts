@@ -150,6 +150,10 @@ export class Hle {
       case 0x14: return this.serialBios();
       case 0x15: return this.system();
       case 0x17: return this.printer();
+      case 0x18:
+        this.writeString('\r\nNo bootable system found.\r\n');
+        this.m.exit(1, '启动失败（INT 18h）：未找到可引导系统。硬盘启动请检查分区是否设为活动、是否已安装系统；也可改从启动软盘或光盘启动。');
+        return true;
       case 0x19: this.m.reboot(); return true;
       case 0x12: this.cpu.r[AX] = 640; return true;
       case 0x16: return this.keyboard();

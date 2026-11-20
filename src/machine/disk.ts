@@ -24,6 +24,17 @@ const FLOPPIES: { size: number; geo: Geometry; type: number; name: string }[] = 
   { size: 2880 * 1024, geo: { cylinders: 80, heads: 2, sectors: 36 }, type: 6, name: '2.88MB' },
 ];
 
+function floppyFormat(data: Uint8Array) {
+  const raw = FLOPPIES.find(f => f.size === data.length);
+  if (raw) return raw;
+  const f = FLOPPIES.find(f => f.size + 1024 === data.length);
+  if (!f) return undefined;
+  const footer = new TextDecoder().decode(data.subarray(f.size));
+  return footer.startsWith('[FileVersion 003] ') &&
+    footer.includes(`[SectorsPerTrack ${f.geo.sectors}]`) &&
+    footer.includes(`[Tracks ${f.geo.cylinders}]`) ? f : undefined;
+}
+
 export class Disk {
   readonly data: Uint8Array;
   readonly geo: Geometry;
@@ -50,9 +61,9 @@ export class Disk {
       this.geo = iso.geo;
       this.floppyType = 0;
     } else if (floppy) {
-      const f = FLOPPIES.find(x => x.size === data.length);
+      const f = floppyFormat(data);
       if (!f) throw new Error(`${name} 的大小是 ${data.length} 字节，不是标准的软盘映像（160KB、360KB、720KB、1.2MB、1.44MB、2.88MB）`);
-      this.data = data;
+      this.data = data.length === f.size ? data : data.slice(0, f.size);
       this.geo = f.geo;
       this.floppyType = f.type;
     } else {
@@ -103,9 +114,9 @@ export class Disk {
   }
 }
 
-/** 根据大小判断是不是软盘映像 */
-export function isFloppySize(size: number): boolean {
-  return FLOPPIES.some(f => f.size === size);
+/** 标准原始软盘映像，或附有可识别的 1024 字节尾部说明的映像 */
+export function isFloppyImage(data: Uint8Array): boolean {
+  return floppyFormat(data) !== undefined;
 }
 
 /** 新建一个空白硬盘映像（16 磁头、每道 63 扇区，和当年 BIOS 的"LBA 转换"参数相同） */

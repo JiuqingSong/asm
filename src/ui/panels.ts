@@ -2,6 +2,7 @@
 import { AX, BX, CX, DX, SP, BP, SI, DI, ES, CS, SS, DS, FS, GS, type CPU } from '../cpu/cpu.ts';
 import type { Machine } from '../machine/machine.ts';
 import type { Program, ProgramSymbol } from '../asm/types.ts';
+import type { FpuSnapshot } from '../cpu/x87.ts';
 
 /** 某一时刻的 CPU 状态快照（用于高亮"刚刚改变"的值） */
 export interface Snapshot {
@@ -12,10 +13,11 @@ export interface Snapshot {
   ip: number;
   flags: number;
   mem: Uint8Array;
+  fpu: FpuSnapshot | null;
 }
 
 export function takeSnapshot(m: Machine): Snapshot {
-  return { r: m.cpu.r.slice(), rh: m.cpu.rh.slice(), s: m.cpu.s.slice(), ip: m.cpu.ip, flags: m.cpu.flags, mem: m.mem.slice() };
+  return { r: m.cpu.r.slice(), rh: m.cpu.rh.slice(), s: m.cpu.s.slice(), ip: m.cpu.ip, flags: m.cpu.flags, mem: m.mem.slice(), fpu: m.cpu.fpuEnabled ? m.cpu.fpu!.snapshot() : null };
 }
 
 export const h2 = (v: number) => (v & 0xff).toString(16).toUpperCase().padStart(2, '0');
@@ -110,6 +112,23 @@ ${cpu.r32(i)}`;
         d.appendChild(e);
       }
       rows.splice(3, 0, d);
+    }
+    if (cpu.fpuEnabled) {
+      const fpu = cpu.fpu!;
+      const details = document.createElement('details');
+      details.className = 'x87';
+      details.open = this.regsEl.querySelector<HTMLDetailsElement>('details.x87')?.open ?? false;
+      details.append(el('summary', '', `x87 · TOP=${fpu.top} · CW=${h4(fpu.control)} SW=${h4(fpu.statusWord)} TW=${h4(fpu.tagWord)}`));
+      const registers = el('div', 'regline x87-registers');
+      for (let k = 0; k < 8; k++) {
+        const value = fpu.st(k), physical = (fpu.top + k) & 7;
+        const changed = prev?.fpu && (prev.fpu.registers[physical] !== value || prev.fpu.tags[physical] !== fpu.tag(k));
+        const text = fpu.tag(k) === 3 ? '空' : value.toString(16).toUpperCase().padStart(20, '0');
+        const cell = el('div', 'reg' + (changed ? ' changed' : ''), `<b>ST(${k})</b><span>${text}</span>`);
+        cell.title = '80 位原始值：符号/指数 16 位 + 尾数 64 位';
+        registers.append(cell);
+      }
+      details.append(registers); rows.push(details);
     }
     this.regsEl.replaceChildren(...rows);
 

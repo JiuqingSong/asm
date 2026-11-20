@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { assemble } from '../src/asm/assembler.ts';
 import { Machine } from '../src/machine/machine.ts';
+import { PIT } from '../src/machine/devices.ts';
 
 // AT 机的第二个中断控制器（IRQ8~15）、实时钟中断、DMA 控制器
 
@@ -20,6 +21,40 @@ function run(src: string): Machine {
 }
 
 describe('AT 机的设备', () => {
+  it('latches channel 2 status/count after a gated CPU calibration interval', () => {
+    const pit = new PIT(() => {});
+    pit.out8(0x43, 0xb0);
+    pit.out8(0x42, 0xff); pit.out8(0x42, 0xff);
+    pit.advance(100);
+    expect(pit.output2).toBe(false);
+    pit.setGate2(true);
+    pit.advance(1234);
+    pit.setGate2(false);
+    pit.out8(0x43, 0xc8);
+    expect(pit.in8(0x42)).toBe(0x30);
+    const low = pit.in8(0x42);
+    pit.advance(500);
+    expect(low | (pit.in8(0x42) << 8)).toBe(0xffff - 1234);
+    pit.setGate2(true);
+    pit.advance(65535);
+    expect(pit.output2).toBe(true);
+    expect(pit.in8(0x42) | (pit.in8(0x42) << 8)).toBe(0);
+  });
+
+  it('reports the periodic channel 2 output on port 61h without disturbing IRQ0', () => {
+    const m = new Machine();
+    m.cpu.io.out8(0x43, 0xb6);
+    m.cpu.io.out8(0x42, 8); m.cpu.io.out8(0x42, 0);
+    m.cpu.io.out8(0x61, 1);
+    expect(m.cpu.io.in8(0x61) & 0x20).toBe(0x20);
+    m.pit.advance(4);
+    expect(m.cpu.io.in8(0x61) & 0x20).toBe(0);
+    m.pit.advance(4);
+    expect(m.cpu.io.in8(0x61) & 0x20).toBe(0x20);
+    m.pit.advance(65536 - 8);
+    expect(m.pic.irr & 1).toBe(1);
+  });
+
   it('实时钟的周期中断经从片（IRQ8 → INT 70h）送到', () => {
     const m = run(`
 .model small

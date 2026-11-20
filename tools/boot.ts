@@ -2,10 +2,11 @@
 // 用法：node tools/boot.ts <A: 映像> [C: 映像 或 -] [百万条指令数] [按键...]
 //   按键：普通文字直接写；{F3} {ENTER} {ESC} {Y} 之类表示特殊键；每段按键之间运行一段时间
 //   C: 写 new:64 表示新建一个 64MB 的空白硬盘；写 - 表示没有硬盘
-//   {PNG} 把图形画面存成 PNG（文件名前缀用环境变量 PNG 指定）；CPU=8088/286/386 选 CPU
+//   {PNG} 把图形画面存成 PNG（文件名前缀用环境变量 PNG 指定）；CPU=8088/286/386/486 选 CPU，FPU=1 安装 x87
 //   调试：WATCH=1 跑飞（执行 00 00 或跑到 A000 段以上）时打印之前的指令和最近的换段；WATCHAT=段:偏移 第一次执行到这里时打印；
 //         DUMPAT=段:偏移 同时反汇编那里的代码；VIDEO=1 打印显卡状态；STATE=1 打印 CPU 状态；VEC=33 打印中断向量；DIS=段:偏移 反汇编
 //   环境变量 ISO=光盘映像 放进 D:；CD=光盘映像 放进光驱；BOOT=C 表示从硬盘启动，BOOT=CD 从光驱启动；DISKS="映像2;映像3" 是依次换进 A: 的软盘，按键里写 {SWAP} 换下一张，{EJECT} 取出 A:
+//   FPU=1 安装 x87 数学协处理器（CPU=386 或 486）；默认不安装
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename } from 'node:path';
 import { Machine } from '../src/machine/machine.ts';
@@ -18,8 +19,8 @@ import { IsoDisk, BytesSource, readElTorito } from '../src/machine/iso.ts';
 import { CD_BOOT } from '../src/machine/machine.ts';
 
 const [a, c = '-', millionsArg = '200', ...keys] = process.argv.slice(2);
-const m = new Machine();
-m.setCpu((process.env.CPU as '8088' | '286' | '386') || '386');
+const m = new Machine({ fpu: process.env.FPU === '1' });
+m.setCpu((process.env.CPU as '8088' | '286' | '386' | '486') || '386');
 if (a && a !== '-') m.drives[0] = new Disk(basename(a), new Uint8Array(readFileSync(a)), true);
 if (c.startsWith('new:')) m.drives[2] = new Disk('C.IMG', blankHardDisk(+c.slice(4)), false);
 else if (c !== '-') m.drives[2] = new Disk(basename(c), new Uint8Array(readFileSync(c)), false);

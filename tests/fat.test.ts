@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { FatVolume, shortName } from '../src/machine/fat.ts';
+import { Disk, isFloppyImage } from '../src/machine/disk.ts';
 
 /** 一张格式化好的空白 1.44MB 软盘（FAT12）：和 DOS 的 FORMAT A: 得到的参数相同 */
 function blank144(): Uint8Array {
@@ -13,6 +14,44 @@ function blank144(): Uint8Array {
 }
 
 describe('FAT 文件系统', () => {
+  it('loads a floppy with a recognized metadata footer without exposing it as sectors', () => {
+    const raw = blank144();
+    const volume = FatVolume.open(raw, true);
+    if (typeof volume === 'string') throw new Error(volume);
+    volume.writeFile('', 'TEST.TXT', new TextEncoder().encode('floppy contents'));
+    const image = new Uint8Array(raw.length + 1024);
+    image.set(raw);
+    image.set(new TextEncoder().encode('[FileVersion 003] [Description Setup-Boot Disk\u0001] [SectorsPerTrack 18] [Tracks 80]'), raw.length);
+    const footer = image.slice(raw.length);
+    expect(isFloppyImage(raw)).toBe(true);
+    expect(isFloppyImage(image)).toBe(true);
+    const disk = new Disk('BOOT.IMG', image, true);
+    expect(disk.data.length).toBe(raw.length);
+    expect(disk.data.every((value, i) => value === raw[i])).toBe(true);
+    expect(disk.geo).toEqual({ cylinders: 80, heads: 2, sectors: 18 });
+    expect(disk.description).toBe('1.44MB');
+    expect(disk.readSector(2880)).toHaveLength(0);
+    const loaded = FatVolume.open(disk.data, true);
+    if (typeof loaded === 'string') throw new Error(loaded);
+    expect(new TextDecoder().decode(loaded.readFile('', 'TEST.TXT'))).toBe('floppy contents');
+    disk.writeSector(2879, new Uint8Array(512).fill(0x5a));
+    expect(disk.data.slice(-512)).toEqual(new Uint8Array(512).fill(0x5a));
+    expect(image.slice(raw.length)).toEqual(footer);
+  });
+
+  it('rejects arbitrary extra data, truncated footers and mismatched footer geometry', () => {
+    for (const [extra, text] of [
+      [1024, ''], [512, '[FileVersion 003] [SectorsPerTrack 18] [Tracks 80]'],
+      [1024, '[FileVersion 003] [SectorsPerTrack 9] [Tracks 80]'],
+      [1024, '[FileVersion 003] [SectorsPerTrack 18] [Tracks 40]'],
+    ] as const) {
+      const image = new Uint8Array(1440 * 1024 + extra);
+      image.set(new TextEncoder().encode(text), 1440 * 1024);
+      expect(isFloppyImage(image)).toBe(false);
+      expect(() => new Disk('INVALID.IMG', image, true)).toThrow(/不是标准/);
+    }
+  });
+
   it('在 FAT12 软盘上写入、读回、建目录、删除', () => {
     const img = blank144();
     const v = FatVolume.open(img, true);

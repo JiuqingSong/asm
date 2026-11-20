@@ -352,6 +352,47 @@ export function disassemble(read: ReadByte, start: number, cpu: boolean | Disasm
   }
   if (op >= 0xd8 && op <= 0xdf) {
     modrm();
+    if (is386) {
+      const st = `ST(${rm})`;
+      const arithmetic = ['FADD', 'FMUL', 'FCOM', 'FCOMP', 'FSUB', 'FSUBR', 'FDIV', 'FDIVR'];
+      if (mod !== 3) {
+        const tables: Record<number, string[]> = {
+          0xd9: ['FLD', '', 'FST', 'FSTP', 'FLDENV', 'FLDCW', 'FNSTENV', 'FNSTCW'],
+          0xdb: ['FILD', '', 'FIST', 'FISTP', '', 'FLD', '', 'FSTP'],
+          0xdd: ['FLD', '', 'FST', 'FSTP', 'FRSTOR', '', 'FNSAVE', 'FNSTSW'],
+          0xdf: ['FILD', '', 'FIST', 'FISTP', 'FBLD', 'FILD', 'FBSTP', 'FISTP'],
+        };
+        const name = op & 1 ? tables[op][reg] : arithmetic[reg].replace(/^F/, op === 0xda || op === 0xde ? 'FI' : 'F');
+        const size = op === 0xd8 || op === 0xda ? 'DWORD' : op === 0xdc ? 'QWORD' : op === 0xde ? 'WORD' :
+          op === 0xd9 ? reg < 4 ? 'DWORD' : reg === 5 || reg === 7 ? 'WORD' : '' :
+          op === 0xdb ? reg < 4 ? 'DWORD' : 'TBYTE' :
+          op === 0xdd ? reg < 4 ? 'QWORD' : reg === 7 ? 'WORD' : '' :
+          reg < 4 ? 'WORD' : reg === 5 || reg === 7 ? 'QWORD' : 'TBYTE';
+        if (name) return finish(name, [size ? `${size} PTR ${memText}` : memText]);
+      } else {
+        if (op === 0xd8) return finish(arithmetic[reg], reg === 2 || reg === 3 ? [st] : ['ST', st]);
+        if (op === 0xdc || op === 0xde && reg !== 2 && reg !== 3) {
+          const name = arithmetic[reg >= 4 ? reg ^ 1 : reg] + (op === 0xde ? 'P' : '');
+          return finish(name, [st, 'ST']);
+        }
+        if (op === 0xd9) {
+          if (reg === 0 || reg === 1) return finish(reg === 0 ? 'FLD' : 'FXCH', [st]);
+          const names: Record<number, string> = {
+            0xd0: 'FNOP', 0xe0: 'FCHS', 0xe1: 'FABS', 0xe4: 'FTST', 0xe5: 'FXAM',
+            0xe8: 'FLD1', 0xe9: 'FLDL2T', 0xea: 'FLDL2E', 0xeb: 'FLDPI', 0xec: 'FLDLG2', 0xed: 'FLDLN2', 0xee: 'FLDZ',
+            0xf0: 'F2XM1', 0xf1: 'FYL2X', 0xf2: 'FPTAN', 0xf3: 'FPATAN', 0xf4: 'FXTRACT',
+            0xf5: 'FPREM1', 0xf6: 'FDECSTP', 0xf7: 'FINCSTP', 0xf8: 'FPREM', 0xf9: 'FYL2XP1',
+            0xfa: 'FSQRT', 0xfb: 'FSINCOS', 0xfc: 'FRNDINT', 0xfd: 'FSCALE', 0xfe: 'FSIN', 0xff: 'FCOS',
+          };
+          if (names[0xc0 | (reg << 3) | rm]) return finish(names[0xc0 | (reg << 3) | rm], []);
+        }
+        if (op === 0xdd && [0, 2, 3, 4, 5].includes(reg)) return finish(['FFREE', '', 'FST', 'FSTP', 'FUCOM', 'FUCOMP'][reg], [st]);
+        if (op === 0xda && reg === 5 && rm === 1) return finish('FUCOMPP', []);
+        if (op === 0xde && reg === 3 && rm === 1) return finish('FCOMPP', []);
+        if (op === 0xdb && reg === 4 && rm < 5) return finish(['FNENI', 'FNDISI', 'FNCLEX', 'FNINIT', 'FNSETPM'][rm], []);
+        if (op === 0xdf && reg === 4 && rm === 0) return finish('FNSTSW', ['AX']);
+      }
+    }
     return finish('ESC', [hexNum(((op & 7) << 3) | reg, 2), mod === 3 ? R16[rm] : memText], { undocumented: true });
   }
   switch (op) {

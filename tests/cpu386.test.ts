@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { CPU, AX, BX, CX, DX, SP, SI, DI, CS, DS } from '../src/cpu/cpu.ts';
+import { X87 } from '../src/cpu/x87.ts';
 
 // 386 的保护模式和分页：真机测试集（SingleStepTests/80386）只有实模式，这里用手写的机器码检查
 // 32 位代码段、平坦内存、回到实模式、分页和缺页异常。
@@ -48,6 +49,25 @@ function machine(code32: number[], idt?: (cpu: CPU) => void, is486 = false): CPU
 }
 
 describe('386 保护模式', () => {
+  it('486 的 32 位 LOCK CMPXCHG [ESI],ECX（Win98 OLEDB32 注册代码）', () => {
+    const c = machine([
+      0xbe, 0x00, 0x00, 0x10, 0x00,
+      0x31, 0xc0,
+      0xb9, 0x78, 0x56, 0x34, 0x12,
+      0xf0, 0x0f, 0xb1, 0x0e,
+      0x9c, 0x5b,
+      0xf0, 0x0f, 0xb1, 0x0e,
+      0xf4,
+    ], undefined, true);
+    expect(c.protectedMode).toBe(true);
+    expect(c.ip).toBe(0x2042);
+    expect(c.r32(AX)).toBe(0x12345678);
+    expect(c.r32(CX)).toBe(0x12345678);
+    expect(c.r32(BX) & 0x40).toBe(0x40);
+    expect(c.flags & 0x40).toBe(0);
+    expect(Array.from(c.mem.subarray(0x100000, 0x100004))).toEqual([0x78, 0x56, 0x34, 0x12]);
+  });
+
   it('32 位代码段：平坦内存、32 位运算、SIB 寻址、MOVZX', () => {
     const c = machine([
       0xb8, 0x78, 0x56, 0x34, 0x12,             // mov eax, 12345678h
@@ -122,6 +142,28 @@ describe('386 保护模式', () => {
     expect(c.mem[0x10000 + 0x200 * 4] & 0x20).toBe(0x20); // 页目录项：已访问
     expect(c.mem[0x12000] & 0x60).toBe(0x60);   // 页表项：已访问、已写
     expect(c.ip).toBe(0x2105);
+  });
+
+  it('does not partially save or reset the x87 across a missing page', () => {
+    const c = machine([
+      0xb8, 0, 0, 1, 0, 0x0f, 0x22, 0xd8,
+      0x0f, 0x20, 0xc0, 0x0d, 0, 0, 0, 0x80, 0x0f, 0x22, 0xc0,
+      0xdd, 0x35, 0xfc, 0x8f, 0, 0, 0xf4,
+    ], c => {
+      c.fpu = new X87();
+      c.fpu.registers[0] = 0x3fff8000000000000000n; c.fpu.tags[0] = 0;
+      const v = new DataView(c.mem.buffer);
+      v.setUint32(0x10000, 0x11003, true);
+      for (let k = 0; k < 1024; k++) v.setUint32(0x11000 + k * 4, k === 9 ? 0 : k * 4096 | 3, true);
+      c.mem.fill(0x5a, 0x8ffc, 0x9000);
+      c.mem.set([0, 0x21, 8, 0, 0, 0x8e, 0, 0], 0x3000 + 14 * 8);
+      c.mem[0x2100] = 0xf4;
+    });
+    expect(c.ip).toBe(0x2101);
+    expect(c.cr2).toBe(0x9000);
+    expect([...c.mem.subarray(0x8ffc, 0x9000)]).toEqual([0x5a, 0x5a, 0x5a, 0x5a]);
+    expect(c.fpu!.tagWord).toBe(0xfffc);
+    expect(c.fpu!.st()).toBe(0x3fff8000000000000000n);
   });
 
   it('486 的 CR0.WP：内核态写只读页产生缺页（错误码 3）；386 上照样写进去', () => {

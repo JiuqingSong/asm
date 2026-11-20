@@ -85,6 +85,10 @@ export class StartupPanel {
   }
 
   private warnings(): void {
+    const cpu = (document.getElementById('config-cpu') as HTMLSelectElement).value;
+    const fpu = this.configDialog.querySelector<HTMLInputElement>('[data-option="fpu"]')!;
+    fpu.disabled = cpu !== '386' && cpu !== '486';
+    if (fpu.disabled) fpu.checked = false;
     const c = this.read();
     const warnings = configWarnings(c);
     if (this.selected === 'full') warnings.push('保留 BIOS，不预装 DOS 或 INT 33h 鼠标驱动；鼠标需要在客体系统中安装驱动。');

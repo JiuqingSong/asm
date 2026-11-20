@@ -19,6 +19,7 @@
 // - BIOS/DOS 功能用"陷阱"实现：中断向量指向 F000 段里的小桩代码
 //   `F1 nn CF`（陷阱 + 中断号 + IRET），CPU 在实模式下执行到陷阱时回调 JS。
 // - 端口读写通过 IOBus 分发，硬件中断通过 IrqSource 注入。
+import { X87, fpuMemory, fpuNoWait } from './x87.ts';
 
 export const AX = 0, CX = 1, DX = 2, BX = 3, SP = 4, BP = 5, SI = 6, DI = 7;
 export const ES = 0, CS = 1, SS = 2, DS = 3, FS = 4, GS = 5;
@@ -135,9 +136,15 @@ export class CPU {
   /**
    * 选 486 时为 true（在 386 的基础上）：BSWAP、XADD、CMPXCHG、INVLPG、INVD/WBINVD、CPUID 指令；EFLAGS 的 AC 位
    * （程序靠能不能改它区分 386 和 486）和 ID 位（能改说明有 CPUID）；CR0 的 WP 位（分页时内核态写只读页也产生缺页）。
-   * 没有浮点单元（相当于 486SX），没有对齐检查（AM + AC 时不产生 #AC）
+   * 可选的 x87 浮点单元；没有对齐检查（AM + AC 时不产生 #AC）
    */
   is486 = false;
+  fpu: X87 | null = null;
+  onFpuIrq: ((active: boolean) => void) | null = null;
+  get fpuEnabled(): boolean { return this.model === 2 && this.fpu !== null; }
+  updateFpuIrq(): void {
+    this.onFpuIrq?.(this.fpuEnabled && this.fpu!.pending && !(this.is486 && this.msw & 0x20));
+  }
   /** 正在执行陷阱处理函数（BIOS 的高层模拟） */
   private inTrap = false;
   /** 陷阱处理函数要求等待（如等待按键），CPU 停在陷阱处 */
@@ -232,12 +239,13 @@ export class CPU {
 
   private modelChanged(): void {
     this.updateAddrMask();
-    if (!(this.msw & 1)) this.msw = this.model === 2 ? 0 : 0xfff0;
+    if (!(this.msw & 1)) this.msw = this.model === 2 ? (this.fpuEnabled ? 0x10 : 0) : 0xfff0;
   }
 
   /** 复位 CPU 的 286/386 部分（开机、键盘控制器复位）：回到实模式 */
   resetProtected(): void {
-    this.msw = this.model === 2 ? 0 : 0xfff0;
+    this.msw = this.model === 2 ? (this.fpuEnabled ? 0x10 : 0) : 0xfff0;
+    this.fpu?.init();
     this.cr2 = 0; this.cr3 = 0;
     this.dr.fill(0);
     this.gdtr = { base: 0, limit: 0xffff };
@@ -1842,8 +1850,8 @@ export class CPU {
         if (!this.is486) throw ud();
         if (this.r32(AX) === 0) { // 最大功能号 1，厂商 "GenuineIntel"
           this.setR32(AX, 1); this.setR32(BX, 0x756e6547); this.setR32(DX, 0x49656e69); this.setR32(CX, 0x6c65746e);
-        } else if (this.r32(AX) === 1) { // 家族 4、型号 8（486DX4）；没有浮点单元等特性
-          this.setR32(AX, 0x0480); this.setR32(BX, 0); this.setR32(CX, 0); this.setR32(DX, 0);
+        } else if (this.r32(AX) === 1) { // 家族 4、型号 8；EDX 位 0 是可选的浮点单元
+          this.setR32(AX, 0x0480); this.setR32(BX, 0); this.setR32(CX, 0); this.setR32(DX, this.fpuEnabled ? 1 : 0);
         } else { this.setR32(AX, 0); this.setR32(BX, 0); this.setR32(CX, 0); this.setR32(DX, 0); }
         return;
       }
@@ -1924,12 +1932,14 @@ export class CPU {
   /** 写 CR0：PE 位从 0 变 1 进入保护模式，从 1 变 0 回到实模式；PG 位开关分页 */
   private setCr0(v: number): void {
     v >>>= 0;
+    if (this.fpuEnabled) v |= 0x10;
     if (v & 0x80000000 && !(v & 1)) throw gp(0);
     const old = this.msw;
     this.msw = v;
     if (v & 1 && !(old & 1)) this.enterProtected();
     else if (!(v & 1) && old & 1) this.exitProtected();
     if ((v ^ old) & 0x80000000) this.flushTlb();
+    if (this.fpuEnabled && (v ^ old) & 0x20) this.updateFpuIrq();
   }
 
   /** PE 位刚置 1：段描述符缓存保留实模式下的基址 */
@@ -2117,13 +2127,14 @@ export class CPU {
 
   /**
    * 386：LOCK 前缀只能用在"读-改-写"内存的指令上（ADD、ADC、AND、BTx、DEC、INC、NEG、NOT、OR、SBB、SUB、XOR、XCHG，
-   * 目标是内存），否则 #UD
+   * 目标是内存）；486 还允许 CMPXCHG、XADD。否则 #UD
    */
   private lockable(op: number): boolean {
     const peek = (k: number) => this.rl(this.segBase(CS) + this.ip + k);
     if (op === 0x0f) {
       const op2 = peek(0), m = peek(1);
       if (m >> 6 === 3) return false;
+      if (this.is486 && (op2 === 0xb0 || op2 === 0xb1 || op2 === 0xc0 || op2 === 0xc1)) return true;
       return op2 === 0xab || op2 === 0xb3 || op2 === 0xbb || (op2 === 0xba && ((m >> 3) & 7) >= 5);
     }
     const m = peek(0), mem = m >> 6 !== 3, reg = (m >> 3) & 7;
@@ -2272,6 +2283,7 @@ export class CPU {
       case 0x9a: this.op9A(op); return;
       case 0x9b: // WAIT：TS 和 MP 都置 1 时 #NM
         if (this.model >= 1 && (this.msw & 0x0a) === 0x0a) throw new CpuFault(7);
+        if (this.fpuEnabled) this.waitFpu();
         return;
       case 0x9c: // PUSHF / PUSHFD
         if (this.flags & VM && this.iopl < 3) throw gp(0);
@@ -2298,6 +2310,49 @@ export class CPU {
   }
 
   /** 操作码 C0-FF */
+  private waitFpu(): boolean {
+    if (!this.fpu!.pending) return false;
+    if (this.is486 && this.msw & 0x20) throw new CpuFault(16);
+    this.updateFpuIrq();
+    this.ip = this.startIP;
+    this.waiting = true;
+    return true;
+  }
+
+  private execFpu(op: number): void {
+    const m = (this.mod << 6) | (this.reg << 3) | this.rm;
+    if (!fpuNoWait(op, m) && this.waitFpu()) return;
+    const memory = this.mod !== 3;
+    const operand = memory ? fpuMemory(op, this.reg, this.osz === 4) : { size: 0, write: false };
+    if (memory && !operand.size) throw ud();
+    if (!memory) {
+      const valid = op === 0xd8 || op === 0xdc ||
+        op === 0xd9 && (m <= 0xd0 || m === 0xe0 || m === 0xe1 || m === 0xe4 || m === 0xe5 || m >= 0xe8 && m <= 0xee || m >= 0xf0) ||
+        op === 0xda && m === 0xe9 || op === 0xdb && m >= 0xe0 && m <= 0xe4 ||
+        op === 0xdd && (m < 0xc8 || m >= 0xd0 && m < 0xf0) ||
+        op === 0xde && (m < 0xd0 || m === 0xd9 || m >= 0xe0) ||
+        op === 0xdf && m === 0xe0;
+      if (!valid) throw ud();
+    }
+    // Validate the complete operand before changing the FPU or committing any store.
+    const addresses = new Uint32Array(operand.size);
+    if (memory) {
+      this.check(this.eaSi, this.eaOff, operand.size, operand.write);
+      const base = this.segBase(this.eaSi) + this.eaOff;
+      for (let k = 0; k < operand.size; k++) addresses[k] = this.phys((base + k) >>> 0, operand.write);
+    }
+    this.waiting = false;
+    this.fpu!.execute(op, m, {
+      read: () => Uint8Array.from(addresses, a => a < MEM_SIZE ? this.readLin(a) : 0xff),
+      write: bytes => {
+        for (let k = 0; k < bytes.length; k++) if (addresses[k] < MEM_SIZE) this.writeLin(addresses[k], bytes[k]);
+      },
+      ax: value => { this.r[AX] = value; },
+      ip: this.startIP, cs: this.s[CS], dp: this.eaOff, ds: this.s[this.eaSi],
+      operand32: this.osz === 4, protectedMode: this.protectedMode && !this.v86,
+    });
+  }
+
   private execC0(op: number): void {
     const r = this.r, os = this.osz;
     switch (op) {
@@ -2321,9 +2376,10 @@ export class CPU {
       case 0xd6: this.setR8(0, this.flags & CF ? 0xff : 0); return; // SALC（未公开）
       case 0xd7: this.opD7(op); return;
       case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
-        // ESC（协处理器指令）：没有协处理器。EM 或 TS 置 1 时 #NM（让操作系统去模拟），否则忽略
         if (this.model >= 1 && this.msw & 0x0c) throw new CpuFault(7);
-        this.modrm(); return;
+        this.modrm();
+        if (this.fpuEnabled) this.execFpu(op);
+        return;
 
       // ---- E0-EF ----
       case 0xe0: case 0xe1: case 0xe2: this.opE0(op); return;
