@@ -90,7 +90,7 @@ export class PIC implements IrqSource {
 
 /**
  * DMA 控制器：AT 机的两片 8237（0~3 号通道 8 位，端口 00h~0Fh；4~7 号通道 16 位，端口 C0h~DEh）和页寄存器（80h~8Fh）。
- * 软驱控制器经 2 号通道传送数据（见 fdc.ts 和 transfer）；其他通道只保存寄存器，让探测、编程 DMA 的程序读回合理的值
+ * 软驱使用 2 号通道，SB16 使用 1/5 号通道；4 号是级联通道，不传送外设数据。
  */
 export class DMA {
   /** 各通道的当前地址、当前计数（传送时变化；读端口得到的是它们） */
@@ -163,22 +163,29 @@ export class DMA {
   }
 
   /** 通道没被屏蔽，可以传送 */
-  ready(ch: number): boolean { return !(this.mask & (1 << ch)); }
+  ready(ch: number): boolean {
+    return ch >= 0 && ch < 8 && ch !== 4 && !(this.mask & (1 << ch)) && !(this.command[ch >> 2] & 4);
+  }
 
   /**
-   * 外设经 0~3 号通道（8 位）传送 data.length 个字节，按通道编程的模式：写内存（外设 → 内存）、读内存
+   * 外设传送 data.length 个字节（5~7 号每次一个字），按通道编程的模式：写内存（外设 → 内存）、读内存
    * （内存 → 外设，结果放进 data）或校验（不碰内存）。计数到达终点（计数从 0 再减一）时停止，返回传送的字节数和
-   * 是否到达终点；到达终点时自动初始化的通道恢复基准值。地址只在 64KB 内变化，不进位到页寄存器（和真的一样）
+   * 是否到达终点；到达终点时自动初始化的通道恢复基准值。8 位地址在 64KB 内回绕，16 位地址在 128KB
+   * 内回绕（页寄存器最低位无效），计数单位分别为字节和字；返回的 n 始终是字节数。
    */
   transfer(ch: number, data: Uint8Array, mem: { readLin(a: number): number; writeLin(a: number, v: number): void }): { n: number; tc: boolean } {
+    if (!this.ready(ch)) return { n: 0, tc: false };
     const mode = this.mode[ch], type = (mode >> 2) & 3, down = (mode & 0x20) !== 0;
-    const page = this.page[PAGE_PORT[ch]] << 16;
+    const word = ch >= 5, width = word ? 2 : 1;
+    const page = (this.page[PAGE_PORT[ch]] & (word ? 0xfe : 0xff)) << 16;
     let n = 0, tc = false;
-    while (n < data.length) {
-      const a = page | this.addr[ch];
-      if (type === 1) mem.writeLin(a, data[n]);
-      else if (type === 2) data[n] = mem.readLin(a);
-      n++;
+    while (n + width <= data.length) {
+      const a = page | (this.addr[ch] << (word ? 1 : 0));
+      for (let b = 0; b < width; b++) {
+        if (type === 1) mem.writeLin(a + b, data[n + b]);
+        else if (type === 2) data[n + b] = mem.readLin(a + b);
+      }
+      n += width;
       this.addr[ch] = this.addr[ch] + (down ? -1 : 1);
       this.count[ch] = this.count[ch] - 1;
       if (this.count[ch] === 0xffff) { tc = true; break; }
@@ -192,8 +199,8 @@ export class DMA {
   }
 }
 
-/** 0~3 号通道的页寄存器（80h 开始的序号）：0 号是 87h、1 号 83h、2 号 81h、3 号 82h */
-const PAGE_PORT = [7, 3, 1, 2];
+/** 页寄存器的 80h 相对偏移；4 号级联通道没有页寄存器。 */
+const PAGE_PORT = [7, 3, 1, 2, 0, 0xb, 9, 0xa];
 
 /** 8254 可编程定时器：0 号通道产生 IRQ0，2 号通道用于喇叭和计时 */
 export class PIT {

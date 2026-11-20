@@ -11,6 +11,7 @@ export interface MachineConfig {
   rtc: boolean;
   vga: boolean;
   speaker: boolean;
+  sound: boolean;
   com1: boolean;
   com2: boolean;
   fdc: boolean;
@@ -27,7 +28,7 @@ export const DEFAULT_CONFIG: Readonly<MachineConfig> = Object.freeze({
   fpu: false,
   bios: true, dos: true, mouseDriver: true,
   pic: true, slavePic: true, pit: true, keyboard: true, dma: true, rtc: true,
-  vga: true, speaker: true, com1: true, com2: true, fdc: true,
+  vga: true, speaker: true, sound: false, com1: true, com2: true, fdc: true,
   floppyA: true, floppyB: true, ide: true, cdrom: true, serialMouse: true,
 });
 
@@ -44,6 +45,7 @@ export const CONFIG_OPTIONS: { key: keyof MachineConfig; label: string; software
   { key: 'rtc', label: 'CMOS / RTC 实时钟' },
   { key: 'vga', label: 'VGA 显卡' },
   { key: 'speaker', label: 'PC 喇叭' },
+  { key: 'sound', label: 'Sound Blaster 16（非 PnP，220h / IRQ5 / DMA1、5，仅 PCM 播放）' },
   { key: 'com1', label: 'COM1 串口' },
   { key: 'com2', label: 'COM2 串口' },
   { key: 'fdc', label: '82077 软驱控制器' },
@@ -59,6 +61,9 @@ export function configWarnings(c: Readonly<MachineConfig>): string[] {
   if (c.serialMouse && !c.com2) out.push('串口鼠标需要 COM2；当前不会连接鼠标。');
   if (c.slavePic && !c.pic) out.push('没有主 PIC，从 PIC 的中断无法传给 CPU。');
   if (c.fdc && !c.dma) out.push('没有 DMA，软驱控制器的 DMA 传输不可用。');
+  if (c.sound && !c.dma) out.push('SB16 PCM 播放需要 DMA；当前不能传送音频数据。');
+  if (c.sound && !c.pic) out.push('SB16 需要主 PIC 才能投递播放中断。');
+  if (c.sound && !c.slavePic) out.push('SB16 默认 IRQ5 可用；若客体改选 IRQ2（AT 的 IRQ9）或 IRQ10，需要从 PIC 和主 PIC 的级联。');
   if (!c.fdc && (c.floppyA || c.floppyB)) out.push('没有软驱控制器，A:/B: 软驱不可用。');
   if (!c.floppyA && c.floppyB && c.fdc) out.push('只安装 B:：部分 DOS 只按软驱数量枚举，可能不能正确识别这种配置。');
   if (!c.pic || !c.pit || !c.keyboard || !c.vga || !c.bios) out.push('关闭基础设备或 BIOS 后，依赖它们的示例和操作系统可能无法运行；不会自动补装。');

@@ -16,6 +16,7 @@ import { FatVolume } from './fat.ts';
 import { AtapiCdrom } from './atapi.ts';
 import { IdeChannel } from './ide.ts';
 import { FloppyController } from './fdc.ts';
+import { SoundBlaster } from './sound.ts';
 
 export interface SnapshotSession {
   source: string; fileName: string; cmdline: string; binary: string | null;
@@ -31,7 +32,7 @@ export interface LoadedSnapshot { dual: DualMachine; mode: StartupMode; workspac
 
 // Format and implementation schema deliberately move together: private CPU/device
 // fields are part of this schema, not a portable register-only interchange format.
-const VERSION = 1;
+const VERSION = 2;
 const MAGIC = new TextEncoder().encode('ASM86VM\0');
 const HEADER = 56;
 const MAX_META = 32 * 1024 * 1024;
@@ -43,7 +44,7 @@ type AnyObject = Record<string, unknown>;
 const classes = {
   DualMachine, Machine, CPU, X87, History, PIC, PIT, DMA, Keyboard, Hle, DosMemory,
   UART, NullModem, Mouse, SerialMouse, Video, Planar, Disk, IsoDisk, BlobSource,
-  BytesSource, FatVolume, AtapiCdrom, IdeChannel, FloppyController,
+  BytesSource, FatVolume, AtapiCdrom, IdeChannel, FloppyController, SoundBlaster,
 };
 const TYPE = Symbol.for('asm86.snapshot.type.v1');
 for (const [name, ctor] of Object.entries(classes)) {
@@ -55,6 +56,7 @@ const runtime: Record<string, string[]> = {
   UART: ['now', 'setIrq', 'onActivity', 'onWarn'], Mouse: ['onChange'],
   Video: ['onMapChange'], Planar: ['onWrite'], BlobSource: ['pending'],
   AtapiCdrom: ['raiseIrq', 'lowerIrq', 'onChange'], IdeChannel: ['host'], FloppyController: ['host'],
+  SoundBlaster: ['host'],
 };
 const specialFields: Record<string, string[]> = {
   Disk: ['data', 'geo', 'floppy', 'floppyType', 'name', 'dirty', 'changed', 'iso', 'isoFile'],
@@ -79,6 +81,11 @@ function configValid(config: unknown): config is MachineConfig {
   return !!config && typeof config === 'object' && Object.keys(config).length === Object.keys(DEFAULT_CONFIG).length &&
     Object.keys(DEFAULT_CONFIG).every(k => typeof (config as AnyObject)[k] === 'boolean');
 }
+function legacyConfigValid(config: unknown): boolean {
+  const keys = Object.keys(DEFAULT_CONFIG).filter(k => k !== 'sound');
+  return !!config && typeof config === 'object' && Object.keys(config).length === keys.length &&
+    keys.every(k => typeof (config as AnyObject)[k] === 'boolean');
+}
 function workspaceValid(w: unknown): w is SnapshotWorkspace {
   if (!w || typeof w !== 'object') return false;
   const a = w as SnapshotWorkspace;
@@ -89,7 +96,7 @@ function workspaceValid(w: unknown): w is SnapshotWorkspace {
       [s.dirty, s.sourceModified, s.record].every(v => typeof v === 'boolean') &&
       [s.addrBps, s.sourceBps].every(v => Array.isArray(v) && v.every(n => integer(n, 0xffffffff))));
 }
-const anchorPaths = ['cpu', 'pic', 'pic2', 'dma', 'cdrom', 'ide', 'fdc', 'kbd', 'pit', 'com1', 'com2', 'hle', 'dosmem', 'video', 'video.planar', 'mouse', 'serialMouse', 'history', 'cpu.fpu'];
+const anchorPaths = ['cpu', 'pic', 'pic2', 'dma', 'cdrom', 'ide', 'fdc', 'sound', 'kbd', 'pit', 'com1', 'com2', 'hle', 'dosmem', 'video', 'video.planar', 'mouse', 'serialMouse', 'history', 'cpu.fpu'];
 function at(m: Machine, path: string): unknown {
   return path.split('.').reduce<unknown>((a, k) => (a as AnyObject)[k], m);
 }
@@ -97,6 +104,7 @@ function fields(type: string, seed: object): string[] {
   return (specialFields[type] ?? Object.keys(seed)).filter(k => !runtime[type]?.includes(k)).sort();
 }
 function validatePersistentState(machine: Machine): void {
+  machine.sound.validateState();
   const cpu = machine.cpu as unknown as AnyObject;
   if (!['empty', 'ready', 'paused', 'running', 'waiting', 'exited', 'error'].includes(machine.status) ||
       !['8088', '286', '386', '486'].includes(machine.cpuModel) || !Number.isFinite(machine.clock) || machine.clock < 0 ||
@@ -255,16 +263,19 @@ export async function loadSnapshot(blob: Blob): Promise<LoadedSnapshot> {
   if (!(blob instanceof Blob) || blob.size < HEADER) fail('truncated header');
   const h = await blob.slice(0, HEADER).arrayBuffer(), dv = new DataView(h), hb = new Uint8Array(h);
   if (!MAGIC.every((v, i) => hb[i] === v)) fail('invalid magic');
-  if (dv.getUint32(8, true) !== VERSION) fail('unsupported version');
+  const version = dv.getUint32(8, true);
+  if (version !== VERSION && version !== 1) fail('unsupported version');
+  const legacy = version === 1;
   const length = dv.getUint32(12, true);
   if (!length || length > MAX_META || HEADER + length > blob.size || dv.getFloat64(16, true) !== blob.size) fail('truncated or invalid length');
   const metadata = await blob.slice(HEADER, HEADER + length).arrayBuffer();
   if (await hash(metadata) !== Array.from(hb.subarray(24), v => v.toString(16).padStart(2, '0')).join('')) fail('metadata integrity mismatch');
   let m: Manifest;
   try { m = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(metadata)) as Manifest; } catch { fail('malformed metadata'); }
-  if (!m! || m!.schema !== VERSION) fail('unsupported implementation schema');
+  if (!m! || m!.schema !== version) fail('unsupported implementation schema');
   if (!Array.isArray(m!.nodes) || m!.nodes.length > MAX_NODES || !Array.isArray(m!.blocks) || !Array.isArray(m!.anchors) ||
-      !Array.isArray(m!.configs) || m!.configs.length !== 2 || !m!.configs.every(configValid)) fail('invalid manifest');
+      !Array.isArray(m!.configs) || m!.configs.length !== 2 || !m!.configs.every(legacy ? legacyConfigValid : configValid)) fail('invalid manifest');
+  if (legacy) m!.configs = m!.configs.map(config => ({ ...config, sound: false }));
   const chunks: Blob[] = [], buffers = new Map<number, ArrayBuffer>();
   let uncompressed = 0;
   let offset = HEADER + length;
@@ -333,7 +344,8 @@ export async function loadSnapshot(blob: Blob): Promise<LoadedSnapshot> {
       const keys = n.p!.map(p => p[0]);
       if (new Set(keys).size !== keys.length) fail('duplicate property');
       const entry = reg.get(n.t);
-      if (entry && JSON.stringify(keys.slice().sort()) !== JSON.stringify(entry.fields)) fail(`invalid ${n.t} schema`);
+      const expected = legacy && n.t === 'Machine' ? entry?.fields.filter(k => k !== 'sound') : entry?.fields;
+      if (entry && JSON.stringify(keys.slice().sort()) !== JSON.stringify(expected)) fail(`invalid ${n.t} schema`);
       if (entry && !anchored.has(i) && !specialFields[n.t]) fail('missing runtime anchor');
       if (!objects[i]) objects[i] = entry ? Object.create(entry.prototype) : {};
     } else if (n.t === 'Blob' || n.t === 'ArrayBuffer' || n.t === 'NumberArray') {
@@ -413,10 +425,12 @@ export async function loadSnapshot(blob: Blob): Promise<LoadedSnapshot> {
   if (!required.has('-1:dual') || !required.has('-1:link')) fail('missing dual anchors');
   for (let i = 0; i < 2; i++) {
     const machine = dual.m[i];
+    if (legacy) Object.defineProperty(machine.config, 'sound', { value: false, writable: true, configurable: true, enumerable: true });
     const anchorMachine = m!.anchors.find(a => a[1] === i && a[2] === '');
     if (!anchorMachine || machine !== objects[anchorMachine[0]]) fail('machine anchor mismatch');
     if (!required.has(`${i}:`) || !configValid(machine.config) || Object.keys(DEFAULT_CONFIG).some(k => machine.config[k as keyof MachineConfig] !== m!.configs[i][k as keyof MachineConfig])) fail('invalid machine configuration');
     for (const path of anchorPaths) {
+      if (legacy && path === 'sound') continue;
       if (path === 'cpu.fpu' && !machine.config.fpu) continue;
       const anchor = m!.anchors.find(a => a[1] === i && a[2] === path);
       if (!anchor || at(machine, path) !== objects[anchor[0]]) fail('invalid machine runtime graph');

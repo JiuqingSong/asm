@@ -16,6 +16,7 @@ import { AX } from '../cpu/cpu.ts';
 import { EditorView, monaco } from './editor.ts';
 import { Screen } from './screen.ts';
 import { Speaker } from './speaker.ts';
+import { PcmOutput } from './pcm.ts';
 import { generateFont } from './font.ts';
 
 // 8×8 字库：图形模式下显示文字用（写进虚拟 BIOS 的 ROM）
@@ -55,6 +56,7 @@ interface Session {
   cmdline: HTMLInputElement;
   snap: Snapshot | null;
   speaker: Speaker;
+  pcm: PcmOutput;
   /** 正在运行的可执行文件名（直接运行 EXE/COM 时；运行源程序时为 null） */
   binary: string | null;
   /** 可执行文件的说明页（只读） */
@@ -116,7 +118,7 @@ class App {
       const s: Session = {
         i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model, program: null, dirty: true, sourceVersion: model.getAlternativeVersionId(),
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
-        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(), record: true, snapshotLoaded: false,
+        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), pcm: new PcmOutput(message => this.addMessage('error', message, i)), binary: null, binModel: null, addrBps: new Set(), record: true, snapshotLoaded: false,
       };
       s.screen.onKey = e => this.key(s, e);
       s.screen.onMouseRel = (dx, dy, buttons) => {
@@ -156,6 +158,7 @@ class App {
             this.addMessage('info', '程序打开了 PC 喇叭。全速运行时虚拟时间比真实时间快得多，声音会一闪而过；把速度选成"原机速度"才能听到正常的节奏。', s.i);
           }
         },
+        pcm: (samples, rate) => { if (this.run === 'run' && this.speed() === -1) s.pcm.write(samples, rate); },
         filesChanged: () => { if (this.tab === 'files') this.renderFiles(); },
         disksChanged: () => this.drives?.changed(s.i),
       };
@@ -610,6 +613,7 @@ class App {
         s.screen.setChinese(workspace.chinese ?? false);
         s.screen.invalidate();
         s.speaker.mute();
+        s.pcm.mute();
         s.speaker.set(s.m.speakerFreq);
         s.box.classList.toggle('hidden', s.i === 1 && this.mode !== 'dual');
         s.box.classList.toggle('active', this.mode === 'dual' && s.i === this.active);
@@ -1119,6 +1123,12 @@ class App {
     for (const s of this.live) { this.syncBreakpoints(s); s.snap = takeSnapshot(s.m); }
     const sp = this.speed();
     for (const s of this.live) s.speaker.enable();
+    for (const s of this.live) {
+      if (s.m.config.sound && sp === -1) s.pcm.enable();
+      else s.pcm.mute();
+    }
+    if (this.live.some(s => s.m.config.sound) && sp !== -1)
+      this.addMessage('info', '声卡声音仅在“原机速度”下播放；全速或单步模式仍模拟声卡 DMA 和中断，但不播放音频。');
     this.fastSpeakerHint = false;
     if (sp <= 0) {
       this.run = 'run';
@@ -1264,7 +1274,7 @@ class App {
   private stop(): void {
     this.run = 'idle';
     if (this.tempBp) { const i = this.tempBp.i; this.tempBp = null; this.syncBreakpoints(this.sessions[i]); }
-    for (const s of this.sessions) s.speaker.mute();
+    for (const s of this.sessions) { s.speaker.mute(); s.pcm.mute(); }
     clearInterval(this.animTimer);
     cancelAnimationFrame(this.raf);
     this.updateButtons();
@@ -1302,7 +1312,7 @@ class App {
       this.syncBreakpoints(this.sessions[t.i]);
       if (r === 'breakpoint' && this.sessions[t.i].m.linearIP === t.lin) this.sessions[t.i].m.message = '已运行到指定位置';
     }
-    for (const x of this.sessions) x.speaker.mute();
+    for (const x of this.sessions) { x.speaker.mute(); x.pcm.mute(); }
     this.updateButtons();
     const s = this.sessions[who >= 0 ? who : this.active];
     const tag = this.mode === 'dual' ? `${s.tag} 机：` : '';
@@ -1395,7 +1405,7 @@ class App {
     this.stack.setProgram(s.program);
     this.stack.render(m, s.snap);
     for (const x of this.live) {
-      if (x.m.poweredOff) x.screen.release();
+      if (x.m.poweredOff) { x.screen.release(); x.pcm.mute(); }
       x.box.classList.toggle('no-video', !x.m.config.vga);
       const mem = x.m.mem, bda = 0x400;
       x.screen.relative = !x.m.poweredOff && x.m.serialMouse.active;

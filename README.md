@@ -28,6 +28,7 @@ npm run build      # 生成静态网页到 dist/
 - **可选数学协处理器**：直接调试和完整模拟启动前可为 386/486 勾选 x87（默认不安装，8088/286 不可选），分别相当于 386+80387 / 486DX。80 位寄存器、浮点运算、异常、保存/恢复、单步回退和反汇编；寄存器面板可展开查看 x87 状态。数值核心使用本地内嵌的 Berkeley SoftFloat WASM。已验证 Win95 桌面及英文 Win98 SE 安装向导至产品密钥页，尚未验证 Win98 完整安装
 - **原机速度**：按所选 CPU 的真实速度运行（虚拟时间与真实时间同步），延时、时钟、波特率和声音都与原机一致；也可以全速运行或按每秒 1~100 步动画执行
 - **PC 喇叭**：8253 的 2 号通道 + 端口 61h，用 Web Audio 发声（示例：两只老虎）
+- **可选 SB16 声卡**：启动时勾选 Sound Blaster 16，提供非即插即用的数字 PCM 播放（220h、IRQ5、DMA1/5，8/16 位、单/双声道）。已使用 Windows 95/98 原版驱动实测 16 位立体声 WAV 播放；需安装系统自带的 Creative Sound Blaster 16 非 PnP 驱动，并选择“原机速度”播放。暂停、关机和恢复快照时清空宿主音频。FM/OPL、MIDI、录音及 DOS 游戏兼容性暂不包含
 - **直接运行 DOS 程序**：直接调试始终显示独立文件区，把 EXE/COM 上传后点"运行"（MZ 重定位、PKLITE 等自解压程序、DOS 内存控制块链）；磁盘映像区需在启动前勾选"显示磁盘映像文件系统"（默认不勾选）。完整模拟只显示磁盘映像区，双机保留两个区域
 - **从磁盘启动真 DOS**：完整模拟模式中放入软盘或硬盘映像（.img），选择 A: 或 C: 启动；INT 13h 按扇区读写，新建空白硬盘，映像保存在浏览器里；可以直接查看、放入、取出映像里的文件（FAT12/FAT16），提供关机程序 SHUTDOWN.COM。完整模式隐藏源码窗口，保留屏幕和右侧调试面板；工具栏"重启"重新选择启动设备，Ctrl+Alt+Del 沿用本次启动设备。MS-DOS 6.22 可以从安装盘启动，并安装到虚拟硬盘上
 - **硬盘控制器**：C:、D: 也能经 IDE 第一通道的 ATA 控制器（IRQ14）读写，Windows 95 可以用 32 位方式访问硬盘
@@ -67,6 +68,7 @@ node tools/serial-demo.ts send.asm recv.asm 286 buffered   # 双机串口文件�
 # URL=http://localhost:5173/ node tools/ui-export-check.mjs   # 编辑器替换/新建、EXE/COM 下载和异址运行
 # URL=http://localhost:5173/ node tools/ui-capture-check.mjs  # 真实鼠标/键盘锁定、右 Ctrl、Esc 透传和权限失败清理
 # URL=http://localhost:5173/ node tools/ui-snapshot-check.mjs # 三种模式的完整快照、上传后暂停及继续；可设置 PRODUCTION_URL 验证生产版恢复
+# URL=http://localhost:5173/ node tools/ui-sound-check.mjs    # SB16/DMA 到浏览器实际 PCM 输出，暂停/恢复与全速静音
 ```
 
 `test:cpu` 需要先把测试集下载到 `test-data/8088/`（约 730MB，见 https://github.com/SingleStepTests/8088 的 `v2` 目录）；`test:cpu386` 需要 `test-data/80386/`（约 600MB，https://github.com/SingleStepTests/80386 的 `v1_ex_real_mode` 目录，MOO 格式）。

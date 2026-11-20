@@ -7,6 +7,7 @@ import { saveSnapshot, loadSnapshot, type SnapshotWorkspace } from '../src/machi
 import { Disk, blankFloppy, blankHardDisk } from '../src/machine/disk.ts';
 import { BlobSource, BytesSource, IsoDisk } from '../src/machine/iso.ts';
 import { buildIso } from '../tools/mkiso.ts';
+import { readFileSync } from 'node:fs';
 
 const workspace = (): SnapshotWorkspace => ({
   sessions: [0, 1].map(i => ({
@@ -23,6 +24,46 @@ function packet(m: Machine, bytes: number[]): void {
 }
 
 describe('persistent VM snapshots', () => {
+  it('loads published v1 snapshots with no sound card while preserving CPU and memory', async () => {
+    const bytes = readFileSync(new URL('./fixtures/snapshot-v1.asmsnap', import.meta.url));
+    const restored = await loadSnapshot(new Blob([new Uint8Array(bytes)]));
+    expect(restored.dual.m[0].config.sound).toBe(false);
+    expect(restored.dual.m[0].cpu.r[AX]).toBe(0x1234);
+    expect(restored.dual.m[0].mem[0x999]).toBe(42);
+    expect(restored.dual.m[0].status).toBe('paused');
+  });
+
+  it('restores an in-progress 16-bit sound stream, IRQ state and fresh DMA/audio callbacks', async () => {
+    const d = new DualMachine('full', [new Machine({ sound: true }), new Machine()]);
+    const m = d.m[0], io = m.cpu.io;
+    m.load(assemble('.model tiny\n.code\norg 100h\nstart: sti\nhlt\njmp start\nend start'));
+    m.mem.set([0, 0x40, 0, 0xc0, 0xff, 0x7f, 0, 0x80], 0x1000);
+    io.out8(0xd8, 0);
+    io.out8(0xc4, 0); io.out8(0xc4, 8);
+    io.out8(0xc6, 3); io.out8(0xc6, 0);
+    io.out8(0x8b, 0); io.out8(0xd6, 0x59); io.out8(0xd4, 1);
+    io.out8(0x22c, 0x41); io.out8(0x22c, 0xbb); io.out8(0x22c, 0x80);
+    io.out8(0x22c, 0xd1);
+    for (const v of [0xb6, 0x10, 3, 0]) io.out8(0x22c, v);
+    m.idleTo(200);
+    expect(m.clock).toBe(200);
+    expect(m.pic.irr & 0x20).toBe(0x20);
+    expect(m.sound.next).toBeGreaterThan(200);
+    const blob = await saveSnapshot(d, 'full', workspace());
+    const restored = (await loadSnapshot(blob)).dual.m[0];
+    expect(restored.config.sound).toBe(true);
+    expect(restored.sound === m.sound).toBe(false);
+    expect(restored.dma.addr).toEqual(m.dma.addr);
+    const first: number[] = [], second: number[] = [];
+    m.events.pcm = samples => first.push(...samples);
+    restored.events.pcm = samples => second.push(...samples);
+    m.idleTo(20000); restored.idleTo(20000);
+    expect(second.length).toBeGreaterThan(0);
+    expect(second).toEqual(first);
+    expect(restored.dma.count).toEqual(m.dma.count);
+    expect(restored.pic.irr).toBe(m.pic.irr);
+  });
+
   it('freezes RTC/BIOS/DOS calendar time across offline elapsed time and advances only by virtual clocks', async () => {
     const epoch = Date.UTC(2020, 3, 4, 12, 34, 57);
     const wall = vi.spyOn(Date, 'now').mockReturnValue(epoch);
@@ -242,12 +283,14 @@ end start`);
   it('rejects unsupported versions, truncation, corruption and malformed graph metadata', async () => {
     const saved = await saveSnapshot(make(), 'debug', workspace());
     const version = new Uint8Array(await saved.slice(0, 56).arrayBuffer());
-    new DataView(version.buffer).setUint32(8, 2, true);
-    await expect(loadSnapshot(new Blob([version, saved.slice(56)]))).rejects.toThrow(/unsupported version/);
-    await expect(loadSnapshot(saved.slice(0, 30))).rejects.toThrow(/truncated/);
-    await expect(loadSnapshot(saved.slice(0, saved.size - 1))).rejects.toThrow(/length/);
+    const versionView = new DataView(version.buffer);
+    versionView.setUint32(8, versionView.getUint32(8, true) + 1, true);
+    const loadInvalid = (blob: Blob) => loadSnapshot(blob).then(() => true);
+    await expect(loadInvalid(new Blob([version, saved.slice(56)]))).rejects.toThrow(/unsupported version/);
+    await expect(loadInvalid(saved.slice(0, 30))).rejects.toThrow(/truncated/);
+    await expect(loadInvalid(saved.slice(0, saved.size - 1))).rejects.toThrow(/length/);
     const tail = new Uint8Array(await saved.slice(-1).arrayBuffer()); tail[0] ^= 1;
-    await expect(loadSnapshot(new Blob([saved.slice(0, -1), tail]))).rejects.toThrow(/integrity/);
+    await expect(loadInvalid(new Blob([saved.slice(0, -1), tail]))).rejects.toThrow(/integrity/);
     const header = new Uint8Array(await saved.slice(0, 56).arrayBuffer()), dv = new DataView(header.buffer);
     const oldLength = dv.getUint32(12, true);
     const manifest = JSON.parse(await saved.slice(56, 56 + oldLength).text());
@@ -256,6 +299,6 @@ end start`);
     header.set(new Uint8Array(await crypto.subtle.digest('SHA-256', metadata)), 24);
     dv.setUint32(12, metadata.length, true);
     dv.setFloat64(16, saved.size - oldLength + metadata.length, true);
-    await expect(loadSnapshot(new Blob([header, metadata, saved.slice(56 + oldLength)]))).rejects.toThrow(/properties/);
+    await expect(loadInvalid(new Blob([header, metadata, saved.slice(56 + oldLength)]))).rejects.toThrow(/properties/);
   });
 });

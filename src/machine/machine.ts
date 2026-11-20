@@ -4,6 +4,7 @@ import { Disk } from './disk.ts';
 import { FloppyController } from './fdc.ts';
 import { IdeChannel } from './ide.ts';
 import { SerialMouse } from './serial-mouse.ts';
+import { SoundBlaster } from './sound.ts';
 import type { Program } from '../asm/types.ts';
 import { PIC, PIT, DMA, Keyboard, type KeyEvent } from './devices.ts';
 import { AtapiCdrom } from './atapi.ts';
@@ -168,6 +169,8 @@ export interface MachineEvents {
   disksChanged?(): void;
   /** PC 喇叭：频率（Hz），0 表示不响 */
   speaker?(freq: number): void;
+  /** SB16：虚拟时间产生的 48000Hz 双声道交错 PCM；不依赖主机音频时钟。 */
+  pcm?(samples: Float32Array, sampleRate: number): void;
 }
 
 export class Machine {
@@ -178,6 +181,7 @@ export class Machine {
   /** AT 机的第二个中断控制器（IRQ8~15，接在主片的 IRQ2 上） */
   pic2 = new PIC();
   dma = new DMA();
+  sound: SoundBlaster;
   /** IDE 第二通道上的 ATAPI 光驱（IRQ15） */
   cdrom = new AtapiCdrom(() => { if (this.config.cdrom) this.raiseIrq(15); }, () => this.pic2.lower(7));
   /** IDE 第一通道上的 ATA 硬盘（IRQ14）：C: 主盘、D: 从盘，给 Windows 95 的 32 位磁盘驱动用；DOS 经 INT 13h 读写 */
@@ -321,6 +325,19 @@ export class Machine {
 
   constructor(config: Partial<MachineConfig> = {}) {
     this.config = Object.freeze({ ...DEFAULT_CONFIG, ...config });
+    this.sound = new SoundBlaster({
+      now: () => this.clock,
+      dma: (ch, data) => this.config.sound && this.config.dma && this.dma.ready(ch)
+        ? this.dma.transfer(ch, data, this.cpu) : null,
+      irq: (irq, active) => {
+        if (!this.config.sound) return;
+        if (active) this.raiseIrq(irq);
+        else if (irq < 8) this.pic.lower(irq);
+        else this.pic2.lower(irq - 8);
+      },
+      pcm: (samples, rate) => { if (this.config.sound) this.events.pcm?.(samples, rate); },
+      unsupported: msg => { this.log(msg); this.requestBreak(msg); },
+    });
     const cpu = this.cpu;
     if (this.config.fpu) {
       cpu.fpu = new X87();
@@ -394,6 +411,7 @@ export class Machine {
     if (port >= 0x3f8 && port <= 0x3ff) return c.com1;
     if (port >= 0x2f8 && port <= 0x2ff) return c.com2;
     if (FloppyController.owns(port)) return c.fdc;
+    if (SoundBlaster.owns(port)) return c.sound;
     if (DMA.owns(port)) return c.dma;
     if (AtapiCdrom.owns(port)) return c.cdrom;
     if (IdeChannel.owns(port)) return c.ide;
@@ -415,6 +433,7 @@ export class Machine {
         if (port >= 0x3f8 && port <= 0x3ff) return this.com1.in8(port - 0x3f8);
         if (port >= 0x2f8 && port <= 0x2ff) return this.com2.in8(port - 0x2f8);
         if (FloppyController.owns(port)) return this.fdc.in8(port);
+        if (SoundBlaster.owns(port)) return this.sound.in8(port);
         switch (port) {
           case 0x20: case 0x21: return this.pic.in8(port);
           case 0xa0: case 0xa1: return this.pic2.in8(port & 0x21);
@@ -454,6 +473,7 @@ export class Machine {
         if (port >= 0x3f8 && port <= 0x3ff) { this.com1.out8(port - 0x3f8, v); return; }
         if (port >= 0x2f8 && port <= 0x2ff) { this.com2.out8(port - 0x2f8, v); return; }
         if (FloppyController.owns(port)) { this.fdc.out8(port, v); return; }
+        if (SoundBlaster.owns(port)) { this.sound.out8(port, v); return; }
         switch (port) {
           case 0x20: case 0x21: {
             const had = this.pic.isr & 2;
@@ -854,6 +874,7 @@ export class Machine {
     this.cdrom.reset();
     this.ide.reset();
     this.fdc.reset();
+    this.sound.reset();
     this.rtcFlags = 0;
     this.pit.reload = [0x10000, 0x10000, 0x10000];
     this.pit.out8(0x43, 0x36); this.pit.out8(0x40, 0); this.pit.out8(0x40, 0);
@@ -923,6 +944,7 @@ export class Machine {
     this.mouse.used = false;
     this.port61 = 0;
     this.updateSpeaker();
+    this.sound.reset();
     this.exit(0, message);
     this.poweredOff = true;
   }
@@ -1089,7 +1111,7 @@ export class Machine {
 
   /** HLT：快进到下一次定时器中断；连着串口线时每次只前进一小段，以便及时收到数据 */
   private execHalted(): void {
-    const next = Math.min(this.config.pit ? this.pit.clocksToNextTick() : Infinity, this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), this.config.fdc ? Math.ceil(this.fdc.next - this.clock) : Infinity, this.config.ide ? Math.ceil(this.ide.next - this.clock) : Infinity);
+    const next = Math.min(this.config.pit ? this.pit.clocksToNextTick() : Infinity, this.link ? 64 : Infinity, Math.ceil(this.rtcNext - this.clock), this.config.fdc ? Math.ceil(this.fdc.next - this.clock) : Infinity, this.config.ide ? Math.ceil(this.ide.next - this.clock) : Infinity, this.config.sound ? Math.ceil(this.sound.next - this.clock) : Infinity);
     const dt = Number.isFinite(next) ? Math.max(1, next) : this.clocksPerInstr;
     this.advanceTime(dt);
     if (this.config.keyboard) this.kbd.tick(Math.ceil(dt / this.clocksPerInstr));
@@ -1118,6 +1140,7 @@ export class Machine {
   }
 
   private devicesAfterClock(): void {
+    if (this.config.sound && this.clock >= this.sound.next) this.sound.tick();
     if (this.clock >= this.rtcNext) this.rtcEvent();
     if (this.cdrom.pending || this.ide.pending || this.clock >= this.ide.next || this.clock >= this.fdc.next) this.diskTick();
     // 串口、鼠标：没到下一个事件、鼠标没动、程序没碰串口寄存器时，推进它们什么也不会发生，就跳过
