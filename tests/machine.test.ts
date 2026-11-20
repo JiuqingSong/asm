@@ -49,6 +49,29 @@ end start
 `;
 
 describe('运行程序', () => {
+  it('DOS 的驻留 INTO 入口兼容旧 Pascal 对象检查，仍保留溢出标志并返回', () => {
+    const m = runToEnd(load(`
+.model small
+.stack 100h
+.code
+start:
+        xor ax, ax
+        mov es, ax
+        cmp byte ptr es:[13h], 0
+        jne failed
+        mov ax, 7fffh
+        add ax, 1
+        into
+        jno failed
+        mov ax, 4c00h
+        int 21h
+failed:
+        mov ax, 4c01h
+        int 21h
+end start`));
+    expect(m.exitCode).toBe(0);
+  });
+
   it('Hello World', () => {
     const m = runToEnd(load(HELLO));
     expect(m.console).toBe('Hello, 8086!\n');

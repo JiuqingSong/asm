@@ -17,6 +17,7 @@ import { AtapiCdrom } from './atapi.ts';
 import { IdeChannel } from './ide.ts';
 import { FloppyController } from './fdc.ts';
 import { SoundBlaster } from './sound.ts';
+import { sha256 } from '@noble/hashes/sha2.js';
 
 export interface SnapshotSession {
   source: string; fileName: string; cmdline: string; binary: string | null;
@@ -73,8 +74,10 @@ function className(obj: object): string | undefined {
 const fail = (message: string): never => { throw new Error(`Invalid VM snapshot: ${message}`); };
 const safeKey = (key: string) => key !== '__proto__' && key !== 'prototype' && key !== 'constructor';
 const integer = (n: unknown, max = Number.MAX_SAFE_INTEGER): n is number => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0 && n <= max;
-function hash(bytes: ArrayBuffer): Promise<string> {
-  return crypto.subtle.digest('SHA-256', bytes).then(b => Array.from(new Uint8Array(b), v => v.toString(16).padStart(2, '0')).join(''));
+async function hash(bytes: ArrayBuffer): Promise<string> {
+  const subtle = globalThis.crypto?.subtle;
+  const digest = subtle ? new Uint8Array(await subtle.digest('SHA-256', bytes)) : sha256(new Uint8Array(bytes));
+  return Array.from(digest, v => v.toString(16).padStart(2, '0')).join('');
 }
 function modeValid(mode: unknown): mode is StartupMode { return mode === 'debug' || mode === 'dual' || mode === 'full'; }
 function configValid(config: unknown): config is MachineConfig {

@@ -24,6 +24,22 @@ function packet(m: Machine, bytes: number[]): void {
 }
 
 describe('persistent VM snapshots', () => {
+  it('keeps native and HTTP SHA-256 snapshots interoperable and rejects corruption without Web Crypto', async () => {
+    const nativeCrypto = globalThis.crypto;
+    const d = make();
+    d.m[0].cpu.r[AX] = 0x4321;
+    const native = await saveSnapshot(d, 'debug', workspace());
+    try {
+      vi.stubGlobal('crypto', {});
+      expect((await loadSnapshot(native)).dual.m[0].cpu.r[AX]).toBe(0x4321);
+      const fallback = await saveSnapshot(d, 'debug', workspace());
+      const tail = new Uint8Array(await fallback.slice(-1).arrayBuffer()); tail[0] ^= 1;
+      await expect(loadSnapshot(new Blob([fallback.slice(0, -1), tail]))).rejects.toThrow(/integrity/);
+      vi.stubGlobal('crypto', nativeCrypto);
+      expect((await loadSnapshot(fallback)).dual.m[0].cpu.r[AX]).toBe(0x4321);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it('loads published v1 snapshots with no sound card while preserving CPU and memory', async () => {
     const bytes = readFileSync(new URL('./fixtures/snapshot-v1.asmsnap', import.meta.url));
     const restored = await loadSnapshot(new Blob([new Uint8Array(bytes)]));

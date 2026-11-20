@@ -36,6 +36,7 @@ export type StopReason = 'step' | 'breakpoint' | 'exit' | 'wait' | 'budget' | 'e
 const STUB_SIZE = 8;
 const STUB_INT8 = 0x0800;
 const STUB_INT9 = 0x0810;
+const DOS_INTO_STUB = 0x0700;
 /**
  * 其他硬件中断（IRQ2~7、IRQ8~15，除了鼠标的 IRQ12）的默认处理程序：每个 16 字节，需要的话先进陷阱，再用真的
  * OUT 指令给中断控制器发 EOI。不能在 JavaScript 里直接改中断控制器：Windows 增强模式把中断送进虚拟 8086 模式的
@@ -1005,6 +1006,12 @@ export class Machine {
   private installDosEnvironment(program: Program, cmdline: string, name: string): void {
     const mem = this.mem;
     const w16 = (a: number, v: number) => { mem[a] = v & 0xff; mem[a + 1] = (v >> 8) & 0xff; };
+    // DOS 的默认 INTO 入口驻留常规内存，而不是沿用 ROM 入口。
+    if (this.serviceEnabled(0x04)) {
+      mem[DOS_INTO_STUB] = 0xcf;
+      w16(0x04 * 4, DOS_INTO_STUB - 0x500);
+      w16(0x04 * 4 + 2, 0x0050);
+    }
     // PSP
     const psp = program.pspSeg * 16;
     mem.set([0xcd, 0x20], psp);
@@ -1082,6 +1089,7 @@ export class Machine {
 
   private inCode(lin: number): boolean {
     for (const [a, b] of this.codeRanges) if (lin >= a && lin < b) return true;
+    if (this.dosEnabled && this.serviceEnabled(0x04) && lin === DOS_INTO_STUB) return true;
     // PSP 开头的 INT 20h（COM 程序用 RET 返回时会执行到这里）
     const psp = (this.program?.pspSeg ?? 0) * 16;
     if (lin >= psp && lin < psp + 2) return true;
