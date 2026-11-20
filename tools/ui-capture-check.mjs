@@ -41,10 +41,16 @@ out dx, al
 xor bx, bx
 again: xor ax, ax
 int 16h
+cmp al, 'q'
+je shutdown
 cmp al, 27
 jne again
 inc bx
 jmp again
+shutdown: mov ax, 5307h
+mov bx, 1
+mov cx, 3
+int 15h
 end start`);
     s.dirty = true;
     window.__keys = [];
@@ -101,6 +107,27 @@ end start`);
   await unlock();
   await page.click('#btn-pause');
 
+  for (const fullscreen of [false, true]) {
+    if (await page.$eval('#fullscreen-capture', e => e.checked) !== fullscreen) await page.click('#fullscreen-capture');
+    for (const shutdown of ['toolbar', 'guest']) {
+      await page.click('#btn-reset');
+      await page.click('#btn-run');
+      await page.waitForFunction(() => window.__app.cur.m.status === 'waiting' && window.__app.cur.screen.relative);
+      await lock();
+      await page.waitForFunction(() => !window.__app.cur.screen.capturing);
+      if (shutdown === 'toolbar') await page.evaluate(() => document.getElementById('btn-power').click());
+      else await page.keyboard.press('q');
+      await page.waitForFunction(() => window.__app.cur.m.poweredOff && !document.pointerLockElement && !document.fullscreenElement);
+      assert.match(await page.$eval('#status', e => e.textContent), /已关机/, `${shutdown}: 自动释放不能覆盖关机状态`);
+      await page.click('.screen');
+      assert.equal(await page.evaluate(() => window.__app.cur.screen.relative || !!document.pointerLockElement), false, '关机后的黑屏不能重新捕获鼠标');
+    }
+  }
+  await page.click('#btn-reset');
+  await page.click('#btn-run');
+  await page.waitForFunction(() => window.__app.cur.m.status === 'waiting' && window.__app.cur.screen.relative);
+  await page.click('#btn-pause');
+
   await lock();
   await page.waitForFunction(() => !!document.fullscreenElement && !window.__app.cur.screen.capturing);
   await page.evaluate(() => document.exitFullscreen());
@@ -135,7 +162,7 @@ end start`);
   await enterMode(page, 'dual');
   assert.equal(await page.evaluate(() => window.__app.sessions.every(s => s.screen.fullscreenCapture)), true, '全屏捕获设置应保存并用于两台机器');
   assert.deepEqual(errors, []);
-  console.log('PASS: 真实鼠标捕获；右 Ctrl 释放且无客体残留、左 Ctrl 保留；全屏锁定中 Esc 到达客体；退出清理；拒绝权限/不支持时明确报错；设置持久化');
+  console.log('PASS: 真实鼠标捕获；右 Ctrl 释放且无客体残留、左 Ctrl 保留；全屏锁定中 Esc 到达客体；工具栏/APM 关机自动释放普通及全屏捕获；关机黑屏不重新捕获；退出清理；拒绝权限/不支持时明确报错；设置持久化');
 } finally {
   await browser.close();
 }

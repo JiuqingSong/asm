@@ -4,7 +4,7 @@
 import type { Machine } from '../machine/machine.ts';
 import { Disk, blankHardDisk, blankFloppy, isFloppyImage } from '../machine/disk.ts';
 import { FatVolume } from '../machine/fat.ts';
-import { IsoDisk, BlobSource, isIsoFile } from '../machine/iso.ts';
+import { IsoDisk, BlobSource, BytesSource, isIsoFile } from '../machine/iso.ts';
 import { UTILITIES, buildUtility } from '../dos/utilities.ts';
 
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
@@ -108,6 +108,25 @@ export class DrivesPanel {
         m.cdrom.onChange = () => this.render(); // 程序弹出光盘时刷新
       }
     } catch (e) { this.host.message('error', `无法恢复保存的磁盘映像：${(e as Error).message}`, 0); }
+    this.render();
+  }
+
+  /** 快照里的介质已还原；不能再从 IndexedDB 装盘或触发设备复位。 */
+  async adoptSnapshot(): Promise<void> {
+    this.browse = null;
+    for (const timer of this.saveTimers.values()) clearTimeout(timer);
+    this.saveTimers.clear();
+    await Promise.all(this.pendingSaves);
+    for (const { m, i } of this.host.machines()) {
+      m.cdrom.onChange = () => this.render();
+      for (let k = 0; k < 4; k++) await this.persist(i, k);
+      const source = m.cdrom.source;
+      let iso: Blob | null = null;
+      if (source instanceof BlobSource) iso = source.blob;
+      else if (source instanceof BytesSource) iso = new Blob([source.get(0, source.size).slice()]);
+      else if (source) throw new Error('无法保存快照光盘：不支持的映像来源');
+      await this.saveRecord(i, 'cd', iso ? { name: m.cdrom.discName!, floppy: false, iso } : null);
+    }
     this.render();
   }
 

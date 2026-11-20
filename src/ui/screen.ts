@@ -147,6 +147,11 @@ export class Screen {
     for (const s of this.cells) { s.className = ''; s.style.display = ''; }
   }
 
+  invalidate(): void {
+    this.leaveGraphics();
+    this.setChinese(this.chinese);
+  }
+
   constructor(el: HTMLElement) {
     this.el = el;
     for (let r = 0; r < ROWS; r++) {

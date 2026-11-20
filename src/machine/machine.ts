@@ -57,7 +57,7 @@ export function driveName(drive: number): string {
 }
 
 /** 反向执行用的历史记录：每条指令执行前的寄存器 + 该指令覆盖掉的内存旧值 */
-class History {
+export class History {
   readonly cap = 200_000;
   /** 每条记录 18 项：8 个 32 位通用寄存器、6 个段寄存器、IP、FLAGS、停机/等待、标志 */
   private regs = new Uint32Array(this.cap * 18);
@@ -207,6 +207,18 @@ export class Machine {
   pit = new PIT(() => { if (this.config.pit) this.raiseIrq(0); });
   /** 虚拟时间（PIT 时钟数） */
   clock = 0;
+  /** Null on ordinary startup; snapshots pin the RTC to virtual time and its original timezone. */
+  rtcEpoch: number | null = null;
+  rtcClock = 0;
+  rtcTimezone = 0;
+
+  now(): number { return this.rtcEpoch === null ? Date.now() : this.rtcEpoch + (this.clock - this.rtcClock) * 1000 / 1193182; }
+
+  /** Calendar fields are read with UTC getters, avoiding host timezone changes after restore. */
+  calendar(time = this.now()): Date {
+    const offset = this.rtcEpoch === null ? new Date(time).getTimezoneOffset() : this.rtcTimezone;
+    return new Date(time - offset * 60_000);
+  }
   /** 每条指令消耗的 PIT 时钟数（决定虚拟 CPU 的速度） */
   clocksPerInstr = 3.6;
   cpuModel: CpuSpeedId = '8088';
@@ -628,19 +640,19 @@ export class Machine {
   }
 
   private cmosRead(): number {
-    const d = new Date();
+    const d = this.calendar();
     const bcd = (v: number) => ((Math.floor(v / 10) % 10) << 4) | (v % 10);
     switch (this.cmosIndex) {
-      case 0x00: return bcd(d.getSeconds());
-      case 0x02: return bcd(d.getMinutes());
-      case 0x04: return bcd(d.getHours());
-      case 0x06: return d.getDay() + 1;
-      case 0x07: return bcd(d.getDate());
-      case 0x08: return bcd(d.getMonth() + 1);
-      case 0x09: return bcd(d.getFullYear() % 100);
+      case 0x00: return bcd(d.getUTCSeconds());
+      case 0x02: return bcd(d.getUTCMinutes());
+      case 0x04: return bcd(d.getUTCHours());
+      case 0x06: return d.getUTCDay() + 1;
+      case 0x07: return bcd(d.getUTCDate());
+      case 0x08: return bcd(d.getUTCMonth() + 1);
+      case 0x09: return bcd(d.getUTCFullYear() % 100);
       case 0x0c: { const f = this.rtcFlags; this.rtcFlags = 0; return f; } // 读出后清零
       case 0x0d: return 0x80;
-      case 0x32: return bcd(Math.floor(d.getFullYear() / 100));
+      case 0x32: return bcd(Math.floor(d.getUTCFullYear() / 100));
     }
     return this.cmos[this.cmosIndex];
   }
@@ -849,6 +861,7 @@ export class Machine {
     this.pit.setGate2(false);
     this.updateSpeaker();
     this.kbd.clear();
+    if (this.rtcEpoch !== null) { this.rtcEpoch = this.now(); this.rtcClock = 0; }
     this.clock = 0;
     this.video.reset();
     this.video.loadModeRegs(3);
@@ -880,8 +893,8 @@ export class Machine {
       mem.set(image, 0x7c00);
     }
     // 开机自检时 BIOS 按 CMOS 时钟设置"午夜以来的滴答数"，DOS 由此得到当前时间
-    const now = new Date();
-    const ticks = Math.floor(((now.getHours() * 60 + now.getMinutes()) * 60 + now.getSeconds()) * 1193182 / 65536);
+    const now = this.calendar();
+    const ticks = Math.floor(((now.getUTCHours() * 60 + now.getUTCMinutes()) * 60 + now.getUTCSeconds()) * 1193182 / 65536);
     mem[0x46c] = ticks & 0xff; mem[0x46d] = (ticks >> 8) & 0xff; mem[0x46e] = (ticks >> 16) & 0xff; mem[0x46f] = 0;
     cpu.r.fill(0);
     cpu.s.fill(0);

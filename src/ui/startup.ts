@@ -9,19 +9,41 @@ export class StartupPanel {
   private launch: (mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean) => Promise<void>;
   private currentCpu: () => CpuSpeedId;
   private error: (message: string) => void;
+  private snapshotInput: HTMLInputElement;
 
   constructor(
     launch: (mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean) => Promise<void>,
     currentCpu: () => CpuSpeedId,
     error: (message: string) => void,
+    restoreSnapshot: (file: File) => Promise<void>,
   ) {
     this.launch = launch;
     this.currentCpu = currentCpu;
     this.error = error;
+    this.snapshotInput = document.createElement('input');
+    this.snapshotInput.type = 'file';
+    this.snapshotInput.accept = '.asmsnap';
+    this.snapshotInput.hidden = true;
+    document.body.appendChild(this.snapshotInput);
+    this.snapshotInput.onchange = async () => {
+      const file = this.snapshotInput.files?.[0];
+      this.snapshotInput.value = '';
+      if (!file || this.busy) return;
+      this.busy = true;
+      document.getElementById('launcher')!.setAttribute('inert', '');
+      document.getElementById('startup-error')!.textContent = '正在校验并载入快照…';
+      try { await restoreSnapshot(file); }
+      catch (e) { this.error((e as Error).message); }
+      finally {
+        this.busy = false;
+        document.getElementById('launcher')!.removeAttribute('inert');
+      }
+    };
     for (const b of document.querySelectorAll<HTMLButtonElement>('[data-start]')) b.onclick = () => {
       const mode = b.dataset.start;
       if (mode === 'dual') void this.enter('dual', DEFAULT_CONFIG, this.currentCpu(), true);
       else if (mode === 'debug' || mode === 'full') this.configure(mode);
+      else if (mode === 'snapshot') this.snapshotInput.click();
     };
     const form = this.configDialog.querySelector('form')!;
     form.onsubmit = e => {

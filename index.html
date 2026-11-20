@@ -15,6 +15,7 @@
         <button data-start="debug"><strong>直接调试</strong><span>选择设备和 BIOS / DOS 服务，编写并调试汇编程序</span></button>
         <button data-start="dual"><strong>双机对联</strong><span>使用默认配置，两台机器通过 COM1 串口连接</span></button>
         <button data-start="full"><strong>完整模拟</strong><span>选择设备，从软盘、硬盘或光盘启动操作系统</span></button>
+        <button data-start="snapshot"><strong>Load snapshot · 载入快照</strong><span>上传完整快照，还原工作模式、机器和磁盘；点击运行后继续</span></button>
       </div>
       <p id="startup-error" role="alert"></p>
     </section>
@@ -22,6 +23,7 @@
       <div class="brand">AsmPerfect <span>86</span> <small id="version" class="version"></small></div>
       <div class="group">
         <button id="btn-home" title="停止当前会话，保存磁盘并返回启动选择页">启动选择</button>
+        <button id="btn-snapshot" title="暂停并将工作模式、完整机器状态和所有磁盘下载为一个快照文件">Take snapshot</button>
         <span id="mode-name"></span>
         <select id="cpu" title="CPU 型号：决定虚拟 CPU 的速度；286/386 下 PUSH SP 等少数指令的行为与 8086 不同"></select>
       </div>

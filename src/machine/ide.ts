@@ -55,7 +55,7 @@ export class IdeChannel {
   // ---- 命令执行 ----
   private phase: Phase = 'idle';
   private unit = 0;
-  private buf = new Uint8Array(512);
+  private buf: Uint8Array = new Uint8Array(512);
   private pos = 0;
   /** 读写命令：下一个扇区（LBA）、还剩的扇区数、每块的扇区数、本块的扇区数 */
   private lba = 0;
@@ -64,10 +64,10 @@ export class IdeChannel {
   private blockLen = 0;
   private writing = false;
   /** 光盘映像的扇区还没读出来：读到以后再做 */
-  private waiting: (() => void) | null = null;
+  private waiting: Disk | null = null;
   /** "忙"结束的时间和那时要做的事 */
   next = Infinity;
-  private action: (() => void) | null = null;
+  private action: { kind: 'status' | 'input' | 'write'; unit: number; error?: number; buf?: Uint8Array; count?: number } | null = null;
 
   private host: IdeHost;
   constructor(host: IdeHost) {
@@ -98,23 +98,32 @@ export class IdeChannel {
   private irq(): void { if (!(this.control & 2)) this.host.irq(); }
 
   /** 先"忙"一会儿，然后做 f（置 DRQ 或完成状态、发中断） */
-  private afterBusy(f: () => void): void {
+  private afterBusy(action: NonNullable<IdeChannel['action']>): void {
     this.phase = 'idle';
     this.status[this.unit] = BSY;
-    this.action = f;
+    this.action = action;
     this.next = this.host.now() + DELAY;
   }
 
   /** 机器推进时间时调用 */
   tick(): void {
     if (this.host.now() < this.next) return;
-    const f = this.action;
+    const a = this.action;
     this.next = Infinity; this.action = null;
-    f?.();
+    if (!a) return;
+    if (a.kind === 'input') {
+      this.buf = a.buf!; this.pos = 0; this.blockLen = a.count ?? 0;
+      this.phase = 'dataIn'; this.status[a.unit] = DRDY | DSC | DRQ;
+    } else if (a.kind === 'write') this.expectBlock();
+    else {
+      if (a.error) this.error[a.unit] = a.error;
+      this.status[a.unit] = DRDY | DSC | (a.error ? ERR : 0);
+    }
+    this.irq();
   }
 
   /** 机器定期调用：光盘映像的数据读到了就继续 */
-  poll(): void { if (this.waiting) { const f = this.waiting; this.waiting = null; f(); } }
+  poll(): void { if (this.waiting) { const d = this.waiting; this.waiting = null; this.nextReadBlock(d); } }
   get pending(): boolean { return this.waiting !== null; }
 
   // ======================= 端口 =======================
@@ -210,7 +219,7 @@ export class IdeChannel {
       }
       case 0x90: {                                                            // EXECUTE DEVICE DIAGNOSTIC
         this.reset();
-        this.afterBusy(() => { this.status[u] = DRDY | DSC; this.irq(); });
+        this.afterBusy({ kind: 'status', unit: u });
         return;
       }
       case 0xe5: this.sectorCount = 0xff; return this.done();                 // CHECK POWER MODE：在转
@@ -256,17 +265,17 @@ export class IdeChannel {
 
   private done(): void {
     const u = this.unit;
-    this.afterBusy(() => { this.status[u] = DRDY | DSC; this.irq(); });
+    this.afterBusy({ kind: 'status', unit: u });
   }
 
   private abort(): void {
     const u = this.unit;
-    this.afterBusy(() => { this.error[u] = ABRT; this.status[u] = DRDY | DSC | ERR; this.irq(); });
+    this.afterBusy({ kind: 'status', unit: u, error: ABRT });
   }
 
   private notFound(): void {
     const u = this.unit;
-    this.afterBusy(() => { this.error[u] = IDNF; this.status[u] = DRDY | DSC | ERR; this.irq(); });
+    this.afterBusy({ kind: 'status', unit: u, error: IDNF });
   }
 
   // ---- IDENTIFY ----
@@ -304,12 +313,7 @@ export class IdeChannel {
     for (let k = 0; k < 256; k++) { out[k * 2] = w[k] & 0xff; out[k * 2 + 1] = w[k] >> 8; }
     this.left = 0; this.writing = false;
     const u = this.unit;
-    this.afterBusy(() => {
-      this.buf = out; this.pos = 0;
-      this.phase = 'dataIn';
-      this.status[u] = DRDY | DSC | DRQ;
-      this.irq();
-    });
+    this.afterBusy({ kind: 'input', unit: u, buf: out });
   }
 
   // ---- 读 ----
@@ -337,19 +341,14 @@ export class IdeChannel {
         // 光盘映像的这一段还没从文件里读出来：报告忙，读到后再继续
         this.phase = 'idle';
         this.status[this.unit] = BSY;
-        this.waiting = () => this.nextReadBlock(d);
+        this.waiting = d;
         return;
       }
       buf.set(s, k * 512);
     }
     this.setAddress(d, this.lba + count - 1);
     const u = this.unit;
-    this.afterBusy(() => {
-      this.buf = buf; this.pos = 0; this.blockLen = count;
-      this.phase = 'dataIn';
-      this.status[u] = DRDY | DSC | DRQ;
-      this.irq();
-    });
+    this.afterBusy({ kind: 'input', unit: u, buf, count });
   }
 
   private readBlockDone(): void {
@@ -392,7 +391,7 @@ export class IdeChannel {
     this.host.written(this.unit);
     this.setAddress(d, this.lba + this.blockLen - 1);
     this.lba += this.blockLen; this.left -= this.blockLen;
-    if (this.left > 0) { this.afterBusy(() => { this.expectBlock(); this.irq(); }); return; }
+    if (this.left > 0) { this.afterBusy({ kind: 'write', unit: this.unit }); return; }
     this.done();
   }
 }

@@ -24,6 +24,18 @@ const PARAMS: Record<number, number> = {
 };
 
 type Phase = 'command' | 'exec' | 'pioIn' | 'pioOut' | 'result';
+type Transfer = {
+  c: number[]; disk: Disk; cyl: number;
+  sectors: { lba: number; h: number; r: number }[];
+  usable: number; k: number;
+};
+type Action =
+  | { kind: 'irq' }
+  | { kind: 'seek'; d: number; head: number; target: number }
+  | { kind: 'id'; d: number; head: number; disk: Disk }
+  | { kind: 'transfer' | 'format'; c: number[]; disk: Disk; cyl: number }
+  | { kind: 'dma' | 'pio'; transfer: Transfer }
+  | { kind: 'formatIds'; disk: Disk; d: number; head: number; n: number; fill: number };
 
 export interface FdcHost {
   /** 0、1 号驱动器里的软盘（没有盘时为 null） */
@@ -51,7 +63,7 @@ export class FloppyController {
   /** 非 DMA（SPECIFY 的 ND 位）时经数据端口逐字节传送的数据 */
   private pio = new Uint8Array(0);
   private pioPos = 0;
-  private pioDone: (() => void) | null = null;
+  private pioDone: Action | null = null;
   /** 各驱动器磁头所在的柱面 */
   private pcn = [0, 0, 0, 0];
   /** 正在寻道的驱动器（主状态寄存器的位 0~3） */
@@ -70,7 +82,7 @@ export class FloppyController {
   private rotation = 0;
   /** 下一个事件（命令执行完）的时间和要做的事 */
   next = Infinity;
-  private action: (() => void) | null = null;
+  private action: Action | null = null;
 
   private host: FdcHost;
   constructor(host: FdcHost) { this.host = host; }
@@ -100,15 +112,49 @@ export class FloppyController {
     if (this.host.now() < this.next) return;
     const f = this.action;
     this.next = Infinity; this.action = null;
-    f?.();
+    if (f) this.continueAction(f);
   }
 
-  private later(f: () => void): void {
+  private later(f: Action): void {
     this.action = f;
     this.next = this.host.now() + DELAY;
   }
 
   private interrupt(): void { if (this.dor & 0x08) this.host.irq(); }
+
+  private continueAction(a: Action): void {
+    switch (a.kind) {
+      case 'irq': this.interrupt(); return;
+      case 'seek': {
+        const { d, head, target } = a;
+        this.seeking &= ~(1 << d);
+        if (!this.host.driveExists(d)) { this.pending.push([ST0_SEEK_END | ST0_ABNORMAL | ST0_EQUIP | (head << 2) | d, this.pcn[d]]); this.interrupt(); return; }
+        this.pcn[d] = target;
+        this.checkChange(d);
+        if (d < 2 && this.host.disk(d)) this.changeLine[d] = false;
+        this.pending.push([ST0_SEEK_END | (head << 2) | d, target]);
+        this.interrupt(); return;
+      }
+      case 'id': {
+        const { d, head, disk } = a, g = disk.geo, cyl = this.pcn[d];
+        if (cyl >= g.cylinders || head >= g.heads) { this.finish(this.status(ST0_ABNORMAL | (head << 2) | d, ST1_MA, 0, cyl, head, 1, 2), true); return; }
+        this.rotation = this.rotation % g.sectors + 1;
+        this.finish(this.status((head << 2) | d, 0, 0, cyl, head, this.rotation, 2), true); return;
+      }
+      case 'transfer': this.transferReady(a.c, a.disk, a.cyl); return;
+      case 'format': this.formatReady(a.c, a.disk); return;
+      case 'dma': this.transferDma(a.transfer); return;
+      case 'pio': {
+        const t = a.transfer;
+        if ([0x05, 0x09].includes(t.c[0] & 0x1f)) {
+          for (let i = 0; i < t.usable; i++) t.disk.writeSector(t.sectors[i].lba, this.pio.subarray(i * 512, i * 512 + 512));
+          this.host.written(t.c[1] & 3);
+        }
+        this.transferEnd(t, t.usable, false, t.usable < t.sectors.length); return;
+      }
+      case 'formatIds': this.formatIds(a.disk, a.d, a.head, a.n, a.fill, this.pio); return;
+    }
+  }
 
   private get selected(): number { return this.dor & 3; }
 
@@ -138,12 +184,12 @@ export class FloppyController {
         const was = this.dor;
         this.dor = v;
         if (!(v & 4)) { this.phase = 'command'; this.next = Infinity; this.action = null; return; } // 保持在复位状态
-        if (!(was & 4)) { this.softReset(); this.later(() => this.interrupt()); } // 复位结束
+        if (!(was & 4)) { this.softReset(); this.later({ kind: 'irq' }); } // 复位结束
         return;
       }
       case 0x3f4: // 传输率选择：位 7 软件复位
         this.rate = v & 3;
-        if (v & 0x80) { this.softReset(); this.later(() => this.interrupt()); }
+        if (v & 0x80) { this.softReset(); this.later({ kind: 'irq' }); }
         return;
       case 0x3f5: this.writeData(v); return;
       case 0x3f7: this.rate = v & 3; return;
@@ -164,7 +210,7 @@ export class FloppyController {
   private readData(): number {
     if (this.phase === 'pioIn') {
       const v = this.pio[this.pioPos++];
-      if (this.pioPos >= this.pio.length) { const f = this.pioDone!; this.pioDone = null; f(); }
+      if (this.pioPos >= this.pio.length) { const f = this.pioDone!; this.pioDone = null; this.continueAction(f); }
       return v;
     }
     if (this.phase !== 'result') return 0xff;
@@ -177,7 +223,7 @@ export class FloppyController {
     if (!(this.dor & 4)) return;
     if (this.phase === 'pioOut') {
       this.pio[this.pioPos++] = v;
-      if (this.pioPos >= this.pio.length) { const f = this.pioDone!; this.pioDone = null; f(); }
+      if (this.pioPos >= this.pio.length) { const f = this.pioDone!; this.pioDone = null; this.continueAction(f); }
       return;
     }
     if (this.phase !== 'command') return;
@@ -219,15 +265,7 @@ export class FloppyController {
         target = Math.max(0, Math.min(255, target));
         this.seeking |= 1 << d;
         this.phase = 'command';
-        this.later(() => {
-          this.seeking &= ~(1 << d);
-          if (!this.host.driveExists(d)) { this.pending.push([ST0_SEEK_END | ST0_ABNORMAL | ST0_EQUIP | (head << 2) | d, this.pcn[d]]); this.interrupt(); return; }
-          this.pcn[d] = target;
-          this.checkChange(d);
-          if (d < 2 && this.host.disk(d)) this.changeLine[d] = false; // 寻道后换盘信号清掉（要有盘）
-          this.pending.push([ST0_SEEK_END | (head << 2) | d, target]);
-          this.interrupt();
-        });
+        this.later({ kind: 'seek', d, head, target });
         return;
       }
       case 0x0a: {                                                          // READ ID
@@ -235,12 +273,7 @@ export class FloppyController {
         this.phase = 'exec';
         const disk = this.mediaFor(d);
         if (!disk) return; // 没有盘：软盘不转，命令一直不结束（驱动超时后复位控制器）
-        this.later(() => {
-          const g = disk.geo, cyl = this.pcn[d];
-          if (cyl >= g.cylinders || head >= g.heads) { this.finish(this.status(ST0_ABNORMAL | (head << 2) | d, ST1_MA, 0, cyl, head, 1, 2), true); return; }
-          this.rotation = this.rotation % g.sectors + 1;
-          this.finish(this.status((head << 2) | d, 0, 0, cyl, head, this.rotation, 2), true);
-        });
+        this.later({ kind: 'id', d, head, disk });
         return;
       }
       case 0x02: case 0x05: case 0x06: case 0x09: case 0x0c: case 0x16: this.transferCommand(c); return;
@@ -275,21 +308,25 @@ export class FloppyController {
 
   /** 读、写、校验扇区（READ DATA、READ DELETED、READ TRACK、WRITE DATA、WRITE DELETED、VERIFY） */
   private transferCommand(c: number[]): void {
+    const d = c[1] & 3;
+    this.phase = 'exec';
+    const disk = this.mediaFor(d);
+    if (!disk) return;
+    if (this.config[0] & 0x40) this.pcn[d] = c[2];
+    this.later({ kind: 'transfer', c, disk, cyl: this.pcn[d] });
+  }
+
+  private transferReady(c: number[], disk: Disk, cyl: number): void {
     const op = c[0] & 0x1f, mt = (c[0] & 0x80) !== 0, mfm = (c[0] & 0x40) !== 0;
     const write = op === 0x05 || op === 0x09, verify = op === 0x16;
     const d = c[1] & 3;
     const head = (c[1] >> 2) & 1;
     const C = c[2], H = c[3], N = c[5], EOT = c[6];
     const R = op === 0x02 ? 1 : c[4];
-    this.phase = 'exec';
-    const disk = this.mediaFor(d);
-    if (!disk) return; // 没有盘：命令一直不结束
-    if (this.config[0] & 0x40) this.pcn[d] = C; // 隐含寻道（CONFIGURE 的 EIS）
     const pioMode = (this.specify[1] & 1) !== 0 && !verify;
-    const g = disk.geo, cyl = this.pcn[d];
+    const g = disk.geo;
     const fail = (st1: number, st2 = 0) => this.finish(this.status(ST0_ABNORMAL | (head << 2) | d, st1, st2, C, head, R, N), true);
 
-    this.later(() => {
       if (!mfm) { fail(ST1_MA); return; }                       // FM（单密度）：PC 的软盘都是 MFM
       if (cyl >= g.cylinders || head >= g.heads) { fail(ST1_MA); return; }
       if (C !== cyl) { fail(ST1_ND, ST2_WC); return; }          // 磁头所在的磁道上找不到这个柱面号
@@ -305,21 +342,10 @@ export class FloppyController {
         if (r >= EOT) { if (mt && h === 0 && g.heads > 1) { h = 1; r = 1; continue; } break; }
         r++;
       }
-      const st2Extra = op === 0x0c ? ST2_CM : 0;
-
-      // 传送了 done 个扇区后结束：tc = DMA 到达终点；bad = 第 done 个扇区找不到
-      const end = (done: number, tc: boolean, bad: boolean) => {
-        if (bad) { const x = sectors[done]; this.finish(this.status(ST0_ABNORMAL | (x.h << 2) | d, ST1_ND, 0, C, x.h, x.r, N), true); return; }
-        const last = sectors[done - 1];
-        // 结果里的地址是"下一个扇区"
-        let rc = C, rh = last.h, rr = last.r + 1;
-        if (last.r >= EOT) { rr = 1; if (mt && last.h === 0) rh = 1; else { rc = C + 1; if (mt) rh = 0; } }
-        const ranOff = !tc && op !== 0x0c;                       // 过了 EOT 计数还没完：到了磁道末尾
-        this.finish(this.status((ranOff ? ST0_ABNORMAL : 0) | (last.h << 2) | d, ranOff ? ST1_EN : 0, st2Extra, rc, rh, rr, N), true);
-      };
       const firstBad = sectors.findIndex(x => x.lba < 0);
       const usable = firstBad < 0 ? sectors.length : firstBad;
-      if (usable === 0) { end(0, false, true); return; }
+      const transfer: Transfer = { c, disk, cyl, sectors, usable, k: 0 };
+      if (usable === 0) { this.transferEnd(transfer, 0, false, true); return; }
 
       if (pioMode) {
         // 非 DMA：全部数据经数据端口逐字节读写（主机读完、写完后进入结果阶段）
@@ -327,39 +353,51 @@ export class FloppyController {
         this.pioPos = 0;
         if (!write) for (let i = 0; i < usable; i++) this.pio.set(disk.readSector(sectors[i].lba) ?? new Uint8Array(512), i * 512);
         this.phase = write ? 'pioOut' : 'pioIn';
-        this.pioDone = () => {
-          if (write) { for (let i = 0; i < usable; i++) disk.writeSector(sectors[i].lba, this.pio.subarray(i * 512, i * 512 + 512)); this.host.written(d); }
-          end(usable, false, usable < sectors.length);
-        };
+        this.pioDone = { kind: 'pio', transfer };
         this.interrupt();
         return;
       }
 
-      let k = 0;
-      const step = (): void => {
-        while (k < usable) {
-          const lba = sectors[k].lba;
-          if (verify) { k++; continue; }
-          const buf = write ? new Uint8Array(512) : Uint8Array.from(disk.readSector(lba) ?? new Uint8Array(512));
-          const res = this.host.dma(buf);
-          if (!res) { this.later(step); return; }               // DMA 通道被屏蔽：等它打开
-          if (write && res.n) { disk.writeSector(lba, buf); this.host.written(d); }
-          k++;
-          if (res.tc) { end(k, true, false); return; }
-        }
-        end(k, false, usable < sectors.length);
-      };
-      step();
-    });
+      this.transferDma(transfer);
+  }
+
+  private transferEnd(t: Transfer, done: number, tc: boolean, bad: boolean): void {
+    const c = t.c, C = c[2], N = c[5], EOT = c[6], d = c[1] & 3;
+    const op = c[0] & 0x1f, mt = (c[0] & 0x80) !== 0;
+    if (bad) { const x = t.sectors[done]; this.finish(this.status(ST0_ABNORMAL | (x.h << 2) | d, ST1_ND, 0, C, x.h, x.r, N), true); return; }
+    const last = t.sectors[done - 1];
+    let rc = C, rh = last.h, rr = last.r + 1;
+    if (last.r >= EOT) { rr = 1; if (mt && last.h === 0) rh = 1; else { rc = C + 1; if (mt) rh = 0; } }
+    const ranOff = !tc && op !== 0x0c;
+    this.finish(this.status((ranOff ? ST0_ABNORMAL : 0) | (last.h << 2) | d, ranOff ? ST1_EN : 0, op === 0x0c ? ST2_CM : 0, rc, rh, rr, N), true);
+  }
+
+  private transferDma(t: Transfer): void {
+    const op = t.c[0] & 0x1f, write = op === 0x05 || op === 0x09, verify = op === 0x16;
+    while (t.k < t.usable) {
+      const lba = t.sectors[t.k].lba;
+      if (verify) { t.k++; continue; }
+      const buf = write ? new Uint8Array(512) : Uint8Array.from(t.disk.readSector(lba) ?? new Uint8Array(512));
+      const res = this.host.dma(buf);
+      if (!res) { this.later({ kind: 'dma', transfer: t }); return; }
+      if (write && res.n) { t.disk.writeSector(lba, buf); this.host.written(t.c[1] & 3); }
+      t.k++;
+      if (res.tc) { this.transferEnd(t, t.k, true, false); return; }
+    }
+    this.transferEnd(t, t.k, false, t.usable < t.sectors.length);
   }
 
   /** FORMAT TRACK：DMA 送来每个扇区的 C、H、R、N（各 4 字节），扇区内容填成 D */
   private format(c: number[]): void {
-    const d = c[1] & 3, head = (c[1] >> 2) & 1, N = c[2], SC = c[3], D = c[5];
+    const d = c[1] & 3;
     this.phase = 'exec';
     const disk = this.mediaFor(d);
     if (!disk) return;
-    this.later(() => {
+    this.later({ kind: 'format', c, disk, cyl: this.pcn[d] });
+  }
+
+  private formatReady(c: number[], disk: Disk): void {
+    const d = c[1] & 3, head = (c[1] >> 2) & 1, N = c[2], SC = c[3], D = c[5];
       const cyl = this.pcn[d];
       if (disk.readOnly) { this.finish(this.status(ST0_ABNORMAL | (head << 2) | d, ST1_NW, 0, cyl, head, 1, N), true); return; }
       const ids = new Uint8Array(SC * 4);
@@ -369,12 +407,11 @@ export class FloppyController {
       } else {
         // 非 DMA：主机经数据端口写 ID
         this.pio = ids; this.pioPos = 0; this.phase = 'pioOut';
-        this.pioDone = () => this.formatIds(disk, d, head, N, D, ids);
+        this.pioDone = { kind: 'formatIds', disk, d, head, n: N, fill: D };
         this.interrupt();
         return;
       }
       this.formatIds(disk, d, head, N, D, ids);
-    });
   }
 
   private formatIds(disk: Disk, d: number, head: number, N: number, D: number, ids: Uint8Array): void {

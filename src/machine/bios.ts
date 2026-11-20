@@ -193,7 +193,7 @@ export class Hle {
     if ((this.ah === 0x02 || this.ah === 0x04) && !this.m.config.rtc) {
       this.ah = 0x86; this.retFlag(CF, true); return true;
     }
-    const d = new Date();
+    const d = this.m.calendar();
     const bcd = (v: number) => ((Math.floor(v / 10) % 10) << 4) | (v % 10);
     switch (this.ah) {
       case 0x00:
@@ -203,12 +203,12 @@ export class Hle {
         this.cpu.wb(BDA, 0x70, 0);
         return true;
       case 0x02:
-        this.cpu.setR8(5, bcd(d.getHours())); this.cpu.setR8(1, bcd(d.getMinutes()));
-        this.cpu.setR8(6, bcd(d.getSeconds())); this.cpu.setR8(2, 0);
+        this.cpu.setR8(5, bcd(d.getUTCHours())); this.cpu.setR8(1, bcd(d.getUTCMinutes()));
+        this.cpu.setR8(6, bcd(d.getUTCSeconds())); this.cpu.setR8(2, 0);
         this.ok(); return true;
       case 0x04:
-        this.cpu.setR8(5, bcd(Math.floor(d.getFullYear() / 100))); this.cpu.setR8(1, bcd(d.getFullYear() % 100));
-        this.cpu.setR8(6, bcd(d.getMonth() + 1)); this.cpu.setR8(2, bcd(d.getDate()));
+        this.cpu.setR8(5, bcd(Math.floor(d.getUTCFullYear() / 100))); this.cpu.setR8(1, bcd(d.getUTCFullYear() % 100));
+        this.cpu.setR8(6, bcd(d.getUTCMonth() + 1)); this.cpu.setR8(2, bcd(d.getUTCDate()));
         this.ok(); return true;
       case 0x01: // 设置滴答数
         this.cpu.ww(BDA, 0x6c, this.cpu.r[DX]); this.cpu.ww(BDA, 0x6e, this.cpu.r[CX]); this.cpu.wb(BDA, 0x70, 0);
@@ -1014,7 +1014,8 @@ export class Hle {
           r[CX] = time; r[DX] = date;
         } else if (this.al === 1) {
           const d = r[DX], t = r[CX];
-          this.m.fileTimes.set(f.name, new Date(1980 + (d >> 9), ((d >> 5) & 15) - 1, d & 31, t >> 11, (t >> 5) & 63, (t & 31) * 2).getTime());
+          const fields: [number, number, number, number, number, number] = [1980 + (d >> 9), ((d >> 5) & 15) - 1, d & 31, t >> 11, (t >> 5) & 63, (t & 31) * 2];
+          this.m.fileTimes.set(f.name, this.m.rtcEpoch === null ? new Date(...fields).getTime() : Date.UTC(...fields) + this.m.rtcTimezone * 60_000);
         }
         this.ok();
         return true;
@@ -1031,13 +1032,13 @@ export class Hle {
         return true;
       case 0x25: cpu.ww(0, this.al * 4, r[DX]); cpu.ww(0, this.al * 4 + 2, cpu.s[DS]); return true;
       case 0x2a: {
-        const d = new Date();
-        r[CX] = d.getFullYear(); cpu.setR8(6, d.getMonth() + 1); cpu.setR8(2, d.getDate()); this.al = d.getDay();
+        const d = this.m.calendar();
+        r[CX] = d.getUTCFullYear(); cpu.setR8(6, d.getUTCMonth() + 1); cpu.setR8(2, d.getUTCDate()); this.al = d.getUTCDay();
         return true;
       }
       case 0x2c: {
-        const d = new Date();
-        cpu.setR8(5, d.getHours()); cpu.setR8(1, d.getMinutes()); cpu.setR8(6, d.getSeconds()); cpu.setR8(2, Math.floor(d.getMilliseconds() / 10));
+        const d = this.m.calendar();
+        cpu.setR8(5, d.getUTCHours()); cpu.setR8(1, d.getUTCMinutes()); cpu.setR8(6, d.getUTCSeconds()); cpu.setR8(2, Math.floor(d.getUTCMilliseconds() / 10));
         return true;
       }
       case 0x2b: case 0x2d: this.al = 0; return true;
@@ -1181,12 +1182,12 @@ export class Hle {
   /** 文件的修改时间，换成 DOS 的格式 */
   private dosTime(name: string): { time: number; date: number } {
     let t = this.m.fileTimes.get(name);
-    if (t === undefined) { t = Date.now(); this.m.fileTimes.set(name, t); }
-    const d = new Date(t);
-    const y = Math.max(0, Math.min(127, d.getFullYear() - 1980));
+    if (t === undefined) { t = this.m.now(); this.m.fileTimes.set(name, t); }
+    const d = this.m.calendar(t);
+    const y = Math.max(0, Math.min(127, d.getUTCFullYear() - 1980));
     return {
-      time: (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1),
-      date: (y << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+      time: (d.getUTCHours() << 11) | (d.getUTCMinutes() << 5) | (d.getUTCSeconds() >> 1),
+      date: (y << 9) | ((d.getUTCMonth() + 1) << 5) | d.getUTCDate(),
     };
   }
 
@@ -1332,7 +1333,7 @@ export class Hle {
 
   private flushFile(f: OpenFile): void {
     if (!f.dirty) return;
-    this.m.fileTimes.set(f.name, Date.now());
+    this.m.fileTimes.set(f.name, this.m.now());
     this.m.files.set(f.name, Uint8Array.from(f.data));
     f.dirty = false;
     this.m.filesChanged();

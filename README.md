@@ -15,6 +15,7 @@ npm run build      # 生成静态网页到 dist/
 ## 功能
 
 - **启动选择**：打开网页只显示入口，不创建虚拟 PC。直接调试可选择硬件、BIOS、浅层 DOS 和内置鼠标驱动（默认保持原有环境）；双机对联直接进入串口实验；完整模拟先选设备，再选 A:、C: 或光盘引导，不预装 DOS 或内置鼠标驱动
+- **完整快照**：主工具栏的 Take snapshot 暂停虚拟机，并将模式、CPU/内存、全部设备、所有磁盘/光盘、源码和断点下载为一个 `.asmsnap` 文件；双机同时保存两台机器和串口在途数据。启动页的 Load snapshot 上传恢复，保持暂停，点击运行才继续，不重新引导客体系统
 - **编辑器**：语法高亮、断点（点击行号左侧）、错误标记、悬停提示（寄存器和变量的当前值、指令说明、`INT 21h` 当前 AH 对应的功能）、可选显示每行的地址和机器码
 - **源码工具栏**：直接调试和双机模式的代码窗口内依次提供新建、打开、示例、保存、汇编和机器码开关，生成 EXE/COM 与最大化靠右；完整模拟隐藏整个代码窗口。主工具栏以"启动选择"开头，保留三种模式共用的 CPU、运行、暂停等控制
 - **源码文件操作**：新建会先保护未保存修改，再清空当前编辑器和文件名（双机只清空当前机器）；直接调试中打开文件或载入示例也只在存在未保存修改时确认。汇编不会清除修改状态，保存或撤销回原版本后不再询问
@@ -35,7 +36,7 @@ npm run build      # 生成静态网页到 dist/
 - **光盘映像当作硬盘**：D: 可以放 .iso，模拟器把光盘内容变成一块只读的 FAT16 硬盘，DOS 里直接是 D:，不用光驱驱动和 MSCDEX；ISO 不读进内存，DOS 读到哪里才读哪一段
 - **中文显示**：屏幕上勾选"中文"，像 UCDOS 那样把 GBK 显示成汉字，并自动识别西文制表符
 - **图形模式**：VGA 13h（320×200、256 色，调色板端口 3C7h~3C9h、INT 10h AH=10h）、CGA 04h/05h/06h；EGA/VGA 16 色平面模式 0Dh、0Eh、10h、12h（640×480），模拟 4 个位平面、定序器、图形控制器（写模式 0~3、读模式 0/1、锁存器、逻辑运算、位屏蔽）和属性控制器调色板，Turbo Pascal/Turbo C 的 EGAVGA.BGI 驱动可以直接用；BIOS 写点/读点、图形模式下显示文字（内置 8×8 点阵字库）
-- **鼠标**：直接调试可选内置 INT 33h 驱动（光标、位置、按键、活动范围、形状、移动量、事件回调等）；完整模拟可选 COM2 上的 Microsoft 串口鼠标，由客体系统安装实际硬件驱动。串口鼠标捕获后按右 Ctrl 释放；勾选工具栏的"全屏捕获"可将 Esc 传入客体（Chrome/Edge、HTTPS 或 localhost，需授权），普通捕获的 Esc 仍由浏览器保留
+- **鼠标**：直接调试可选内置 INT 33h 驱动（光标、位置、按键、活动范围、形状、移动量、事件回调等）；完整模拟可选 COM2 上的 Microsoft 串口鼠标，由客体系统安装实际硬件驱动。串口鼠标捕获后按右 Ctrl 释放；勾选工具栏的"全屏捕获"可将 Esc 传入客体（Chrome/Edge、HTTPS 或 localhost，需授权），普通捕获的 Esc 仍由浏览器保留。工具栏或客体 APM 关机后自动释放捕获并退出捕获全屏，黑屏不重新捕获
 - **反汇编**："反汇编"页显示 CS:IP 前后的指令，也可以输入地址（如 335D:32AD 或标号名）查看任意位置，用按钮或鼠标滚轮翻页；可以按地址设断点、双击运行到那里；没有源码的程序也能单步
 - **BIOS/DOS**：INT 10h、16h、1Ah，INT 21h 的常用功能（字符/字符串输入输出、行输入、中断向量、日期时间、文件读写、查找文件 4Eh/4Fh 和 FCB 11h/12h、改名、文件时间等；虚拟磁盘只有根目录）
 
@@ -65,6 +66,7 @@ node tools/serial-demo.ts send.asm recv.asm 286 buffered   # 双机串口文件�
 # URL=http://localhost:5173/ node tools/ui-startup-check.mjs
 # URL=http://localhost:5173/ node tools/ui-export-check.mjs   # 编辑器替换/新建、EXE/COM 下载和异址运行
 # URL=http://localhost:5173/ node tools/ui-capture-check.mjs  # 真实鼠标/键盘锁定、右 Ctrl、Esc 透传和权限失败清理
+# URL=http://localhost:5173/ node tools/ui-snapshot-check.mjs # 三种模式的完整快照、上传后暂停及继续；可设置 PRODUCTION_URL 验证生产版恢复
 ```
 
 `test:cpu` 需要先把测试集下载到 `test-data/8088/`（约 730MB，见 https://github.com/SingleStepTests/8088 的 `v2` 目录）；`test:cpu386` 需要 `test-data/80386/`（约 600MB，https://github.com/SingleStepTests/80386 的 `v1_ex_real_mode` 目录，MOO 格式）。

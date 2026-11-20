@@ -41,7 +41,7 @@ try {
   };
   const checkToolbars = async editorVisible => {
     const sourceIds = ['btn-new', 'btn-open', 'examples', 'btn-save', 'btn-assemble', 'show-bytes'];
-    const mainIds = ['btn-home', 'cpu', 'btn-run', 'btn-pause', 'speed', 'fullscreen-capture', 'record-history', 'btn-back', 'btn-step', 'btn-over', 'btn-out', 'btn-reset', 'btn-cad', 'btn-power'];
+    const mainIds = ['btn-home', 'btn-snapshot', 'cpu', 'btn-run', 'btn-pause', 'speed', 'fullscreen-capture', 'record-history', 'btn-back', 'btn-step', 'btn-over', 'btn-out', 'btn-reset', 'btn-cad', 'btn-power'];
     assert.deepEqual(await page.$$eval('.toolbar button, .toolbar select, .toolbar input', els => els.map(e => e.id)), mainIds);
     assert.deepEqual(await page.$$eval('.editor-tools button, .editor-tools select, .editor-tools input', els => els.map(e => e.id)), sourceIds);
     assert.equal(await page.evaluate(ids => ids.every(id => document.getElementById(id).checkVisibility()), mainIds), true);
@@ -205,6 +205,7 @@ end start`;
   assert.equal(await source(), '');
 
   await page.reload({ waitUntil: 'networkidle0' });
+  await page.waitForFunction(() => !!window.__app);
   await page.click('[data-start="debug"]');
   await page.waitForSelector('#startup-config[open]');
   await page.click('#startup-config button[type="submit"]');

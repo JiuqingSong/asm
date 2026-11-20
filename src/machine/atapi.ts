@@ -54,7 +54,8 @@ export class AtapiCdrom {
   /** 当前的数据传送属于命令包（传完要发"完成"中断）；IDENTIFY 这样的 ATA 命令传完就结束 */
   private packetCmd = false;
   /** 等着从文件里读数据：读到以后调用 */
-  private waiting: (() => void) | null = null;
+  private waiting = false;
+  private loading = false;
 
   /** 发中断（IRQ15）；构造时由机器给出 */
   private raiseIrq: () => void;
@@ -96,7 +97,8 @@ export class AtapiCdrom {
     this.sectorCount = 1; this.lbaLow = 1; this.lbaMid = 0x14; this.lbaHigh = 0xeb;
     this.device &= 0x10;
     this.status = 0;
-    this.waiting = null;
+    this.waiting = false;
+    this.loading = false;
   }
 
   /** 选中的是从盘（这个通道上只有主盘） */
@@ -394,9 +396,11 @@ export class AtapiCdrom {
       this.phase = 'busy';
       this.status = BSY;
       const lba = this.readLba;
+      this.loading = true;
       src.load(off, len).then(() => {
         if (this.phase !== 'busy' || this.readLba !== lba) return;
-        this.waiting = () => this.nextReadBlock();
+        this.loading = false;
+        this.waiting = true;
       }, () => this.fail(SENSE.outOfRange));
       return;
     }
@@ -406,9 +410,21 @@ export class AtapiCdrom {
 
   /** 机器定期调用：文件里的数据读到了就继续 */
   poll(): void {
-    if (this.waiting) { const f = this.waiting; this.waiting = null; f(); }
+    if (this.waiting) { this.waiting = false; this.nextReadBlock(); }
   }
 
   /** 是否在等文件里的数据（机器据此决定要不要调用 poll） */
-  get pending(): boolean { return this.waiting !== null; }
+  get pending(): boolean { return this.waiting; }
+
+  /** Reattach an interrupted host read without delivering data or advancing VM time. */
+  restoreMediaRead(): void {
+    if (!this.loading || this.phase !== 'busy' || !this.disc) return;
+    const per = Math.max(1, Math.min(this.readLeft, Math.floor(this.byteLimit / 2048) || 1, 16));
+    const lba = this.readLba;
+    this.disc.src.load(lba * 2048, per * 2048).then(() => {
+      if (this.phase !== 'busy' || this.readLba !== lba) return;
+      this.loading = false;
+      this.waiting = true;
+    });
+  }
 }

@@ -26,6 +26,7 @@ import { EXAMPLES } from './examples.ts';
 import { INSTR_HELP, DIRECTIVE_HELP, DOS_FUNCS, BIOS_FUNCS } from './help.ts';
 import { DEFAULT_CONFIG, configWarnings, type MachineConfig, type StartupMode } from '../machine/config.ts';
 import { StartupPanel } from './startup.ts';
+import { saveSnapshot, loadSnapshot, type SnapshotWorkspace } from '../machine/snapshot.ts';
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
 const esc = (s: string) => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
@@ -62,6 +63,7 @@ interface Session {
   addrBps: Set<number>;
   /** 记录历史（可以后退）：从磁盘启动时默认关闭（为了速度），运行源程序、EXE 时默认打开；双机模式下总是不记录 */
   record: boolean;
+  snapshotLoaded: boolean;
 }
 
 class App {
@@ -101,6 +103,7 @@ class App {
       (mode, config, cpu, showDiskImages) => this.launch(mode, config, cpu, showDiskImages),
       () => CPU_SPEEDS.find(c => c.id === store.get('cpu'))?.id ?? '8088',
       message => { $('startup-error').textContent = message; this.addMessage('error', message); },
+      file => this.restoreSnapshot(file),
     );
     this.bindUi();
   }
@@ -113,17 +116,18 @@ class App {
       const s: Session = {
         i, tag: i === 0 ? 'A' : 'B', m: this.dual.m[i], model, program: null, dirty: true, sourceVersion: model.getAlternativeVersionId(),
         fileName: '未命名.asm', screen: new Screen(box.querySelector('.screen') as HTMLElement), box,
-        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(), record: true,
+        cmdline: box.querySelector('.cmdline') as HTMLInputElement, snap: null, speaker: new Speaker(), binary: null, binModel: null, addrBps: new Set(), record: true, snapshotLoaded: false,
       };
       s.screen.onKey = e => this.key(s, e);
       s.screen.onMouseRel = (dx, dy, buttons) => {
-        if (!s.program || (s.dirty && !s.binary)) return;
+        if (this.loading || !s.program || (s.dirty && !s.binary && !s.snapshotLoaded)) return;
         if (!s.m.mouseDriverEnabled && s.m.com2.peer !== s.m.serialMouse) return;
         s.m.mouse.moveRel(dx, dy);
         s.m.mouse.queueButtons(buttons, s.m.clock);
         this.afterKey(s);
       };
       s.screen.onCapture = captured => {
+        if (!captured && s.m.poweredOff) return;
         if (captured) this.setStatus(s.screen.fullscreenCapture
           ? '鼠标已全屏捕获，Esc 交给虚拟机。按右 Ctrl 释放并退出捕获全屏'
           : '鼠标已捕获。按右 Ctrl 释放；普通捕获中 Esc 仍由浏览器保留', 'running');
@@ -132,7 +136,7 @@ class App {
       };
       s.screen.onCaptureError = message => { this.addMessage('error', message, s.i); this.setStatus(message, 'error'); this.setTab('messages'); };
       s.screen.onMouse = (fx, fy, buttons) => {
-        if (!s.program || (s.dirty && !s.binary)) return;
+        if (this.loading || !s.program || (s.dirty && !s.binary && !s.snapshotLoaded)) return;
         if (!s.m.mouseDriverEnabled && s.m.com2.peer !== s.m.serialMouse) return;
         s.m.mouse.moveTo(fx * 640, fy * s.m.mouse.screenH);
         s.m.mouse.queueButtons(buttons, s.m.clock);
@@ -158,7 +162,7 @@ class App {
       box.addEventListener('mousedown', () => { s.screen.focus(); if (this.mode === 'dual' && this.active !== i) this.setActive(i); });
       box.querySelector('.screen')!.addEventListener('paste', e => {
         const text = (e as ClipboardEvent).clipboardData?.getData('text') ?? '';
-        if (text) { e.preventDefault(); s.m.typeText(text.replace(/\r?\n/g, '\r'), scanForChar); this.afterKey(s); }
+        if (text && !this.loading) { e.preventDefault(); s.m.typeText(text.replace(/\r?\n/g, '\r'), scanForChar); this.afterKey(s); }
       });
       this.sessions.push(s);
       s.cmdline.onchange = () => store.set('cmdline' + (s.i ? '.b' : ''), s.cmdline.value);
@@ -213,6 +217,7 @@ class App {
       s.snap = null;
       s.addrBps.clear();
       s.dirty = true;
+      s.snapshotLoaded = false;
     }
     store.set('cpu', cpu);
     document.body.classList.add('has-session');
@@ -312,6 +317,7 @@ class App {
     for (const c of CPU_SPEEDS) cpuSel.add(new Option(c.name, c.id));
     cpuSel.onchange = () => { this.applyCpu(); store.set('cpu', cpuSel.value); };
     $('btn-home').onclick = () => { void this.goHome().catch(e => this.addMessage('error', (e as Error).message)); };
+    $('btn-snapshot').onclick = () => { void this.downloadSnapshot(); };
     const wiring = $<HTMLSelectElement>('wiring');
     for (const [k, v] of Object.entries(WIRING_DESC)) wiring.add(new Option(v, k));
     wiring.value = this.loadWiring();
@@ -513,6 +519,133 @@ class App {
     return s.model.getAlternativeVersionId() !== s.sourceVersion;
   }
 
+  private snapshotBusy(busy: boolean): void {
+    this.loading = busy;
+    document.querySelector<HTMLElement>('.layout')!.inert = busy;
+    document.querySelector<HTMLElement>('.toolbar')!.inert = busy;
+    this.editor.editor.updateOptions({ readOnly: busy || !!this.cur?.binary });
+  }
+
+  private async downloadSnapshot(): Promise<void> {
+    if (!this.startupMode || this.loading) return;
+    this.stop();
+    const workspace: SnapshotWorkspace = {
+      sessions: this.sessions.map(s => ({
+        source: s.model.getValue(), fileName: s.fileName, cmdline: s.cmdline.value,
+        binary: s.binary, binaryText: s.binModel?.getValue() ?? null,
+        dirty: s.dirty, sourceModified: this.sourceModified(s),
+        addrBps: [...s.addrBps], sourceBps: this.editor.breakpointLines(s.model), record: s.record,
+      })),
+      active: this.active, speed: $<HTMLSelectElement>('speed').value,
+      showDiskImages: document.body.classList.contains('show-disk-images'),
+      chinese: this.cur.screen.chinese, showBytes: $<HTMLInputElement>('show-bytes').checked,
+      fullscreenCapture: $<HTMLInputElement>('fullscreen-capture').checked,
+    };
+    this.snapshotBusy(true);
+    this.setStatus('正在保存完整快照（包含所有磁盘）…', '');
+    try {
+      const saving = saveSnapshot(this.dual, this.startupMode, workspace);
+      for (const s of this.live) s.m.pause();
+      const blob = await saving;
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'AsmPerfect-' + new Date().toISOString().replace(/[:.]/g, '-') + '.asmsnap';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60_000);
+      this.setStatus('快照已生成并开始下载；虚拟机已暂停', '');
+      this.addMessage('ok', `完整快照已生成（${(blob.size / 1024 / 1024).toFixed(1)} MB）。请保留下载的 .asmsnap 文件。`);
+    } catch (e) {
+      for (const s of this.live) s.m.pause();
+      const message = '保存快照失败：' + (e as Error).message;
+      this.addMessage('error', message);
+      this.setStatus(message, 'error');
+      this.setTab('messages');
+    } finally { this.snapshotBusy(false); this.render(true); }
+  }
+
+  private async restoreSnapshot(file: File): Promise<void> {
+    if (this.startupMode || this.loading) throw new Error('请先返回启动选择，再载入快照');
+    this.snapshotBusy(true);
+    try {
+      const restored = await loadSnapshot(file);
+      const { dual, mode, workspace } = restored;
+      this.dual = dual;
+      this.startupMode = mode;
+      this.mode = mode === 'dual' ? 'dual' : 'single';
+      this.active = workspace.active;
+      this.messages = [];
+      this.run = 'idle';
+      this.tempBp = null;
+      this.resetLayout();
+      $<HTMLInputElement>('show-bytes').checked = workspace.showBytes ?? false;
+      $<HTMLInputElement>('fullscreen-capture').checked = workspace.fullscreenCapture ?? false;
+      for (const c of document.querySelectorAll<HTMLInputElement>('.cn-toggle')) c.checked = workspace.chinese ?? false;
+      if (!this.sessions.length) this.createSessions();
+      else for (const s of this.sessions) {
+        const events = s.m.events;
+        s.m = dual.m[s.i];
+        s.m.events = events;
+      }
+      for (const s of this.sessions) {
+        const saved = workspace.sessions[s.i];
+        this.editor.setText(s.model, saved.source);
+        s.sourceVersion = saved.sourceModified ? -1 : s.model.getAlternativeVersionId();
+        s.fileName = saved.fileName;
+        s.cmdline.value = saved.cmdline;
+        s.binary = saved.binary;
+        if (saved.binaryText !== null) {
+          if (!s.binModel) s.binModel = this.editor.createModel('');
+          this.editor.setText(s.binModel, saved.binaryText);
+        }
+        s.program = s.m.program;
+        s.dirty = saved.dirty;
+        s.record = saved.record;
+        s.snapshotLoaded = !!s.program;
+        s.snap = null;
+        s.addrBps = new Set(saved.addrBps);
+        this.editor.setProgram(s.model, s.dirty ? null : s.program, [], $<HTMLInputElement>('show-bytes').checked);
+        this.editor.setBreakpoints(s.model, saved.sourceBps);
+        s.screen.allKeys = s.program?.format === 'boot';
+        s.screen.fullscreenCapture = workspace.fullscreenCapture ?? false;
+        s.screen.setChinese(workspace.chinese ?? false);
+        s.screen.invalidate();
+        s.speaker.mute();
+        s.speaker.set(s.m.speakerFreq);
+        s.box.classList.toggle('hidden', s.i === 1 && this.mode !== 'dual');
+        s.box.classList.toggle('active', this.mode === 'dual' && s.i === this.active);
+        s.box.querySelector('.screen-title')!.textContent = this.mode === 'dual' ? `${s.tag} 机屏幕` : 'DOS 屏幕';
+        s.box.querySelector('.screen-hint')?.classList.toggle('hidden', this.mode === 'dual');
+      }
+      document.body.classList.add('has-session');
+      document.body.classList.toggle('full-mode', mode === 'full');
+      document.body.classList.toggle('show-disk-images', workspace.showDiskImages);
+      $('mode-name').textContent = { debug: '直接调试', dual: '双机对联', full: '完整模拟' }[mode];
+      $('startup-error').textContent = '';
+      $<HTMLSelectElement>('cpu').value = this.cur.m.cpuModel;
+      $<HTMLSelectElement>('wiring').value = dual.link.wiring;
+      $<HTMLSelectElement>('uart-mode').value = this.cur.m.com1.bufferedTx ? 'buffered' : 'real';
+      $<HTMLInputElement>('disk-latency').checked = this.cur.m.diskLatency;
+      $<HTMLSelectElement>('speed').value = workspace.speed;
+      this.showDoc(this.cur);
+      this.renderTabs();
+      this.disasm.follow();
+      if (this.cur.program) this.memory.go(this.cur.program.dataSeg, 0);
+      this.setTab(mode === 'full' ? 'files' : 'disasm');
+      this.render(true);
+      this.save();
+      this.setStatus('快照已还原，虚拟机已暂停。点击“运行”继续', '');
+      this.addMessage('ok', `已还原快照 ${file.name}。没有重新启动客体系统；点击“运行”从保存位置继续。`);
+      try { await this.drives!.adoptSnapshot(); }
+      catch (e) {
+        this.addMessage('error', '快照已还原，但无法将磁盘保存到浏览器：' + (e as Error).message);
+        this.setStatus('快照已还原并暂停，但浏览器磁盘保存失败；请保留快照文件', 'error');
+      }
+      window.dispatchEvent(new Event('resize'));
+    } catch (e) {
+      throw new Error('载入快照失败：' + (e as Error).message);
+    } finally { this.snapshotBusy(false); }
+  }
+
   private newFile(): void {
     const s = this.cur;
     if (this.sourceModified(s) && !confirm('当前代码已修改，确定放弃修改并新建空白源文件吗？')) return;
@@ -523,6 +656,7 @@ class App {
     s.fileName = '';
     s.program = null;
     s.dirty = true;
+    s.snapshotLoaded = false;
     s.snap = null;
     s.addrBps.clear();
     s.m.unload();
@@ -865,6 +999,7 @@ class App {
   // ======================= 汇编与装载 =======================
 
   private markDirty(s: Session): void {
+    s.snapshotLoaded = false;
     if (!s.dirty) {
       s.dirty = true;
       this.editor.showBytes(s.model, null, false);
@@ -876,6 +1011,7 @@ class App {
 
   /** 汇编一个会话的源程序（不装载） */
   private assemble(s: Session, showMessages: boolean): boolean {
+    s.snapshotLoaded = false;
     if (s.binary) { s.binary = null; if (s === this.cur) this.showDoc(s); }
     let p: Program;
     try {
@@ -928,6 +1064,7 @@ class App {
   /** 装载所有会话的程序（双机时两台机器一起从头开始） */
   private loadAll(): void {
     for (const s of this.live) {
+      s.snapshotLoaded = false;
       s.screen.allKeys = s.program?.format === 'boot';
       if (!s.program) continue;
       s.m.load(s.program, s.cmdline.value, s.binary ?? 'PROGRAM.EXE');
@@ -945,7 +1082,7 @@ class App {
 
   private ensureReady(): boolean {
     if (this.startupMode === 'full') return !!this.cur.program;
-    if (this.live.some(s => !s.binary && (s.dirty || !s.program))) return this.assembleAll(true);
+    if (this.live.some(s => !s.binary && !s.snapshotLoaded && (s.dirty || !s.program))) return this.assembleAll(true);
     return true;
   }
 
@@ -1202,7 +1339,7 @@ class App {
   }
 
   private key(s: Session, e: KeyEvent): void {
-    if (!s.program || s.dirty) return;
+    if (this.loading || !s.program || (s.dirty && !s.snapshotLoaded)) return;
     s.m.pressKey(e);
     this.afterKey(s);
   }
@@ -1258,9 +1395,10 @@ class App {
     this.stack.setProgram(s.program);
     this.stack.render(m, s.snap);
     for (const x of this.live) {
+      if (x.m.poweredOff) x.screen.release();
       x.box.classList.toggle('no-video', !x.m.config.vga);
       const mem = x.m.mem, bda = 0x400;
-      x.screen.relative = x.m.serialMouse.active;
+      x.screen.relative = !x.m.poweredOff && x.m.serialMouse.active;
       if (x.m.config.vga) x.screen.render(mem, mem[bda + 0x51], mem[bda + 0x50], mem[bda + 0x60] | (mem[bda + 0x61] << 8), x.m.video, x.m.mouseDriverEnabled ? x.m.mouse : undefined);
     }
     if (full || this.run === 'animate') {
