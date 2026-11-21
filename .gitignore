@@ -8,3 +8,4 @@ deploy/
 release.bat
 release.ps1
 .dockerignore
+tmp/
