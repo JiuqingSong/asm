@@ -21,7 +21,7 @@ page.on('dialog', d => d.accept());
 page.on('pageerror', e => errors.push(e.message));
 await page.evaluateOnNewDocument(() => { try { localStorage.clear(); indexedDB.deleteDatabase('asm86-disks'); } catch { /* */ } });
 await page.goto(process.env.URL || 'http://localhost:5317/', { waitUntil: 'networkidle0' });
-await enterMode(page, 'full');
+await enterMode(page, 'full', false, !!process.env.ISO);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 await page.select('#cpu', '386');

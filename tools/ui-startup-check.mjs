@@ -188,8 +188,9 @@ try {
       page.waitForFileChooser(), page.click('#drives [data-act="cd-insert"]'),
     ]);
     await chooser.accept([file]);
-    await page.waitForFunction(name => window.__app.cur.m.cdrom.discName === name, {}, file === floppyIso ? 'floppy.iso' : 'noemu.iso');
-    await page.click('[data-boot="224"]');
+    await page.waitForFunction(name => window.__app.cur.m.cdrom.discName === name && document.querySelector('#drives').textContent.includes(name), {}, file === floppyIso ? 'floppy.iso' : 'noemu.iso');
+    // "从这里启动"在磁盘面板里，放入光盘后面板会重画几次；在页面里点当前的按钮，避免拿到已被替换的元素
+    await page.evaluate(() => document.querySelector('[data-boot="224"]').click());
     await page.waitForFunction(() => !document.getElementById('boot-choice').open);
     assert.equal(await page.evaluate(() => window.__app.cur.m.mem[0x7c02]), 0x44);
     assert.equal(await page.evaluate(() => window.__app.cur.m.cpu.r[2] & 0xff), drive);

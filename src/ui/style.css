@@ -321,6 +321,16 @@ table.vars a { color: var(--accent); cursor: pointer; text-decoration: none; }
 .drive-row .dl { width: 22px; flex: none; font-family: var(--mono); }
 .drive-row .fn { max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .drive-row select { height: 24px; font-size: 12px; }
+/* "从这里启动"：只在"选择启动设备"对话框里显示，A:、C:、光驱各用一种底色 */
+.boot-slot { display: none; }
+#boot-media .boot-slot { display: inline-flex; flex: none; width: 96px; }
+#boot-choice .dialog-actions { align-items: center; flex-wrap: nowrap; }
+#boot-choice .dialog-actions p { margin: 0; }
+.boot-here { font-weight: 600; color: #fff; border-color: transparent; }
+.boot-here.boot-a { background: #2f8f5b; }
+.boot-here.boot-c { background: #2d6fd2; }
+.boot-here.boot-cd { background: #c4711d; }
+.boot-here:hover:not(:disabled) { border-color: var(--text); filter: brightness(1.1); }
 .drive-boot { display: flex; gap: 6px; padding: 6px 10px 10px; border-bottom: 1px solid var(--border); }
 #tab-disasm:not(.hidden) { display: flex; flex-direction: column; overflow: hidden; }
 #tab-disasm .dis-list { flex: 1; min-height: 0; overflow: hidden; }

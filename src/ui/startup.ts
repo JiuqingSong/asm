@@ -1,18 +1,18 @@
 import { CONFIG_OPTIONS, DEFAULT_CONFIG, configWarnings, type MachineConfig, type StartupMode } from '../machine/config.ts';
-import { CPU_SPEEDS, CD_BOOT, type CpuSpeedId, type Machine } from '../machine/machine.ts';
+import { CPU_SPEEDS, type CpuSpeedId } from '../machine/machine.ts';
 
 export class StartupPanel {
   private configDialog = document.getElementById('startup-config') as HTMLDialogElement;
   private bootDialog = document.getElementById('boot-choice') as HTMLDialogElement;
   private selected: 'debug' | 'full' = 'debug';
   private busy = false;
-  private launch: (mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean) => Promise<void>;
+  private launch: (mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean, driveD: boolean) => Promise<void>;
   private currentCpu: () => CpuSpeedId;
   private error: (message: string) => void;
   private snapshotInput: HTMLInputElement;
 
   constructor(
-    launch: (mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean) => Promise<void>,
+    launch: (mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean, driveD: boolean) => Promise<void>,
     currentCpu: () => CpuSpeedId,
     error: (message: string) => void,
     restoreSnapshot: (file: File) => Promise<void>,
@@ -41,7 +41,7 @@ export class StartupPanel {
     };
     for (const b of document.querySelectorAll<HTMLButtonElement>('[data-start]')) b.onclick = () => {
       const mode = b.dataset.start;
-      if (mode === 'dual') void this.enter('dual', DEFAULT_CONFIG, this.currentCpu(), true);
+      if (mode === 'dual') void this.enter('dual', DEFAULT_CONFIG, this.currentCpu(), true, true);
       else if (mode === 'debug' || mode === 'full') this.configure(mode);
       else if (mode === 'snapshot') this.snapshotInput.click();
     };
@@ -51,8 +51,9 @@ export class StartupPanel {
       const config = this.read();
       const cpu = (document.getElementById('config-cpu') as HTMLSelectElement).value as CpuSpeedId;
       const showDiskImages = this.selected === 'debug' && (document.getElementById('config-images') as HTMLInputElement).checked;
+      const driveD = this.selected !== 'full' || (document.getElementById('config-drive-d') as HTMLInputElement).checked;
       this.configDialog.close();
-      void this.enter(this.selected, config, cpu, showDiskImages);
+      void this.enter(this.selected, config, cpu, showDiskImages, driveD);
     };
     document.getElementById('config-cancel')!.onclick = () => this.configDialog.close();
     document.getElementById('config-defaults')!.onclick = () => this.configure(this.selected);
@@ -61,11 +62,11 @@ export class StartupPanel {
     for (const c of CPU_SPEEDS) cpu.add(new Option(c.name, c.id));
   }
 
-  private async enter(mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean): Promise<void> {
+  private async enter(mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages: boolean, driveD: boolean): Promise<void> {
     if (this.busy) return;
     this.busy = true;
     document.getElementById('launcher')!.setAttribute('inert', '');
-    try { await this.launch(mode, config, cpu, showDiskImages); }
+    try { await this.launch(mode, config, cpu, showDiskImages, driveD); }
     catch (e) { this.error((e as Error).message); }
     finally {
       this.busy = false;
@@ -92,6 +93,8 @@ export class StartupPanel {
     (document.getElementById('config-cpu') as HTMLSelectElement).value = this.currentCpu();
     document.getElementById('config-images-option')!.classList.toggle('hidden', mode !== 'debug');
     (document.getElementById('config-images') as HTMLInputElement).checked = false;
+    document.getElementById('config-drive-d-option')!.classList.toggle('hidden', mode !== 'full');
+    (document.getElementById('config-drive-d') as HTMLInputElement).checked = false;
     this.warnings();
     if (!this.configDialog.open) this.configDialog.showModal();
   }
@@ -117,32 +120,30 @@ export class StartupPanel {
     document.getElementById('config-warnings')!.textContent = warnings.join('\n');
   }
 
-  async boot(m: Machine, start: (drive: number) => Promise<boolean>): Promise<boolean> {
+  async boot(start: (drive: number) => Promise<boolean>): Promise<boolean> {
     const drives = document.getElementById('drives')!;
     const parent = drives.parentElement!;
     document.getElementById('boot-media')!.appendChild(drives);
-    const buttons = [...this.bootDialog.querySelectorAll<HTMLButtonElement>('[data-boot]')];
     let working = false;
     let success = false;
-    for (const b of buttons) {
+    // "从这里启动"按钮由磁盘面板画在 A:、C:、光驱那几行左边；面板会重画，所以在对话框上统一接收点击
+    this.bootDialog.onclick = async e => {
+      const b = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-boot]');
+      if (!b || b.disabled || working) return;
       const drive = Number(b.dataset.boot);
-      b.disabled = drive === CD_BOOT ? !m.config.cdrom : drive === 0 ? !m.floppyInstalled(0) : !m.config.ide;
-      b.onclick = async () => {
-        if (working) return;
-        working = true;
-        this.bootDialog.setAttribute('aria-busy', 'true');
-        try {
-          success = await start(drive);
-          if (success) this.bootDialog.close();
-        } catch (e) {
-          this.error((e as Error).message);
-          document.getElementById('boot-error')!.textContent = (e as Error).message;
-        } finally {
-          working = false;
-          this.bootDialog.removeAttribute('aria-busy');
-        }
-      };
-    }
+      working = true;
+      this.bootDialog.setAttribute('aria-busy', 'true');
+      try {
+        success = await start(drive);
+        if (success) this.bootDialog.close();
+      } catch (err) {
+        this.error((err as Error).message);
+        document.getElementById('boot-error')!.textContent = (err as Error).message;
+      } finally {
+        working = false;
+        this.bootDialog.removeAttribute('aria-busy');
+      }
+    };
     const cancel = document.getElementById('boot-cancel') as HTMLButtonElement;
     cancel.onclick = () => { if (!working) this.bootDialog.close(); };
     this.bootDialog.oncancel = e => { if (working) e.preventDefault(); };

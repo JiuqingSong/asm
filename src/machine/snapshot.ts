@@ -28,6 +28,8 @@ export interface SnapshotWorkspace {
   sessions: SnapshotSession[];
   active: number; speed: string; showDiskImages: boolean;
   chinese?: boolean; showBytes?: boolean; fullscreenCapture?: boolean;
+  /** 是否启用 D: 盘（旧快照没有这一项，按启用处理） */
+  driveD?: boolean;
 }
 export interface LoadedSnapshot { dual: DualMachine; mode: StartupMode; workspace: SnapshotWorkspace }
 
@@ -93,7 +95,7 @@ function workspaceValid(w: unknown): w is SnapshotWorkspace {
   if (!w || typeof w !== 'object') return false;
   const a = w as SnapshotWorkspace;
   return Array.isArray(a.sessions) && a.sessions.length === 2 && integer(a.active, 1) && typeof a.speed === 'string' &&
-    typeof a.showDiskImages === 'boolean' && [a.chinese, a.showBytes, a.fullscreenCapture].every(v => v === undefined || typeof v === 'boolean') &&
+    typeof a.showDiskImages === 'boolean' && [a.chinese, a.showBytes, a.fullscreenCapture, a.driveD].every(v => v === undefined || typeof v === 'boolean') &&
     a.sessions.every(s => s && ['source', 'fileName', 'cmdline'].every(k => typeof (s as unknown as AnyObject)[k] === 'string') &&
       [s.binary, s.binaryText].every(v => v === null || typeof v === 'string') &&
       [s.dirty, s.sourceModified, s.record].every(v => typeof v === 'boolean') &&

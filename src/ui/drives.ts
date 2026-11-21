@@ -1,7 +1,7 @@
 // 磁盘映像面板（"虚拟磁盘"页上半部分）：软驱 A:、B:，硬盘 C:、D:（D: 也可以放光盘映像 .iso，变成只读硬盘）；插入/取出/新建/下载映像，从磁盘启动。
 // 映像保存在浏览器的 IndexedDB 里，刷新页面后还在（硬盘上装好的 DOS 不会丢）。
 // 光盘映像不读进内存：保存的是文件本身（Blob），DOS 读到哪里才从文件里读哪一段。
-import type { Machine } from '../machine/machine.ts';
+import { CD_BOOT, type Machine } from '../machine/machine.ts';
 import { Disk, blankHardDisk, blankFloppy, isFloppyImage } from '../machine/disk.ts';
 import { FatVolume } from '../machine/fat.ts';
 import { IsoDisk, BlobSource, BytesSource, isIsoFile } from '../machine/iso.ts';
@@ -68,6 +68,11 @@ export class DrivesPanel {
   private fileInput: HTMLInputElement;
   private saveTimers = new Map<string, number>();
   private pendingSaves = new Set<Promise<void>>();
+  /**
+   * 是否启用 D: 盘。不启用时不显示 D: 那一行，也不从浏览器里把 D: 的映像（硬盘或光盘 ISO）装进内存；
+   * 浏览器里保存的 D: 映像原样保留，下次启用时还在
+   */
+  driveD = true;
 
   constructor(el: HTMLElement, host: DriveHost) {
     this.el = el; this.host = host;
@@ -97,6 +102,7 @@ export class DrivesPanel {
     try {
       for (const { m, i } of this.host.machines()) {
         for (let k = 0; k < 4; k++) {
+          if (k === 3 && !this.driveD) { m.drives[3] = null; continue; }
           const v = await dbGet(`${i}:${k}`);
           try {
             if (v?.iso) m.drives[k] = await isoDisk(v.name, v.iso);
@@ -119,7 +125,7 @@ export class DrivesPanel {
     await Promise.all(this.pendingSaves);
     for (const { m, i } of this.host.machines()) {
       m.cdrom.onChange = () => this.render();
-      for (let k = 0; k < 4; k++) await this.persist(i, k);
+      for (let k = 0; k < (this.driveD ? 4 : 3); k++) await this.persist(i, k);
       const source = m.cdrom.source;
       let iso: Blob | null = null;
       if (source instanceof BlobSource) iso = source.blob;
@@ -379,7 +385,7 @@ export class DrivesPanel {
     try {
       const floppy = k < 2;
       if (!floppy && await isIsoFile(f)) {
-        if (k !== 3) throw new Error(`${f.name} 是光盘映像，请放进 D:（C: 要用来启动 DOS）`);
+        if (k !== 3) throw new Error(`${f.name} 是光盘映像，请放进${this.driveD ? ' D: 或' : ''}光驱（C: 要用来启动 DOS）`);
         const d = await isoDisk(f.name, f);
         this.machine(i).drives[k] = d;
         this.persist(i, k);
@@ -389,7 +395,8 @@ export class DrivesPanel {
         return;
       }
       const data = new Uint8Array(await f.arrayBuffer());
-      if (floppy && !isFloppyImage(data)) throw new Error(`${f.name} 不是标准大小的软盘映像（${data.length} 字节）。硬盘映像请放进 C: 或 D:，光盘映像（.iso）请放进 D:`);
+      if (floppy && !isFloppyImage(data)) throw new Error(`${f.name} 不是标准大小的软盘映像（${data.length} 字节）。` +
+        (this.driveD ? '硬盘映像请放进 C: 或 D:，光盘映像（.iso）请放进 D: 或光驱' : '硬盘映像请放进 C:，光盘映像（.iso）请放进光驱'));
       const disk = new Disk(f.name, data, floppy);
       this.machine(i).drives[k] = disk;
       this.persist(i, k);
@@ -412,10 +419,15 @@ export class DrivesPanel {
   }
 
   render(): void {
-    const parts: string[] = ['<div class="drives-head">磁盘映像：放入软盘或硬盘的映像文件（.img），可以从磁盘启动真的 DOS；光盘映像（.iso）可以放进光驱，也可以放在 D:（变成只读硬盘，DOS 不用装光驱驱动）</div>'];
+    const parts: string[] = ['<div class="drives-head">磁盘映像：放入软盘或硬盘的映像文件（.img），可以从磁盘启动真的 DOS；光盘映像（.iso）可以放进光驱' +
+      (this.driveD ? '，也可以放在 D:（变成只读硬盘，DOS 不用装光驱驱动）' : '') + '</div>'];
+    /** 行首的"从这里启动"按钮，只在"选择启动设备"对话框里显示（见 style.css 的 .boot-slot） */
+    const bootSlot = (i: number, drive: number | null, cls: string, enabled: boolean) => `<span class="boot-slot">` +
+      (drive === null ? '' : `<button class="boot-here ${cls}" data-boot="${drive}" data-i="${i}"${enabled ? '' : ' disabled'}>从这里启动</button>`) + '</span>';
     for (const { m, tag, i } of this.host.machines()) {
       if (this.host.dual()) parts.push(`<div class="pane-head sub">${tag} 机</div>`);
       for (let k = 0; k < 4; k++) {
+        if (k === 3 && !this.driveD) continue;
         const d = m.drives[k];
         const installed = k < 2 ? m.floppyInstalled(k) : m.config.ide;
         const at = `data-i="${i}" data-drive="${k}"`;
@@ -433,11 +445,12 @@ export class DrivesPanel {
         }
         if (d && !d.iso) btns = `<button data-act="browse" ${at} title="查看、放入、取出映像里的文件">${this.browse?.i === i && this.browse.k === k ? '收起文件' : '文件'}</button>` + btns;
         if (d) btns += (d.iso ? '' : `<button data-act="download" ${at} title="把映像文件下载到电脑上保存">下载</button>`) + `<button data-act="eject" ${at} title="${k < 2 ? '取出软盘' : '拿掉这个硬盘（浏览器里保存的映像也会删除）'}">${k < 2 ? '取出' : '移除'}</button>`;
-        parts.push(`<div class="file-row drive-row"><b class="dl">${LETTERS[k]}</b>${installed ? '' : '<span class="note">未安装（映像保留）</span>'}${info}<span class="spacer"></span>${btns}</div>`);
+        const slot = k === 0 ? bootSlot(i, 0, 'boot-a', installed) : k === 2 ? bootSlot(i, 0x80, 'boot-c', installed) : bootSlot(i, null, '', false);
+        parts.push(`<div class="file-row drive-row">${slot}<b class="dl">${LETTERS[k]}</b>${installed ? '' : '<span class="note">未安装（映像保留）</span>'}${info}<span class="spacer"></span>${btns}</div>`);
         if (this.browse && this.browse.i === i && this.browse.k === k) parts.push(this.renderBrowser());
       }
       const disc = m.cdrom.discName;
-      parts.push(`<div class="file-row drive-row"><b class="dl" title="IDE 第二通道上的 ATAPI 光驱">光驱</b>${m.config.cdrom ? '' : '<span class="note">未安装（映像保留）</span>'}` +
+      parts.push(`<div class="file-row drive-row">${bootSlot(i, CD_BOOT, 'boot-cd', m.config.cdrom)}<b class="dl" title="IDE 第二通道上的 ATAPI 光驱">光驱</b>${m.config.cdrom ? '' : '<span class="note">未安装（映像保留）</span>'}` +
         (disc ? `<span class="fn" title="${esc(disc)}">${esc(disc)}</span><span class="note">${Math.round(m.cdrom.discSize / 1024 / 1024)}MB</span>` : '<span class="note">（没有光盘）</span>') +
         `<span class="spacer"></span><button data-act="cd-insert" data-i="${i}" title="选择一个光盘映像文件（.iso）放进光驱">${disc ? '换光盘' : '放入光盘'}</button>` +
         (disc ? `<button data-act="cd-eject" data-i="${i}" title="取出光盘">弹出</button>` : '') + '</div>');

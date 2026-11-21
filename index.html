@@ -178,6 +178,9 @@
       <label id="config-images-option" class="check">
         <input type="checkbox" id="config-images" /> 显示磁盘映像文件系统（软盘、硬盘和光驱）
       </label>
+      <label id="config-drive-d-option" class="check">
+        <input type="checkbox" id="config-drive-d" /> D: 盘（第二块硬盘映像，或把光盘映像 .iso 映射成只读硬盘）
+      </label>
       <p id="config-warnings" class="config-warnings"></p>
       <div class="dialog-actions">
         <button type="button" id="config-defaults">恢复默认</button>
@@ -189,11 +192,8 @@
   </dialog>
   <dialog id="boot-choice" class="startup-dialog">
     <h2>选择启动设备</h2>
-    <p>可以先在下方装入或更换映像。重启会再次询问；客体热启动沿用本次启动源。</p>
     <div class="dialog-actions">
-      <button data-boot="0">从 A: 启动</button>
-      <button data-boot="128">从 C: 启动</button>
-      <button data-boot="224">从光盘启动</button>
+      <p>可以先在下方装入或更换映像，再点那一行左边的“从这里启动”。重启会再次询问；客体热启动沿用本次启动源。</p>
       <span class="spacer"></span>
       <button id="boot-cancel">取消</button>
     </div>

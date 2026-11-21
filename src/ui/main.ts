@@ -102,7 +102,7 @@ class App {
       hover: (model, w, line, text) => this.hover(this.byModel(model), w, line, text),
     });
     this.startup = new StartupPanel(
-      (mode, config, cpu, showDiskImages) => this.launch(mode, config, cpu, showDiskImages),
+      (mode, config, cpu, showDiskImages, driveD) => this.launch(mode, config, cpu, showDiskImages, driveD),
       () => CPU_SPEEDS.find(c => c.id === store.get('cpu'))?.id ?? '8088',
       message => { $('startup-error').textContent = message; this.addMessage('error', message); },
       file => this.restoreSnapshot(file),
@@ -203,7 +203,7 @@ class App {
     return w && w in WIRING_DESC ? (w as Wiring) : 'loopback-rts';
   }
 
-  private async launch(mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages = mode !== 'debug'): Promise<void> {
+  private async launch(mode: StartupMode, config: Readonly<MachineConfig>, cpu: CpuSpeedId, showDiskImages = mode !== 'debug', driveD = true): Promise<void> {
     if (this.startupMode) await this.goHome();
     this.startupMode = mode;
     this.active = 0;
@@ -233,6 +233,7 @@ class App {
     const workspace = document.querySelector<HTMLElement>('.layout')!;
     const toolbar = document.querySelector<HTMLElement>('.toolbar')!;
     workspace.inert = toolbar.inert = true;
+    this.drives!.driveD = driveD;
     try { await this.drives!.restore(); }
     finally { this.loading = false; workspace.inert = toolbar.inert = false; }
     for (const warning of configWarnings(config)) this.addMessage('warning', warning);
@@ -272,7 +273,7 @@ class App {
     this.cur.screen.release();
     this.drives?.render();
     try {
-      const started = await this.startup.boot(this.cur.m, async drive =>
+      const started = await this.startup.boot(async drive =>
         drive === CD_BOOT ? this.runCdBoot(this.cur) : this.runBoot(this.cur, drive));
       if (!started && running) this.start();
       else if (!started) this.setStatus('未选择启动设备。点“重启”或“运行”重新选择', '');
@@ -541,6 +542,7 @@ class App {
       })),
       active: this.active, speed: $<HTMLSelectElement>('speed').value,
       showDiskImages: document.body.classList.contains('show-disk-images'),
+      driveD: this.drives!.driveD,
       chinese: this.cur.screen.chinese, showBytes: $<HTMLInputElement>('show-bytes').checked,
       fullscreenCapture: $<HTMLInputElement>('fullscreen-capture').checked,
     };
@@ -639,6 +641,7 @@ class App {
       this.save();
       this.setStatus('快照已还原，虚拟机已暂停。点击“运行”继续', '');
       this.addMessage('ok', `已还原快照 ${file.name}。没有重新启动客体系统；点击“运行”从保存位置继续。`);
+      this.drives!.driveD = workspace.driveD ?? true;
       try { await this.drives!.adoptSnapshot(); }
       catch (e) {
         this.addMessage('error', '快照已还原，但无法将磁盘保存到浏览器：' + (e as Error).message);
