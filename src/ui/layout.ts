@@ -108,7 +108,7 @@ export function setupLayout(onChange: () => void): () => void {
   window.addEventListener('keydown', e => {
     if (e.key !== 'Escape' || !layout.classList.contains('has-max')) return;
     const t = e.target as HTMLElement;
-    if (t.closest('.screen, .monaco-editor, input, select')) return;
+    if (t.closest('.screen, .monaco-editor, input, select, textarea')) return;
     const p = layout.querySelector('.pane.maxed') as HTMLElement | null;
     if (p) toggleMax(p);
   });

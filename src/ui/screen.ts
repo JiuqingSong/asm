@@ -1,5 +1,5 @@
 // DOS 文本屏幕（80×25，B800:0000）的渲染与键盘输入
-import { SCAN, type KeyEvent } from '../machine/devices.ts';
+import { SCAN, scanForChar, type KeyEvent } from '../machine/devices.ts';
 import { modeInfo, MODE_UNCHAINED, type Video } from '../machine/video.ts';
 import type { Mouse } from '../machine/mouse.ts';
 
@@ -34,6 +34,19 @@ const PALETTE = [
 ];
 
 const COLS = 80, ROWS = 25;
+
+/** 触屏设备（手机、平板）：div 拿不到键盘焦点，用隐藏的文本框接收软键盘和外接键盘的输入 */
+const TOUCH = typeof window !== 'undefined' && (('ontouchstart' in window) || (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches));
+
+/** 软键盘没有的键：放在屏幕下方的一排按钮里 */
+const TOUCH_KEYS: [label: string, code: string][] = [
+  ['⌨', ''], ['Esc', 'Escape'], ['Tab', 'Tab'], ['Ctrl', 'ControlLeft'], ['Alt', 'AltLeft'], ['Shift', 'ShiftLeft'],
+  ['←', 'ArrowLeft'], ['↑', 'ArrowUp'], ['↓', 'ArrowDown'], ['→', 'ArrowRight'],
+  ['Home', 'Home'], ['End', 'End'], ['PgUp', 'PageUp'], ['PgDn', 'PageDown'], ['Ins', 'Insert'], ['Del', 'Delete'],
+  ['F1', 'F1'], ['F2', 'F2'], ['F3', 'F3'], ['F4', 'F4'], ['F5', 'F5'], ['F6', 'F6'], ['F7', 'F7'], ['F8', 'F8'],
+  ['F9', 'F9'], ['F10', 'F10'], ['F11', 'F11'], ['F12', 'F12'],
+];
+const SHIFTED = '~!@#$%^&*()_+{}|:"<>?';
 
 // ---------- 中文显示（模拟 UCDOS 等中文 DOS）----------
 // 制表符（CP437 B3h~DAh）与 GBK 的编码范围重叠，例如 C9 CD 既是"╔═"又是"赏"。
@@ -219,6 +232,7 @@ export class Screen {
     el.addEventListener('blur', () => this.releaseAll());
     window.addEventListener('blur', () => { this.releaseAll(); this.releasingControlRight = false; });
     const wrap = el.parentElement!;
+    if (TOUCH) this.setupTouch(wrap);
     new ResizeObserver(() => this.fit(wrap)).observe(wrap);
     window.addEventListener('resize', () => this.fit(wrap));
   }
@@ -531,7 +545,140 @@ export class Screen {
     }
   }
 
-  focus(): void { this.el.focus(); }
+  focus(): void {
+    if (this.proxy) this.proxy.focus({ preventScroll: true });
+    else this.el.focus();
+  }
+
+  // ---------- 触屏设备的键盘 ----------
+  private proxy: HTMLTextAreaElement | null = null;
+  /** 粘滞的修饰键（Ctrl、Alt、Shift 按钮按一下，对下一个键有效） */
+  private sticky = new Set<string>();
+  private stickyButtons = new Map<string, HTMLButtonElement>();
+
+  private setupTouch(wrap: HTMLElement): void {
+    const t = document.createElement('textarea');
+    t.className = 'key-proxy';
+    for (const [k, v] of [['autocapitalize', 'off'], ['autocomplete', 'off'], ['autocorrect', 'off'], ['spellcheck', 'false'], ['enterkeyhint', 'enter'], ['aria-label', 'DOS 键盘输入']])
+      t.setAttribute(k, v);
+    wrap.appendChild(t);
+    this.proxy = t;
+    // 轻点之后浏览器补发的 mousedown 会把焦点移到屏幕 div（或者移走）：取消它的默认动作，焦点留在文本框
+    this.el.removeAttribute('tabindex');
+    const hint = wrap.closest('.screen-box')?.querySelector('.screen-hint');
+    if (hint) hint.textContent = '轻点屏幕弹出键盘';
+    wrap.addEventListener('mousedown', e => { if (e.target !== t) e.preventDefault(); });
+    // 文本框里留两个空格：内容为空时有的软键盘按退格不产生任何事件
+    const reset = () => { t.value = '  '; t.setSelectionRange(2, 2); };
+    reset();
+    t.addEventListener('focus', reset);
+    t.addEventListener('blur', () => this.releaseAll());
+    let handledAt = -1;
+    t.addEventListener('keydown', e => {
+      handledAt = -1; // 只跳过紧跟在已处理的 keydown 后面的 input
+      if (e.isComposing || e.keyCode === 229 || e.key === 'Unidentified') return; // 交给 input 事件
+      if (SCAN[e.code] !== undefined) {
+        // 外接键盘：和桌面一样按物理键处理（按下、松开分开发送）
+        this.key(e, false);
+        if (e.defaultPrevented) handledAt = e.timeStamp;
+        return;
+      }
+      // 软键盘：通常只有 key，没有 code
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const named: Record<string, string> = { Backspace: 'Backspace', Enter: 'Enter', Tab: 'Tab', Escape: 'Escape', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight', ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown', Delete: 'Delete' };
+      if (named[e.key]) { e.preventDefault(); handledAt = e.timeStamp; this.tapCode(named[e.key]); }
+      else if (e.key.length === 1 && e.key.charCodeAt(0) < 128) { e.preventDefault(); handledAt = e.timeStamp; this.typeChar(e.key); }
+    });
+    t.addEventListener('keyup', e => { if (SCAN[e.code] !== undefined && e.keyCode !== 229) this.key(e, true); });
+    t.addEventListener('input', e => {
+      const ie = e as InputEvent;
+      // keydown 已经处理过（个别浏览器取消了 keydown 仍会改文本框）
+      if (handledAt >= 0 && ie.timeStamp - handledAt < 100) { reset(); return; }
+      if (ie.isComposing) return; // 输入法正在组字：等组字结束
+      const type = ie.inputType;
+      if (type === 'deleteContentBackward') this.tapCode('Backspace');
+      else if (type === 'deleteContentForward') this.tapCode('Delete');
+      else if (type === 'insertLineBreak' || type === 'insertParagraph') this.tapCode('Enter');
+      else if (ie.data) for (const ch of ie.data) this.typeChar(ch);
+      else if (t.value.length > 2) for (const ch of t.value.slice(2)) this.typeChar(ch);
+      reset();
+    });
+    t.addEventListener('compositionend', e => {
+      for (const ch of e.data ?? '') this.typeChar(ch);
+      reset();
+    });
+    // 轻点屏幕弹出软键盘（必须在触摸事件里直接调用 focus，iOS 才会弹出）
+    let sx = 0, sy = 0;
+    this.el.addEventListener('touchstart', e => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; }, { passive: true });
+    this.el.addEventListener('touchend', e => {
+      const c = e.changedTouches[0];
+      if (Math.abs(c.clientX - sx) < 10 && Math.abs(c.clientY - sy) < 10) this.focus();
+    });
+    // 额外按键
+    const bar = document.createElement('div');
+    bar.className = 'touch-keys';
+    for (const [label, code] of TOUCH_KEYS) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      if (!code) b.title = '显示 / 收起键盘';
+      if (/^(Control|Alt|Shift)/.test(code)) this.stickyButtons.set(code, b);
+      // pointerdown 时取消默认动作：按钮不抢焦点，软键盘不会收起
+      b.addEventListener('pointerdown', e => {
+        e.preventDefault();
+        if (!code) { if (document.activeElement === t) t.blur(); else this.focus(); return; }
+        if (this.stickyButtons.has(code)) {
+          if (this.sticky.has(code)) this.sticky.delete(code); else this.sticky.add(code);
+          b.classList.toggle('on', this.sticky.has(code));
+          return;
+        }
+        this.tapCode(code);
+      });
+      bar.appendChild(b);
+    }
+    wrap.after(bar);
+  }
+
+  /** 输入一个字符（软键盘）：大写字母和上档符号同时按下 Shift */
+  private typeChar(ch: string): void {
+    if (ch === '\r' || ch === '\n') { this.tapCode('Enter'); return; }
+    const c = ch.charCodeAt(0);
+    if (c >= 128) return; // 西文 DOS 键盘打不出来
+    const scan = scanForChar(ch);
+    if (!scan) return;
+    const shift = (ch >= 'A' && ch <= 'Z') || SHIFTED.includes(ch);
+    this.tap(scan, c, shift);
+  }
+
+  /** 按一下并松开某个键（按 KeyboardEvent.code） */
+  private tapCode(code: string): void {
+    const scan = SCAN[code];
+    if (scan === undefined) return;
+    const ascii = ({ Enter: 13, Backspace: 8, Tab: 9, Escape: 27, Space: 32 } as Record<string, number>)[code] ?? 0;
+    this.tap(scan, ascii, false);
+  }
+
+  private tap(scan: number, ascii: number, shift: boolean): void {
+    if (!this.onKey) return;
+    const mods: number[] = [];
+    const ctrl = this.sticky.has('ControlLeft'), alt = this.sticky.has('AltLeft');
+    if (ctrl) mods.push(SCAN.ControlLeft);
+    if (alt) mods.push(SCAN.AltLeft);
+    if (shift || this.sticky.has('ShiftLeft')) {
+      mods.push(SCAN.ShiftLeft);
+      if (ascii >= 0x61 && ascii <= 0x7a) ascii -= 0x20;
+    }
+    if (ctrl && ((ascii >= 0x41 && ascii <= 0x5a) || (ascii >= 0x61 && ascii <= 0x7a))) ascii &= 0x1f;
+    if (alt) ascii = 0;
+    for (const m of mods) this.onKey({ scan: m, ascii: 0, release: false });
+    this.onKey({ scan, ascii, release: false });
+    this.onKey({ scan: scan | 0x80, ascii: 0, release: true });
+    for (const m of mods.reverse()) this.onKey({ scan: m | 0x80, ascii: 0, release: true });
+    if (this.sticky.size) {
+      this.sticky.clear();
+      for (const b of this.stickyButtons.values()) b.classList.remove('on');
+    }
+  }
 
   /** 从磁盘启动时为 true：功能键全部交给虚拟机里的程序（DOS 安装程序要用 F3、F5、F8 等） */
   allKeys = false;

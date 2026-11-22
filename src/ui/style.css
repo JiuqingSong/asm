@@ -157,6 +157,20 @@ body.resizing.h { cursor: row-resize; }
 .screen-pane.sized .screen-wrap, .screen-pane.maxed .screen-wrap, .screen-pane:fullscreen .screen-wrap { flex: 1; min-height: 0; overflow: hidden; align-items: center; }
 .screen-pane.sized .screens, .screen-pane.maxed .screens, .screen-pane:fullscreen .screens { min-height: 0; }
 .screen { box-shadow: 0 0 0 1px #2a2a2a; }
+.screen-wrap:has(.key-proxy) { position: relative; }
+/* 触屏设备：接收键盘输入的隐藏文本框（字号 16px，iOS 聚焦时才不会放大页面） */
+.key-proxy {
+  position: absolute; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; border: 0; padding: 0; margin: 0;
+  font-size: 16px; resize: none; overflow: hidden; color: transparent; background: transparent; caret-color: transparent;
+}
+.screen-wrap:has(.key-proxy:focus) .screen { box-shadow: 0 0 0 2px var(--accent); }
+.touch-keys { display: flex; gap: 4px; overflow-x: auto; padding: 6px 8px; background: #0b0b0b; -webkit-overflow-scrolling: touch; }
+.touch-keys button {
+  flex: none; min-width: 40px; height: 34px; padding: 0 8px; font: 13px var(--mono); color: #ddd; background: #262626;
+  border: 1px solid #3a3a3a; border-radius: 5px; touch-action: manipulation; user-select: none; -webkit-user-select: none;
+}
+.touch-keys button:active { background: #3a3a3a; }
+.touch-keys button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
 .screen {
   position: relative; font-family: var(--mono); line-height: 1.18; white-space: pre; color: #aaa; background: #000;
   outline: none; cursor: text; font-size: 13px; user-select: text;

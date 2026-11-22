@@ -410,7 +410,7 @@ class App {
       if (!this.startupMode || this.loading || document.querySelector('dialog[open]')) return;
       const k = e.key;
       // 从磁盘启动、DOS 屏幕有焦点时，功能键交给虚拟机（调试请用工具栏按钮）
-      if (/^F\d+$/.test(k) && (e.target as HTMLElement).closest?.('.screen') && this.cur.program?.format === 'boot') return;
+      if (/^F\d+$/.test(k) && (e.target as HTMLElement).closest?.('.screen, .key-proxy') && this.cur.program?.format === 'boot') return;
       let handled = true;
       if (k === 'F5' && e.ctrlKey) this.restart();
       else if (k === 'F5') this.start();
