@@ -66,18 +66,24 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\build\asm86-native.exe --create-hard 'D:\images\win95.img' 504 --cpu 486
 ```
 
-直接打开 EXE 时恢复上次的软盘、CPU 和速度设置，机器保持停机，用菜单选择启动设备：
+GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、屏幕全黑；
+`run.ps1` 或命令行加载映像也不会自动开机，用菜单选择启动设备。
+`--boot a/c` 仅在 `--headless` 脚本模式自动引导，GUI 仍需菜单启动：
 
 - **Disks > Create C: hard disk > 31.5 / 126 / 504 MiB**：按容量新建空白硬盘，绝不覆盖已有文件。
   命令行 `--create-hard <路径> [31.5|126|504]` 也支持容量选择，省略时仍为 31.5 MiB。
-- **Disks > Open C: hard disk**：打开已有硬盘；替换硬盘前先用 **Machine > Stop** 停机。
+- **Disks > Open C: hard disk**：打开已有硬盘；替换硬盘前先用 **Machine > Power off** 关机。
 - **Disks > Insert A: floppy**：插入或切换安装盘，可在安装过程中换盘，不会重启机器。
 - **Disks > Eject A:**：取出软盘。
 - **Disks > Insert ATAPI CD-ROM / Eject ATAPI CD-ROM**：在 AT 平台挂载或取出只读 ISO；
   不重启机器，尊重客体的锁盘状态，正在传输时拒绝换盘。光盘路径暂不保存。
 - **Machine > Boot / restart from A: / C:**：从指定设备启动或重启。
+- **Machine > Power off**：释放鼠标和按键、停止执行、刷新硬盘，屏幕立即变黑；
+  保留已加载映像、CPU 和速度选择，再从 A:/C: 引导即可重新开机。
 - **Machine > Ctrl+Alt+Del**：与现有组合键相同，释放输入并重启客体；
   有软盘时从 A: 启动，否则从 C: 启动，保留 CPU 型号和速度设置，不触发宿主安全界面。
+  快捷键为 **右 Ctrl+Del**，左 Ctrl+Del 保留给客体；右 Ctrl 单独按下仍释放鼠标。
+  持续按住 Del 不重复重启，关机状态禁用此重启功能，需从菜单选择 A:/C: 开机。
 - **Machine > Full speed**：勾选时取消执行限速，再次点击恢复正常速度，无需重启客体。
   标题栏显示 **Full speed / Normal speed**；首次运行默认正常速度，以后自动记住选择。
   正常档随 CPU 型号切换：8088 约 0.33 MIPS，286 约 2 MIPS，386 约 4 MIPS，486 约 8 MIPS；标题栏显示当前档位。
@@ -96,7 +102,8 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 重绘时不先清黑显示区域，避免字符被裁切和整屏闪烁（输入光标仍正常闪烁）。
 菜单、标题栏和边框不计入 640×400；程序启用系统 DPI 感知。
 键盘输入发送给客体；Ctrl+Alt+Del 从当前插入的软盘（若有）或硬盘重启。
-宿主文件对话框和菜单保持 Windows 原生行为。
+宿主文件对话框和菜单保持 Windows 原生行为。因执行错误而停止时保留错误画面供排查，
+这与明确选择 **Power off** 的黑屏关机状态不同。
 
 软盘路径（包括换盘和取出）、CPU 型号和速度模式在选择成功后立即保存到当前 Windows
 用户的注册表 `HKEY_CURRENT_USER\Software\Asm86\Native`，不依赖启动目录，也不需要管理员权限。

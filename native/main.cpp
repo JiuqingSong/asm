@@ -19,6 +19,9 @@ std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
 bool running = false;
+// Execution faults stop the CPU without powering off its diagnostic display.
+bool poweredOn = false;
+bool rightCtrlDown = false;
 bool fullSpeed = false;
 bool mouseCaptured = false;
 std::array<bool, 128> pressedKeys{};
@@ -48,7 +51,10 @@ void title(HWND hwnd) {
         : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
         : pc->at() ? L" | Normal speed (286 ~2 MIPS)" : L" | Normal speed (8088 ~0.33 MIPS)";
     if (mouseCaptured) value += L" | Mouse captured (Right Ctrl releases)";
-    if (!running) value += L" | stopped";
+    if (!poweredOn) value += L" | powered off";
+    else if (!running) value += L" | stopped";
+    if (EnableMenuItem(GetMenu(hwnd), CtrlAltDel, MF_BYCOMMAND | (poweredOn ? MF_ENABLED : MF_GRAYED)) == -1)
+        throw std::runtime_error("Cannot update restart menu");
     SetWindowTextW(hwnd, value.c_str());
 }
 void releaseMouse(HWND hwnd) {
@@ -89,6 +95,11 @@ void original(HWND hwnd) {
 }
 void render(HDC target, int width, int height) {
     if (!pc) return;
+    if (!poweredOn) {
+        RECT screen{0,0,width,height};
+        FillRect(target, &screen, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        return;
+    }
     unsigned cols = std::max(1u, std::min(pc->columns(), 80u)), page = pc->activePage();
     bool graphics = pc->vga.graphics();
     auto v = viewport(width, height, int(pc->vga.width()), int(pc->vga.height()));
@@ -172,7 +183,7 @@ void command(HWND hwnd, int id) {
     }
     case EjectCdrom: pc->cdrom.eject(); break;
     case NewHard: case NewHard126: case NewHard504: case LoadHard: {
-        if (running) { MessageBoxW(hwnd, L"Stop the machine before replacing the hard disk (Machine > Stop).", L"Hard disk", MB_OK); break; }
+        if (running) { MessageBoxW(hwnd, L"Power off the machine before replacing the hard disk (Machine > Power off).", L"Hard disk", MB_OK); break; }
         auto p = choose(hwnd, id != LoadHard);
         if (!p.empty()) {
             if (id != LoadHard) Disk::create(p, id == NewHard504 ? 1024 : id == NewHard126 ? 256 : 64);
@@ -181,14 +192,18 @@ void command(HWND hwnd, int id) {
         break;
     }
     case BootA: case BootC: case CtrlAltDel:
+        if (id == CtrlAltDel && !poweredOn) break;
         releaseMouse(hwnd); releaseKeyboard();
         pc->boot(id == BootA || (id == CtrlAltDel && pc->floppy) ? 0 : 0x80);
         executionTiming.reset(*pc);
-        running = true; break;
-    case Reset: releaseMouse(hwnd); releaseKeyboard(); running = false; if (pc->hard) pc->hard->flush(); break;
+        poweredOn = running = true; break;
+    case Reset:
+        releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
+        poweredOn = running = false; if (pc->hard) pc->hard->flush(); break;
     case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
-        if (running) { MessageBoxW(hwnd, L"Stop the machine before changing the CPU (Machine > Stop).", L"CPU", MB_OK); break; }
+        if (running) { MessageBoxW(hwnd, L"Power off the machine before changing the CPU (Machine > Power off).", L"CPU", MB_OK); break; }
         pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088);
+        poweredOn = false;
         if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu486, id, MF_BYCOMMAND))
             throw std::runtime_error("Cannot update CPU menu");
         if (preferences) preferences->cpu(pc->cpu.model);
@@ -218,12 +233,17 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             if (running && fullSpeed) execute(hwnd);
             return 0;
         case WM_KEYDOWN: case WM_SYSKEYDOWN: {
+            bool rightCtrl = w == VK_RCONTROL || (w == VK_CONTROL && (l & (LPARAM(1) << 24)));
+            if (rightCtrl) rightCtrlDown = true;
             if (!running) return 0;
             bool ctrl = GetKeyState(VK_CONTROL) < 0, alt = GetKeyState(VK_MENU) < 0;
-            if (mouseCaptured && (w == VK_RCONTROL || (w == VK_CONTROL && (l & (LPARAM(1) << 24))))) {
+            if (mouseCaptured && rightCtrl) {
                 releaseMouse(hwnd); releaseKeyboard(); title(hwnd); return 0;
             }
-            if (w == VK_DELETE && ctrl && alt) { command(hwnd, CtrlAltDel); return 0; }
+            if (w == VK_DELETE && (rightCtrlDown || (ctrl && alt))) {
+                if (!(l & (LPARAM(1) << 30))) command(hwnd, CtrlAltDel);
+                return 0;
+            }
             BYTE state[256]{}; GetKeyboardState(state);
             WORD character = 0; unsigned scan = (unsigned(l) >> 16) & 255;
             int converted = ToAscii(UINT(w), scan, state, &character, 0);
@@ -235,6 +255,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             pressedKeys[scan & 127] = true; pc->key(uint8_t(scan), ascii); return 0;
         }
         case WM_KEYUP: case WM_SYSKEYUP: {
+            if (w == VK_RCONTROL || (w == VK_CONTROL && (l & (LPARAM(1) << 24)))) rightCtrlDown = false;
             unsigned scan = (unsigned(l) >> 16) & 127;
             if (pressedKeys[scan] && running) pc->key(uint8_t(scan | 128), 0);
             pressedKeys[scan] = false;
@@ -267,7 +288,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_CAPTURECHANGED: releaseMouse(hwnd); title(hwnd); return 0;
-        case WM_KILLFOCUS: releaseMouse(hwnd); releaseKeyboard(); title(hwnd); return 0;
+        case WM_KILLFOCUS: releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false; title(hwnd); return 0;
         case WM_SIZE:
             if (mouseCaptured) { if (w == SIZE_MINIMIZED) releaseMouse(hwnd); else centerMouse(hwnd); }
             InvalidateRect(hwnd, nullptr, FALSE); return 0;
@@ -521,8 +542,10 @@ int application(int argc, wchar_t** argv) {
         if (speedSpecified) preferences->fullSpeed(fullSpeed);
         if (floppySpecified) preferences->floppy(pc->floppy->path);
     }
-    if (start) { pc->boot(pc->bootDrive); running = true; }
-    if (!script.empty()) return headless(script);
+    if (!script.empty()) {
+        if (start) pc->boot(pc->bootDrive);
+        return headless(script);
+    }
     auto instance = GetModuleHandleW(nullptr);
     SetProcessDPIAware();
     WNDCLASSW cls{}; cls.hInstance = instance; cls.lpfnWndProc = windowProc; cls.lpszClassName = L"Asm86Native";
@@ -542,8 +565,8 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(disks, MF_SEPARATOR, 0, nullptr); AppendMenuW(disks, MF_STRING, Quit, L"Exit");
     AppendMenuW(machine, MF_STRING, BootA, L"Boot / restart from A:");
     AppendMenuW(machine, MF_STRING, BootC, L"Boot / restart from C:");
-    AppendMenuW(machine, MF_STRING, CtrlAltDel, L"Ctrl+Alt+Del");
-    AppendMenuW(machine, MF_STRING, Reset, L"Stop");
+    AppendMenuW(machine, MF_STRING, CtrlAltDel, L"Ctrl+Alt+Del\tRight Ctrl+Del");
+    AppendMenuW(machine, MF_STRING, Reset, L"Power off");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed, L"Full speed (real-time timers)");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
@@ -574,6 +597,37 @@ int application(int argc, wchar_t** argv) {
     executionTiming.reset(*pc);
     if (!SetTimer(hwnd, 1, 16, nullptr)) throw std::runtime_error("Cannot start execution timer");
     if (uiTest) {
+        if (poweredOn || running) throw std::runtime_error("GUI startup must remain powered off even with --boot");
+        auto checkBlackScreen = [&]() {
+            RECT area{}; GetClientRect(hwnd, &area);
+            auto target = CreateCompatibleDC(back);
+            auto image = CreateCompatibleBitmap(back, area.right, area.bottom);
+            if (!target || !image) throw std::runtime_error("Cannot allocate power-off screen test");
+            auto old = SelectObject(target, image);
+            FillRect(target, &area, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+            render(target, area.right, area.bottom);
+            SelectObject(target, old);
+            BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            info.bmiHeader.biWidth = area.right; info.bmiHeader.biHeight = -area.bottom;
+            info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+            std::vector<uint32_t> pixels(size_t(area.right) * area.bottom);
+            auto rows = GetDIBits(back, image, 0, UINT(area.bottom), pixels.data(), &info, DIB_RGB_COLORS);
+            DeleteObject(image); DeleteDC(target);
+            if (rows != area.bottom || !std::all_of(pixels.begin(), pixels.end(), [](uint32_t p) { return !(p & 0xffffff); }))
+                throw std::runtime_error("Powered-off screen must be entirely black");
+        };
+        pc->cpu.ww(0xb800, 0, 0x4f58);
+        checkBlackScreen();
+        auto initialInstructions = pc->instructions;
+        SendMessageW(hwnd, WM_APP, 0, 0); SendMessageW(hwnd, WM_TIMER, 1, 0);
+        SendMessageW(hwnd, WM_COMMAND, CtrlAltDel, 0);
+        SendMessageW(hwnd, WM_KEYDOWN, VK_CONTROL, LPARAM((0x1d << 16) | (1 << 24)));
+        SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24)));
+        SendMessageW(hwnd, WM_KEYUP, VK_CONTROL, LPARAM((0x1d << 16) | (1 << 24)));
+        if (poweredOn || running || pc->instructions != initialInstructions ||
+            !(GetMenuState(menu, CtrlAltDel, MF_BYCOMMAND) & MF_GRAYED))
+            throw std::runtime_error("Timers or restart commands powered on an idle GUI");
+        poweredOn = true;
         TEXTMETRICW metrics{};
         if (!GetTextMetricsW(back, &metrics)) throw std::runtime_error("Cannot measure DOS display font");
         std::cout << "Text cell metrics: " << metrics.tmAveCharWidth << 'x' << metrics.tmHeight << '\n';
@@ -582,6 +636,7 @@ int application(int argc, wchar_t** argv) {
         for (unsigned i = 0; i < 2000; ++i) pc->cpu.ww(0xb800, uint16_t(i * 2), 0x1f20);
         for (unsigned i = 32; i < 127; ++i) pc->cpu.wb(0xb800, uint16_t((i - 32) * 2), uint8_t(i));
         pc->cpu.ww(0x40, 0x60, 0x2000);
+        SendMessageW(hwnd, WM_COMMAND, Reset, 0); checkBlackScreen(); poweredOn = true;
         RECT rect{}; GetClientRect(hwnd, &rect);
         if (rect.right != 640 || rect.bottom != 400) throw std::runtime_error("Original-size client area is not 640x400");
         auto reference = CreateCompatibleDC(back); auto referenceBitmap = CreateCompatibleBitmap(back, 32, 48);
@@ -649,7 +704,9 @@ int application(int argc, wchar_t** argv) {
                 throw std::runtime_error("Graphics original-size client area is incorrect");
             checkGraphics(); ShowWindow(hwnd, SW_MAXIMIZE); checkGraphics();
         }
+        SendMessageW(hwnd, WM_COMMAND, Reset, 0); checkBlackScreen(); poweredOn = true;
         pc->cpu.r[AX] = 3; pc->cpu.trap(0x10); original(hwnd);
+        std::cout << "Powered-off startup / no automatic boot / text-graphics black-screen checks passed\n";
         std::cout << "VGA 320x200 / 640x480 original-size / maximized pixel checks passed\n";
         auto savedPc = std::move(pc);
         pc = std::make_unique<Pc>();
@@ -844,19 +901,53 @@ int application(int argc, wchar_t** argv) {
                 SendMessageW(hwnd, WM_COMMAND, model, 0);
                 auto expectedModel = model == Cpu486 ? CpuModel::I486 : model == Cpu386 ? CpuModel::I386 : model == Cpu286 ? CpuModel::I286 : CpuModel::I8088;
                 pc->floppy = std::make_unique<Disk>(resetImages[1], true, true);
+                SendMessageW(hwnd, WM_COMMAND, BootA, 0);
+                if (!poweredOn || !running || pc->bootDrive != 0 || pc->cpu.rb(0, 0x7c02) != 'D')
+                    throw std::runtime_error("Boot from A: must power on the guest");
+                pc->cpu.wb(0, 0x7c02, 'X');
                 SendMessageW(hwnd, WM_COMMAND, CtrlAltDel, 0);
                 if (!running || pc->bootDrive != 0 || pc->cpu.rb(0, 0x7c02) != 'D'
                     || pc->cpu.model != expectedModel || fullSpeed != savedSpeed)
                     throw std::runtime_error("Ctrl+Alt+Del did not boot the inserted floppy while preserving CPU/speed");
                 pc->floppy.reset();
+                SendMessageW(hwnd, WM_COMMAND, Reset, 0);
+                SendMessageW(hwnd, WM_COMMAND, BootC, 0);
+                if (!poweredOn || !running || pc->bootDrive != 0x80 || pc->cpu.rb(0, 0x7c02) != 'C')
+                    throw std::runtime_error("Boot from C: must power on the guest");
                 SendMessageW(hwnd, WM_COMMAND, CtrlAltDel, 0);
                 if (!running || pc->bootDrive != 0x80 || pc->cpu.rb(0, 0x7c02) != 'C'
                     || pc->cpu.model != expectedModel || fullSpeed != savedSpeed)
                     throw std::runtime_error("Ctrl+Alt+Del did not restart from the hard disk while preserving CPU/speed");
+                pc->cpu.wb(0, 0x7c02, 'X');
+                SendMessageW(hwnd, WM_KEYDOWN, VK_CONTROL, LPARAM(0x1d << 16));
+                SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24)));
+                SendMessageW(hwnd, WM_KEYUP, VK_CONTROL, LPARAM(0x1d << 16));
+                if (pc->cpu.rb(0, 0x7c02) != 'X') throw std::runtime_error("Left Ctrl+Del must not restart the guest");
+                pc->cpu.out(0x3fb, 0x80); pc->cpu.out(0x3f8, 96); pc->cpu.out(0x3f9, 0);
+                pc->cpu.out(0x3fb, 2); pc->cpu.out(0x3fc, 3);
+                capture();
+                SendMessageW(hwnd, WM_KEYDOWN, VK_CONTROL, LPARAM((0x1d << 16) | (1 << 24)));
+                if (mouseCaptured) throw std::runtime_error("Right Ctrl release no longer works");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24)));
+                if (!poweredOn || !running || pc->bootDrive != 0x80 || pc->cpu.rb(0, 0x7c02) != 'C' ||
+                    pc->cpu.model != expectedModel || fullSpeed != savedSpeed)
+                    throw std::runtime_error("Right Ctrl+Del did not reboot after releasing capture");
+                pc->cpu.wb(0, 0x7c02, 'X');
+                SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24) | (1 << 30)));
+                if (pc->cpu.rb(0, 0x7c02) != 'X') throw std::runtime_error("Repeated Delete must not repeatedly reboot");
+                SendMessageW(hwnd, WM_KEYUP, VK_CONTROL, LPARAM((0x1d << 16) | (1 << 24)));
+                SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24)));
+                if (pc->cpu.rb(0, 0x7c02) != 'X') throw std::runtime_error("Right Ctrl remained stuck after key-up");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_CONTROL, LPARAM((0x1d << 16) | (1 << 24)));
+                SendMessageW(hwnd, WM_KILLFOCUS, 0, 0);
+                SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24)));
+                if (pc->cpu.rb(0, 0x7c02) != 'X') throw std::runtime_error("Right Ctrl remained stuck after focus loss");
+                releaseKeyboard();
             }
-        } catch (...) { removeResetImages(); throw; }
+        } catch (...) { releaseMouse(hwnd); SetCursorPos(savedCursor.x, savedCursor.y); removeResetImages(); throw; }
+        if (!SetCursorPos(savedCursor.x, savedCursor.y)) throw std::runtime_error("Cannot restore reset-test cursor");
         running = false; removeResetImages();
-        std::cout << "Ctrl+Alt+Del menu / floppy-first / hard-disk fallback / CPU-speed preservation checks passed\n";
+        std::cout << "Ctrl+Alt+Del menu / Right-Ctrl+Del / capture release / floppy-first / hard-disk fallback / CPU-speed preservation checks passed\n";
         pc = std::move(savedPc);
         DestroyWindow(hwnd);
     }

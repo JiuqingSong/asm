@@ -16,9 +16,7 @@ if (Test-Path -LiteralPath $HardDisk) {
     $arguments += @('--hard', ('"{0}"' -f [System.IO.Path]::GetFullPath($HardDisk)))
 }
 if ($Floppy) {
-    $arguments += @('--floppy', ('"{0}"' -f (Resolve-Path -LiteralPath $Floppy).Path), '--boot', 'a')
-} elseif (Test-Path -LiteralPath $HardDisk) {
-    $arguments += @('--boot', 'c')
+    $arguments += @('--floppy', ('"{0}"' -f (Resolve-Path -LiteralPath $Floppy).Path))
 }
 if ($Cdrom) {
     $arguments += @('--cdrom', ('"{0}"' -f (Resolve-Path -LiteralPath $Cdrom).Path))
