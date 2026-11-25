@@ -17,6 +17,16 @@
         <button data-start="full"><strong>完整模拟</strong><span>选择设备，从软盘、硬盘或光盘启动操作系统</span></button>
         <button data-start="snapshot"><strong>Load snapshot · 载入快照</strong><span>上传完整快照，还原工作模式、机器和磁盘；点击运行后继续</span></button>
       </div>
+      <section class="teaching-entry">
+        <h2>配套书籍 · 试验章节</h2>
+        <p><a href="./teaching/ch01/index.html">第 1 章：我们究竟要模拟什么 · 状态实验</a> ·
+          <a href="./teaching/ch02/index.html">第 2 章：数字如何进入机器 · 内存实验</a> ·
+          <a href="./teaching/ch03/index.html">第 3 章：第一条指令 · 独立虚拟机</a> ·
+          <a href="./teaching/ch04/index.html">第 4 章：ALU 与标志位 · 独立虚拟机</a></p>
+        <label>完整平台对照 <select id="teaching-experiments"></select></label>
+        <button id="btn-teaching">装载所选实验（关闭 BIOS / DOS / 外设）</button>
+        <p>此对照使用完整 CPU，不是章节核心。两边共享程序与检查点；选择后进入直接调试，原有三种模式不变。</p>
+      </section>
       <p id="startup-error" role="alert"></p>
     </section>
     <header class="toolbar">

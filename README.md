@@ -94,6 +94,16 @@ npm run build
 
 下一步要做的功能、工作约定和验证方法见 [docs/ROADMAP.md](docs/ROADMAP.md)。功能的完整列表见 [docs/REFERENCE.md](docs/REFERENCE.md)，增加或修改功能时要同步更新它。
 
+## 配套书籍与教学环境
+
+配套书籍的目的、章节结构、职责归属与古今对照原则，以及教学模式、逐章独立虚拟机、观察工具和验收要求见 [写作与实验环境总纲](docs/BOOK_OUTLINE.md)。后续相关写作和开发以这份总纲为依据；总纲描述目标设计，当前试验交付见下。
+
+现有试验稿：[第 1 章：我们究竟要模拟什么](docs/book/ch01.md)、[第 2 章：数字如何进入机器](docs/book/ch02.md)、[第 3 章：第一条指令](docs/book/ch03.md)、[第 4 章：ALU 与标志位](docs/book/ch04.md)。启动开发服务器后打开 `/teaching/ch01/index.html` 到 `/teaching/ch04/index.html`，也可从启动页进入。第一、二章提供独立内存模型、宿主操作实验和数值解释，不提前执行指令；第三、四章提供独立 CPU、机器码实验及关闭 BIOS/DOS/外设的完整平台同题对照。四章都有可卸载观察模块和自动断言。
+
+`npm run build` 同时构建四章网页、文字稿和 `source.tar` 完整源码下载。各源码包只包含本章及所需共享宿主，不依赖完整项目或其他章节，附锁文件与独立构建/测试说明。源码目录见 [第 1 章工程](teaching/ch01/README.md)、[第 2 章工程](teaching/ch02/README.md)、[第 3 章工程](teaching/ch03/README.md)、[第 4 章工程](teaching/ch04/README.md)。当前是未提交的 pilot-1 试验，不宣称已经发布固定版本；课程浏览、系统级过程观察等后续目标仍未实现。
+
+验证：`npx vitest run tests/teaching.test.ts teaching/ch01/tests/memory.test.ts teaching/ch02/tests/memory.test.ts teaching/ch03/tests/core.test.ts teaching/ch04/tests/core.test.ts`；开发服务器启动后运行 `node tools/ui-teaching-check.mjs`（默认端口 5329，可通过 `URL` 指定），检查浏览器实验、观察模块、失败断言、下载和完整平台入口。
+
 ## 结构
 
 ```

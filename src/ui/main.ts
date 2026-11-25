@@ -24,6 +24,7 @@ Machine.font = generateFont();
 import { DisasmPanel, currentInstruction } from './disasm-panel.ts';
 import { RegisterPanel, StackPanel, VarsPanel, MemoryPanel, takeSnapshot, h2, h4, type Snapshot } from './panels.ts';
 import { EXAMPLES } from './examples.ts';
+import { TEACHING_CONFIG, TEACHING_EXPERIMENTS, teachingSource } from './teaching.ts';
 import { INSTR_HELP, DIRECTIVE_HELP, DOS_FUNCS, BIOS_FUNCS } from './help.ts';
 import { DEFAULT_CONFIG, configWarnings, type MachineConfig, type StartupMode } from '../machine/config.ts';
 import { StartupPanel } from './startup.ts';
@@ -314,6 +315,32 @@ class App {
   }
 
   private bindUi(): void {
+    const lessons = $<HTMLSelectElement>('teaching-experiments');
+    for (const lesson of TEACHING_EXPERIMENTS) lessons.add(new Option(lesson.title, lesson.id));
+    const requestedLesson = new URLSearchParams(location.search).get('lesson');
+    if (requestedLesson && TEACHING_EXPERIMENTS.some(e => e.id === requestedLesson)) lessons.value = requestedLesson;
+    $('btn-teaching').onclick = async () => {
+      const lesson = TEACHING_EXPERIMENTS.find(e => e.id === lessons.value);
+      if (!lesson) { this.addMessage('error', '未知教学实验'); return; }
+      const button = $<HTMLButtonElement>('btn-teaching');
+      button.disabled = true;
+      try {
+        await this.launch('debug', TEACHING_CONFIG, '8088');
+        const s = this.cur;
+        this.editor.setText(s.model, teachingSource(lesson));
+        s.sourceVersion = s.model.getAlternativeVersionId();
+        s.fileName = lesson.id + '.asm';
+        s.dirty = true;
+        if (!this.assemble(s, true)) throw new Error('教学实验汇编失败，请查看消息');
+        this.loadAll();
+        s.m.cpu.setFlags(0x0002);
+        this.addMessage('info', '教学对照：全部可选设备及 BIOS/DOS 已关闭。8088 FLAGS 高位固定为 1（初值 F002），只比较已定义标志。完整 CPU 仍具备章节以外的指令；失败实验的结果可能不同。', s.i);
+        this.render(true);
+      } catch (error) {
+        this.addMessage('error', (error as Error).message);
+        $('startup-error').textContent = (error as Error).message;
+      } finally { button.disabled = false; }
+    };
     const sel = $<HTMLSelectElement>('examples');
     for (const ex of EXAMPLES) sel.add(new Option(ex.title, ex.id));
     sel.onchange = () => { if (sel.value) this.loadExample(sel.value); sel.value = ''; };
