@@ -5,6 +5,7 @@
 #include "at.h"
 #include "ide.h"
 #include "atapi.h"
+#include "dma.h"
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -42,6 +43,7 @@ public:
     SerialMouse serialMouse;
     IdeChannel ide;
     AtapiCdrom cdrom;
+    DmaController dma;
     std::unique_ptr<Disk> floppy, hard;
     uint64_t instructions = 0;
     double clock = 0;

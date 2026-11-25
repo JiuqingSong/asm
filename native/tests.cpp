@@ -1672,6 +1672,72 @@ void atapiTests(const std::filesystem::path& path) {
         "ATAPI software reset must restore its signature even without media");
     std::cout << "ATAPI / IRQ15 / packet phases / ISO streaming / host limits / sense / TOC / media-lock checks passed\n";
 }
+void dmaTests() {
+    Pc p; p.setModel(CpuModel::I486); auto& c = p.cpu;
+    auto program = [&](unsigned channel, uint16_t address, uint16_t count, uint8_t mode, uint8_t page) {
+        static constexpr uint16_t pages[] = {0x87,0x83,0x81,0x82,0,0x8b,0x89,0x8a};
+        bool word = channel >= 4;
+        uint16_t mask = word ? 0xd4 : 0x0a, flip = word ? 0xd8 : 0x0c;
+        uint16_t addr = word ? uint16_t(0xc0 + (channel - 4) * 4) : uint16_t(channel * 2);
+        c.out(mask, uint8_t(4 | (channel & 3))); c.out(flip, 0);
+        c.out(addr, uint8_t(address)); c.out(addr, uint8_t(address >> 8));
+        auto counter = uint16_t(addr + (word ? 2 : 1));
+        c.out(counter, uint8_t(count)); c.out(counter, uint8_t(count >> 8));
+        c.out(pages[channel], page); c.out(word ? 0xd6 : 0x0b, uint8_t(mode | (channel & 3)));
+        c.out(mask, uint8_t(channel & 3));
+    };
+    std::array<uint8_t, 4> bytes{0x11,0x22,0x33,0x44};
+    auto result = p.dma.transfer(2, bytes.data(), 4, DmaDirection::ToMemory);
+    check(result.bytes == 0 && !result.terminal && !result.error, "Masked DMA must wait without consuming device bytes");
+    c.msw |= 0x80000001u; c.cr3 = 0xff0000; c.cpl = 3; c.a20 = false;
+    program(2, 0xfffe, 3, 0x44, 0x12);
+    result = p.dma.transfer(2, bytes.data(), 4, DmaDirection::ToMemory);
+    check(result.bytes == 4 && result.terminal && c.mem[0x12fffe] == 0x11 && c.mem[0x12ffff] == 0x22
+        && c.mem[0x120000] == 0x33 && c.mem[0x120001] == 0x44 && c.mem[0x2fffe] == 0,
+        "DMA must address physical memory independently of A20, paging and CPL, wrapping only its 16-bit address");
+    check((c.in(8) & 4) && !(c.in(8) & 4) && (c.in(15) & 4), "DMA terminal count must latch, clear on status read, and mask a non-auto-init channel");
+    c.out(0x0c, 0);
+    check(c.in(5) == 255 && c.in(5) == 255, "DMA count must underflow to FFFF at terminal count");
+    c.mem[0x21000] = 1; c.mem[0x21001] = 2; c.mem[0x21002] = 3;
+    program(1, 0x1002, 2, 0x68, 2);
+    result = p.dma.transfer(1, bytes.data(), 4, DmaDirection::FromMemory);
+    check(result.bytes == 3 && result.terminal && bytes[0] == 3 && bytes[1] == 2 && bytes[2] == 1,
+        "Decrementing DMA memory-to-device transfers must stop at the exact byte terminal count");
+    bytes = {0x55,0x66,0x77,0x88}; program(5, 0xffff, 1, 0x44, 0x13);
+    result = p.dma.transfer(5, bytes.data(), 4, DmaDirection::ToMemory);
+    check(result.bytes == 4 && result.terminal && c.mem[0x13fffe] == 0x55 && c.mem[0x13ffff] == 0x66
+        && c.mem[0x120000] == 0x77 && c.mem[0x120001] == 0x88,
+        "16-bit DMA must count words, ignore the low page bit, and wrap within a 128 KiB page");
+    program(1, 0x3000, 1, 0x54, 0);
+    auto first = p.dma.transfer(1, bytes.data(), 4, DmaDirection::ToMemory);
+    auto second = p.dma.transfer(1, bytes.data() + 2, 2, DmaDirection::ToMemory);
+    check(first.bytes == 2 && first.terminal && second.bytes == 2 && second.terminal
+        && c.mem[0x3000] == 0x77 && c.mem[0x3001] == 0x88, "Auto-initialized DMA must restore base address/count for the next block");
+    program(2, 0x4000, 0, 0x44, 0); c.out(0xd4, 4);
+    result = p.dma.transfer(2, bytes.data(), 1, DmaDirection::ToMemory);
+    check(!result.bytes && !result.error, "Masking the AT cascade must suspend first-controller DMA");
+    c.out(0xd4, 0); c.out(8, 4);
+    result = p.dma.transfer(2, bytes.data(), 1, DmaDirection::ToMemory);
+    check(!result.bytes && !result.error, "The DMA controller-disable command must suspend peripheral requests");
+    c.out(8, 0);
+    result = p.dma.transfer(2, bytes.data(), 1, DmaDirection::FromMemory);
+    check(result.error && !result.bytes && c.mem[0x4000] == 0, "A DMA direction mismatch must report an error before altering memory or device data");
+    result = p.dma.transfer(2, bytes.data(), 1, DmaDirection::ToMemory);
+    check(result.bytes == 1 && result.terminal && c.mem[0x4000] == 0x55, "Resuming DMA must still transfer exactly the unconsumed request");
+    program(2, 0x8000, 1, 0x44, 0x0b); bytes[0] = 'D'; bytes[1] = 0x1f;
+    result = p.dma.transfer(2, bytes.data(), 2, DmaDirection::ToMemory);
+    check(result.terminal && p.vga.textByte(0) == 'D' && p.vga.textByte(1) == 0x1f, "DMA must reach the VGA memory bus rather than bypassing MMIO into the RAM backing array");
+    std::vector<uint8_t> block(65536);
+    program(2, 0, 0xffff, 0x40, 0);
+    result = p.dma.transfer(2, block.data(), unsigned(block.size()), DmaDirection::Verify);
+    check(result.bytes == 65536 && result.terminal, "FFFF DMA count must represent a full 65536-unit transfer, not zero units");
+    Pc xt; xt.cpu.out(0x0c, 0); xt.cpu.out(4, 0); xt.cpu.out(4, 1);
+    xt.cpu.out(5, 0); xt.cpu.out(5, 0); xt.cpu.out(0x81, 0x10);
+    xt.cpu.out(0x0b, 0x46); xt.cpu.out(0x0a, 2);
+    result = xt.dma.transfer(2, bytes.data(), 1, DmaDirection::ToMemory);
+    check(result.terminal && xt.cpu.mem[0x100] == 'D' && xt.cpu.in(0xc0) == 255, "XT DMA must retain its 20-bit bus and not expose an AT second controller");
+    std::cout << "8237 DMA / physical-MMIO bus / page wrapping / decrement / cascade / auto-init / exact terminal-count checks passed\n";
+}
 void diskSizingTests(const std::filesystem::path& base) {
     auto path = std::filesystem::path(base.native() + L".sizing");
     check(!std::filesystem::exists(path), "Disk sizing fixture already exists");
@@ -1765,7 +1831,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        dmaTests(); diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

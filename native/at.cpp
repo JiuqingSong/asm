@@ -8,6 +8,8 @@ void Pc::resetAt() {
     pic[0].reset(8, !at()); pic[1].reset(0x70, false);
     ide.reset();
     cdrom.reset();
+    dma.reset(at());
+    if (at()) { dma.output(0xd6, 0xc0); dma.output(0xd4, 0); }
     controller.clear(); kbdCommand = 0x45; kbdOutput = 1; kbdWrite = fastA20 = cmosIndex = 0;
     keyboardLatch = 0; keyboardRead = false;
     pendingReset = false; cpu.a20 = false;

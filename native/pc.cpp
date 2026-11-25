@@ -113,6 +113,8 @@ bool Disk::write(uint32_t lba, const uint8_t* p) { return transfer(lba, const_ca
 void Disk::flush() { if (!readOnly && !FlushFileBuffers(file)) throw osError("Disk flush failed"); }
 
 Pc::Pc() {
+    dma.read = [this](uint32_t address) { return cpu.readBus(address & (at() ? 0xffffffu : 0xfffffu)); };
+    dma.write = [this](uint32_t address, uint8_t value) { cpu.writeBus(address & (at() ? 0xffffffu : 0xfffffu), value); };
     cpu.in = [this](uint16_t p) { return input(p); };
     cpu.out = [this](uint16_t p, uint8_t v) { output(p, v); };
     cpu.inWide = [this](uint16_t port, unsigned size) {
@@ -257,6 +259,7 @@ int Pc::acknowledge() {
     return pic[0].base + line;
 }
 uint8_t Pc::input(uint16_t p) {
+    if ((at() || p < 0xc0) && DmaController::owns(p)) return dma.input(p);
     if (at() && IdeChannel::owns(p)) return ide.input(p, clock);
     if (at() && AtapiCdrom::owns(p)) return cdrom.input(p, clock);
     if (p >= 0x3f8 && p <= 0x3ff) return serialMouse.input(p - 0x3f8, clock);
@@ -293,6 +296,7 @@ uint8_t Pc::input(uint16_t p) {
     return 255; // Unpopulated ISA bus reads high.
 }
 void Pc::output(uint16_t p, uint8_t v) {
+    if ((at() || p < 0xc0) && DmaController::owns(p)) { dma.output(p, v); return; }
     if (at() && IdeChannel::owns(p)) { ide.output(p, v, clock); return; }
     if (at() && AtapiCdrom::owns(p)) { cdrom.output(p, v, clock); return; }
     if (p >= 0x3f8 && p <= 0x3ff) { serialMouse.output(p - 0x3f8, v, clock); return; }

@@ -8,6 +8,9 @@ uint8_t Cpu::rb(uint16_t seg, uint16_t off) const {
 uint8_t Cpu::readPhysical(uint32_t address) const {
     auto a = address & (model == CpuModel::I8088 ? 0xfffff : model == CpuModel::I286 ? (a20 ? 0xffffff : 0xefffff) : (a20 ? 0xffffffffu : 0xffefffffu));
     if (supports386() && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
+    return readBus(a);
+}
+uint8_t Cpu::readBus(uint32_t a) const {
     return a >= mmioStart && a < mmioEnd && mmioRead ? mmioRead(a) : a < mem.size() ? mem[a] : 0xff;
 }
 uint16_t Cpu::rw(uint16_t seg, uint16_t off) const { return rb(seg, off) | (uint16_t(rb(seg, uint16_t(off + 1))) << 8); }
@@ -19,6 +22,9 @@ void Cpu::writeWord(uint32_t address, uint16_t value) { writePhysical(address, u
 void Cpu::writePhysical(uint32_t address, uint8_t v) {
     auto a = address & (model == CpuModel::I8088 ? 0xfffff : model == CpuModel::I286 ? (a20 ? 0xffffff : 0xefffff) : (a20 ? 0xffffffffu : 0xffefffffu));
     if (supports386() && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
+    writeBus(a, v);
+}
+void Cpu::writeBus(uint32_t a, uint8_t v) {
     if (onWrite) onWrite(a);
     if (a >= mmioStart && a < mmioEnd && mmioWrite) mmioWrite(a, v);
     else if (a < mem.size()) mem[a] = v;

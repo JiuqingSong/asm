@@ -225,6 +225,19 @@ DOS 的 AUTOEXEC 命令回显也包含提示符；加载 HIMEM/SMARTDRV 后，�
 Windows 95 Setup 的 `INT 67h / AX=DE00h` VCPI 探测返回非零 AH，明确报告没有驻留 VCPI；
 不会把该安装检查当成未实现中断而停机，也不宣告提供 EMS/VCPI 服务。
 
+## ISA DMA 底座
+
+XT 提供第一片 8237 的寄存器，AT 另提供第二片和级联通道；支持 8 位/16 位地址计数、
+页寄存器、屏蔽、控制器禁用、递减地址、自动初始化及终点状态的读取清除。
+外设传输使用物理内存总线，不经过 CPU 分页、CPL 或 CPU 的 A20 门，并保留 VGA MMIO。
+8 位通道在 64 KiB 页内回绕，16 位通道按字计数并在 128 KiB 页内回绕；
+计数 FFFFh 对应完整的 65536 个传输单位，非自动初始化通道到终点后屏蔽。
+方向不匹配会向外设报告错误，不先修改内存或消费数据。
+
+这是供后续 FDC/声音设备使用的外设 DMA 底座；不包含内存到内存复制、
+完整总线仲裁/周期时序，也不等同于 IDE DMA。已通过边界、物理寻址、MMIO、
+级联及终点行为测试，并回归 Windows 3.2 增强模式与全部 8088 真机数据。
+
 ## IDE 硬盘控制器（AT）
 
 286/386/486 的 C: 同时接在第一 IDE 通道主盘，使用与 BIOS 相同的磁盘映像；
@@ -340,6 +353,7 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 - `at.h/cpp`：8259 PIC、8042、A20、CMOS/RTC 和 AT 暖复位。
 - `ide.h/cpp`：第一通道 ATA PIO 硬盘、任务寄存器、延迟完成和 IRQ14。
 - `atapi.h/cpp`：第二通道 ATAPI PIO 光驱、ISO 按需读取、命令包、sense 和 IRQ15。
+- `dma.h/cpp`：8237 DMA 寄存器、8/16 位外设传输、物理总线和终点计数。
 - `pc.h/cpp`：设备、BIOS、启动和磁盘映像；磁盘 I/O 使用 Windows API。
 - `video.h/cpp`：VGA 显存、寄存器、调色板和图形像素。
 - `font8x8.h`：从 `src/machine/font8x8.ts` 的 `builtinFont()` 导出的原生 ROM 字形数据。

@@ -71,8 +71,10 @@ public:
     void outputPort(uint16_t port, uint32_t value, unsigned size);
     bool protectedMode() const { return msw & 1; }
     uint8_t readPhysical(uint32_t address) const;
+    uint8_t readBus(uint32_t address) const;
     uint16_t readWord(uint32_t address) const;
     void writePhysical(uint32_t address, uint8_t value);
+    void writeBus(uint32_t address, uint8_t value);
     void writeWord(uint32_t address, uint16_t value);
     uint8_t rbS(int segment, uint32_t offset);
     uint16_t rwS(int segment, uint32_t offset);
