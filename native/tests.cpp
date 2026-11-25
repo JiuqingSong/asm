@@ -1206,6 +1206,21 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
         p.runCpu(100);
         check(c.halted && c.r == debugRegisters && c.flags == debugFlags,
             "An absent INT 68h debugger must preserve registers and flags through the firmware's empty IRET hook");
+        c.halted = false; c.ip = 0x500; c.mem[0x501] = 0x0c;
+        c.r[AX] = 0x0d83; c.r[BX] = 0xffff; c.r[CX] = 7; c.r[DX] = 0x069e;
+        c.out(0x21, 0xed); c.out(0x3fc, 8); c.out(0x3f9, 2);
+        check(c.irq() == 0x0c, "An unowned COM1 transmitter interrupt must reach the restored BIOS IRQ4 vector");
+        auto serialRegisters = c.r; auto serialFlags = c.flags;
+        p.runCpu(100);
+        check(c.halted && c.r == serialRegisters && c.flags == serialFlags,
+            "The default serial interrupt must return with caller registers and flags intact");
+        check(c.in(0x21) == 0xfd && c.in(0x3fa) == 2,
+            "The default serial interrupt must mask only IRQ4 without consuming the driver's UART state");
+        c.out(0x20, 0x0b);
+        check(c.in(0x20) == 0, "The default serial interrupt must acknowledge the PIC's in-service IRQ");
+        p.key(0x1e, 'a');
+        check(c.irq() == 9, "Masking an unowned serial interrupt must leave keyboard IRQ1 deliverable");
+        c.in(0x60); c.out(0x20, 0x20); p.serialMouse.reset();
         for (uint16_t mode : {0x12, 0x93, 3}) {
             c.halted = false;
             c.loadSegment(CS, 0); c.loadSegment(SS, 0);
