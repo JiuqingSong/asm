@@ -20,6 +20,7 @@ public:
         return guestOrigin + std::chrono::duration<double>(now - hostOrigin).count() * PitHz;
     }
     void advance(Pc& pc, bool fullSpeed, HostClock::time_point now) {
+        if (pc.powerOffRequested) return;
         auto next = std::min(target(now), pc.clock + PitHz / 4000);
         auto elapsed = std::max(0.0, next - pc.clock);
         if (elapsed > 0) pc.advanceClock(next);
@@ -35,7 +36,7 @@ public:
         const auto until = target(start);
         do {
             advance(pc, fullSpeed, fullSpeed ? HostClock::now() : start);
-        } while (!pc.rebootRequested && (fullSpeed || pc.clock < until) && HostClock::now() < deadline);
+        } while (!pc.rebootRequested && !pc.powerOffRequested && (fullSpeed || pc.clock < until) && HostClock::now() < deadline);
     }
 private:
     HostClock::time_point hostOrigin = HostClock::now();

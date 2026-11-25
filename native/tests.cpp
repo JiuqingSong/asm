@@ -1183,6 +1183,59 @@ void keyboardProbeTests() {
         }
     }
 }
+void apmTests(const std::filesystem::path& disk) {
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
+        Pc p; p.setModel(model); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
+        auto& c = p.cpu;
+        auto call = [&](uint8_t function, uint16_t device, uint16_t value = 0) {
+            c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.r[SP] = 0x9000; c.ip = 0x500;
+            c.halted = c.waiting = false; c.setFlags(CF | DF | 2);
+            c.mem[0x500] = 0xcd; c.mem[0x501] = 0x15; c.mem[0x502] = 0xf4;
+            c.r[AX] = uint16_t(0x5300 | function); c.r[BX] = device; c.r[CX] = value;
+            p.runCpu(100);
+            check((c.flags & DF) && (p.powerOffRequested || (c.halted && c.r[SP] == 0x9000)),
+                "APM INT 15h must return through the guest interrupt frame preserving unrelated flags");
+            return c.flags & CF ? c.reg8(4) : uint8_t(0);
+        };
+        if (model == CpuModel::I8088) {
+            check(call(0, 0) == 0x86 && !p.powerOffRequested, "XT must not advertise AT APM support");
+            continue;
+        }
+        check(call(0, 0) == 0 && c.r[AX] == 0x0102 && c.r[BX] == 0x504d && c.r[CX] == 0,
+            "APM discovery must identify a real-mode-only BIOS without claiming protected-mode or idle throttling");
+        check(call(0x10, 0) == 0 && c.reg8(3) == 0 && c.r[CX] == 0,
+            "APM capabilities must be queryable before connection and advertise no batteries, standby or suspend");
+        check(call(7, 1, 3) == 3 && !p.powerOffRequested, "Disconnected APM calls cannot power off");
+        check(call(2, 0) == 6 && call(3, 0) == 8, "Unimplemented protected-mode APM interfaces must report unsupported");
+        check(call(1, 0) == 0 && call(1, 0) == 2, "APM connection must reject duplicate connections");
+        check(call(7, 1, 3) == 0x0a && !p.powerOffRequested, "APM 1.0 connections cannot request global power off");
+        check(call(0x0e, 0, 0x0101) == 0 && c.r[AX] == 0x0101, "APM must negotiate the Windows 95 driver version");
+        check(call(7, 0xffff, 3) == 9 && call(7, 1, 0) == 0x0a && !p.powerOffRequested,
+            "Invalid APM device IDs and power states must not shut down the machine");
+        check(call(7, 1, 1) == 0x60 && call(7, 1, 2) == 0x60 && !p.powerOffRequested,
+            "Unsupported standby and suspend must fail explicitly without powering off");
+        check(call(8, 1, 0) == 0 && call(7, 1, 3) == 1, "Disabled power management must reject shutdown");
+        check(call(8, 1, 1) == 0 && call(0x0f, 1, 0) == 0 && call(7, 1, 3) == 0x0b,
+            "Disengaged power management must reject shutdown");
+        check(call(9, 1) == 0 && call(0x0b, 0) == 0x80, "APM defaults and empty event polling");
+        check(call(0x0a, 1) == 0 && c.r[BX] == 0x01ff && c.r[CX] == 0x80ff && c.r[DX] == 0xffff,
+            "Desktop APM status must report AC power and no system battery");
+        check(call(0xff, 0) == 0x0c, "Unsupported APM functions must return an explicit BIOS error");
+        check(call(4, 0) == 0 && call(4, 0) == 3, "APM disconnect must clear the connection");
+        check(call(1, 0) == 0 && call(7, 1, 3) == 0x0a, "Reconnecting must reset the negotiated APM version");
+        check(call(0x0e, 0, 0x0102) == 0 && call(8, 1, 1) == 0 && call(7, 1, 3) == 0 && p.powerOffRequested,
+            "An enabled, connected APM driver must be able to request whole-machine power off");
+        auto instructions = p.instructions; auto clock = p.clock;
+        p.run(1000); p.runCpu(1000);
+        ExecutionTiming timing; timing.reset(p);
+        timing.advance(p, true, ExecutionTiming::HostClock::now() + std::chrono::seconds(1));
+        check(p.instructions == instructions && p.clock == clock,
+            "A powered-off core must not run guest instructions or advance scheduled device time");
+        p.boot(0x80);
+        check(!p.powerOffRequested && call(7, 1, 3) == 3, "Boot must clear both power-off and APM connection state");
+    }
+    std::cout << "APM real-mode discovery / connection / errors / Windows 95 power-off / explicit reboot checks passed\n";
+}
 void videoFirmwareTests(const std::filesystem::path& disk) {
     Pc p; auto& c = p.cpu;
     auto observed = std::make_unique<Vga>();
@@ -2290,7 +2343,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

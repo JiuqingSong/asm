@@ -151,6 +151,13 @@ void render(HDC target, int width, int height) {
 void execute(HWND hwnd) {
     bool hadDisc = pc->cdrom.medium() != nullptr;
     executionTiming.run(*pc, fullSpeed);
+    if (pc->powerOffRequested) {
+        releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
+        if (pc->hard) pc->hard->flush();
+        poweredOn = running = false;
+        title(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
+        return;
+    }
     if (hadDisc != (pc->cdrom.medium() != nullptr)) title(hwnd);
     if (pc->rebootRequested) {
         if (pc->hard) pc->hard->flush();
@@ -356,7 +363,7 @@ int headless(const std::filesystem::path& script) {
         auto arg = split == std::string::npos ? std::string() : line.substr(split + 1);
         if (op == "run") {
             uint64_t count = std::stoull(arg);
-            while (count) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80); }
+            while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80); }
         } else if (op == "realtime") {
             std::istringstream input(arg); int milliseconds = 0; std::string speed, extra;
             if (!(input >> milliseconds >> speed) || milliseconds < 0 || (input >> extra) || (speed != "normal" && speed != "full"))
@@ -364,7 +371,7 @@ int headless(const std::filesystem::path& script) {
             ExecutionTiming timing; timing.reset(*pc);
             const auto started = ExecutionTiming::HostClock::now(), deadline = started + std::chrono::milliseconds(milliseconds);
             const auto beforeClock = pc->clock;
-            while (ExecutionTiming::HostClock::now() < deadline) {
+            while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline) {
                 auto remaining = deadline - ExecutionTiming::HostClock::now();
                 if (remaining <= ExecutionTiming::HostClock::duration::zero()) break;
                 timing.run(*pc, speed == "full", std::min(remaining,
@@ -378,6 +385,7 @@ int headless(const std::filesystem::path& script) {
         } else if (op == "wait") {
             uint64_t count = 0;
             while (pc->text().find(arg) == std::string::npos && count < 1000000000) {
+                if (pc->powerOffRequested) throw std::runtime_error("Guest powered off while waiting for: " + arg);
                 pc->run(10000); count += 10000;
                 if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80);
             }
@@ -447,7 +455,7 @@ int headless(const std::filesystem::path& script) {
             info.biSize = sizeof(info); info.biWidth = LONG(width); info.biHeight = -LONG(height);
             info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
             std::vector<uint32_t> pixels(width * height);
-            if (!pc->vga.blanked())             for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+            if (!pc->powerOffRequested && !pc->vga.blanked()) for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
                 auto color = pc->vga.pixel(x, y);
                 pixels[y * width + x] = pc->vga.color(pc->vga.indexed256() ? color : pc->vga.paletteIndex(color));
             }
@@ -943,9 +951,32 @@ int application(int argc, wchar_t** argv) {
                 SendMessageW(hwnd, WM_KEYDOWN, VK_DELETE, LPARAM((0x53 << 16) | (1 << 24)));
                 if (pc->cpu.rb(0, 0x7c02) != 'X') throw std::runtime_error("Right Ctrl remained stuck after focus loss");
                 releaseKeyboard();
+                if (expectedModel != CpuModel::I8088) {
+                    auto& c = pc->cpu;
+                    c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.r[SP] = 0x9000; c.setFlags(2);
+                    c.r[AX] = 0x5301; c.r[BX] = 0; c.trap(0x15);
+                    c.r[AX] = 0x530e; c.r[CX] = 0x0101; c.trap(0x15);
+                    const uint8_t shutdown[] = {0xb8,7,0x53,0xbb,1,0,0xb9,3,0,0xcd,0x15,0xc6,6,0,6,0xff};
+                    std::copy(std::begin(shutdown), std::end(shutdown), c.mem.begin() + 0x500);
+                    c.mem[0x600] = 0;
+                    c.ip = 0x500; c.halted = c.waiting = false;
+                    executionTiming.reset(*pc, ExecutionTiming::HostClock::now() - std::chrono::milliseconds(10));
+                    execute(hwnd);
+                    if (poweredOn || running || !pc->powerOffRequested || c.mem[0x600] == 0xff)
+                        throw std::runtime_error("Guest APM shutdown must stop execution and power off the GUI");
+                    checkBlackScreen();
+                    auto stoppedInstructions = pc->instructions;
+                    SendMessageW(hwnd, WM_APP, 0, 0); SendMessageW(hwnd, WM_TIMER, 1, 0);
+                    if (pc->instructions != stoppedInstructions)
+                        throw std::runtime_error("APM-powered-off GUI must not resume execution");
+                    SendMessageW(hwnd, WM_COMMAND, BootC, 0);
+                    if (!poweredOn || !running || pc->powerOffRequested)
+                        throw std::runtime_error("Explicit boot must clear guest APM shutdown state");
+                }
             }
         } catch (...) { releaseMouse(hwnd); SetCursorPos(savedCursor.x, savedCursor.y); removeResetImages(); throw; }
         if (!SetCursorPos(savedCursor.x, savedCursor.y)) throw std::runtime_error("Cannot restore reset-test cursor");
+        std::cout << "Guest APM shutdown / black screen / stopped execution / explicit power-on checks passed\n";
         running = false; removeResetImages();
         std::cout << "Ctrl+Alt+Del menu / Right-Ctrl+Del / capture release / floppy-first / hard-disk fallback / CPU-speed preservation checks passed\n";
         pc = std::move(savedPc);

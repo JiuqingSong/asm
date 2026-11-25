@@ -52,6 +52,7 @@ public:
     double clock = 0;
     uint8_t bootDrive = 0;
     bool rebootRequested = false;
+    bool powerOffRequested = false;
     std::string notice;
     Pc();
     void setModel(CpuModel model);
@@ -87,6 +88,9 @@ private:
     void output(uint16_t port, uint8_t value);
     int acknowledge();
     bool bios(uint8_t number);
+    bool apm();
+    bool apmConnected = false, apmEnabled = true, apmEngaged = true;
+    uint16_t apmVersion = 0x0100;
     bool video();
     bool disk();
     unsigned biosColumns();

@@ -215,7 +215,9 @@ void Pc::boot(uint8_t drive) {
     cpu.reset(); std::fill(cpu.mem.begin(), cpu.mem.end(), 0);
     vga.setMode(3);
     serialMouse.reset();
-    bootDrive = drive; rebootRequested = false; instructions = 0; clock = 0; notice.clear(); keys.clear();
+    bootDrive = drive; rebootRequested = powerOffRequested = false;
+    apmConnected = false; apmEnabled = apmEngaged = true; apmVersion = 0x0100;
+    instructions = 0; clock = 0; notice.clear(); keys.clear();
     resetAt();
     reload.fill(0); access.fill(3); pitMode.fill(3); writeHigh.fill(false); readHigh.fill(false); latched.fill(false);
     port61 = crtcIndex = 0; nextTimer = 65536;
@@ -276,7 +278,7 @@ void Pc::boot(uint8_t drive) {
     cpu.r[DX] = drive; cpu.setFlags(0x0202);
 }
 void Pc::run(unsigned budget, double untilClock) {
-    for (unsigned i = 0; i < budget && !rebootRequested && clock < untilClock; ++i) {
+    for (unsigned i = 0; i < budget && !rebootRequested && !powerOffRequested && clock < untilClock; ++i) {
         stepCpu();
         advanceClock(clock + ((cpu.halted || cpu.waiting) ? 256.0 : 3.6));
     }
@@ -286,7 +288,7 @@ void Pc::stepCpu() {
     if (pendingReset) resetCpu();
 }
 void Pc::runCpu(unsigned budget) {
-    for (unsigned i = 0; i < budget && !rebootRequested; ++i) {
+    for (unsigned i = 0; i < budget && !rebootRequested && !powerOffRequested; ++i) {
         stepCpu();
         if (cpu.halted || cpu.waiting) break;
     }
@@ -757,6 +759,67 @@ bool Pc::disk() {
     if (ah == 3 || ah == 5) d->flush();
     status(0); c.reg8(0, uint8_t(count)); return true;
 }
+bool Pc::apm() {
+    auto& c = cpu; auto& r = c.r;
+    auto result = [&](uint8_t error) {
+        c.stackedFlag(CF, error != 0); c.reg8(4, error); return true;
+    };
+    auto function = c.reg8(0);
+    if (!at()) return result(0x86);
+    if (function == 0) {
+        if (r[BX]) return result(9);
+        r[AX] = 0x0102; r[BX] = 0x504d; r[CX] = (!apmEnabled ? 8 : 0) | (!apmEngaged ? 16 : 0);
+        c.stackedFlag(CF, false); return true;
+    }
+    if (function >= 1 && function <= 3) {
+        if (r[BX]) return result(9);
+        if (apmConnected) return result(2);
+        if (function != 1) return result(function == 2 ? 6 : 8);
+        apmConnected = true; apmVersion = 0x0100; return result(0);
+    }
+    if (function == 0x10) {
+        if (r[BX]) return result(9);
+        c.reg8(3, 0); r[CX] = 0; return result(0);
+    }
+    if (!apmConnected) return result(3);
+    switch (function) {
+    case 4:
+        if (r[BX]) return result(9);
+        apmConnected = false; apmVersion = 0x0100; return result(0);
+    case 5: case 6: return result(0); // CPU idle/busy without clock throttling.
+    case 7:
+        if (r[BX] != 1) return result(9);
+        if (!apmEnabled) return result(1);
+        if (!apmEngaged) return result(0x0b);
+        if (r[CX] == 1 || r[CX] == 2) return result(0x60);
+        if (r[CX] != 3) return result(0x0a);
+        if (apmVersion == 0x0100) return result(0x0a);
+        result(0); powerOffRequested = true; return true;
+    case 8:
+        if (r[BX] != (apmVersion == 0x0100 ? 0xffff : 1)) return result(9);
+        if (r[CX] > 1) return result(0x0a);
+        if (!apmEngaged) return result(0x0b);
+        apmEnabled = r[CX] != 0; return result(0);
+    case 9:
+        if (r[BX] != (apmVersion == 0x0100 ? 0xffff : 1)) return result(9);
+        apmEnabled = apmEngaged = true; return result(0);
+    case 0x0a:
+        if (r[BX] != 1) return result(9);
+        r[BX] = 0x01ff; r[CX] = 0x80ff; r[DX] = 0xffff; return result(0);
+    case 0x0b: return result(0x80);
+    case 0x0e:
+        if (r[BX]) return result(9);
+        if (r[CX] < 0x0100) return result(0x0a);
+        apmVersion = std::min(r[CX], uint16_t(0x0102));
+        r[AX] = apmVersion; c.stackedFlag(CF, false); return true;
+    case 0x0f:
+        if (r[BX] != 1) return result(9);
+        if (!apmEnabled) return result(1);
+        if (r[CX] > 1) return result(0x0a);
+        apmEngaged = r[CX] != 0; return result(0);
+    default: return result(0x0c);
+    }
+}
 bool Pc::bios(uint8_t n) {
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4);
     // HP-HIL installation probes leave BX unchanged on a standard PC/AT.
@@ -794,6 +857,7 @@ bool Pc::bios(uint8_t n) {
         }
         c.reg8(4, input(0x3fd)); c.reg8(0, input(0x3fe)); return true;
     case 0x15:
+        if (ah == 0x53) return apm();
         if (ah == 0x88) { r[AX] = at() ? 15360 : 0; c.stackedFlag(CF, false); }
         else if (at() && ah == 0x24 && c.reg8(0) <= 3) {
             switch (c.reg8(0)) {
