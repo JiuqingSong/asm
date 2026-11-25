@@ -317,6 +317,18 @@ void cpu386Tests(CpuModel model) {
             check(rejected && c.readDword(0x200) == 0x12345678, "An alignment fault must occur before an unaligned store modifies memory");
             check(c.readSegment(DS, 0x200, size) == (size == 2 ? 0x5678u : 0x12345678u), "Aligned operands must remain accessible with alignment checking enabled");
         }
+        c.loadSegment(CS, 0); c.ip = 0x500; c.halted = false;
+        c.mem[0x500] = 0x66; c.mem[0x501] = 0xf3; c.mem[0x502] = 0x6d;
+        c.r[DX] = 0x1f0; c.r[DI] = 0x201; c.r[CX] = 1;
+        c.tr = {0x28, 0x9000, 0xff, 0x89}; c.writeWord(0x9066, 0x80);
+        unsigned inputReads = 0;
+        c.inWide = [&](uint16_t, unsigned) { ++inputReads; return uint32_t(0x12345678); };
+        c.onFault = [](CpuFault fault, uint32_t) { throw fault; };
+        bool alignment = false;
+        try { c.step(); } catch (const CpuFault& f) { alignment = f.vector == 17 && f.code == 0; }
+        check(alignment && inputReads == 0 && c.r[DI] == 0x201 && c.readDword(0x200) == 0x12345678,
+            "An unaligned INSD destination must fault before consuming a wide device input");
+        c.inWide = {}; c.onFault = {};
         c.msw &= ~0x40000u;
         check(c.readSegment(DS, 0x201, 2) == 0x3456, "Clearing CR0.AM must disable alignment faults");
         c.msw |= 0x40000; c.setEflags(0x23002);
@@ -342,11 +354,10 @@ void cpu386Tests(CpuModel model) {
         for (const auto& code : {std::vector<uint8_t>{0x0f,8}, {0x0f,9}, {0x67,0x0f,1,0x38}}) {
             c = protectedMachine({0xf4}); c.setEflags(0x23002); c.cpl = 3;
             c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.ip = 0x500; c.halted = false; c.r[SP] = 0x8000;
-            c.gdtr = {}; c.idtr = {};
             bool denied = false;
-            c.onFault = [&](CpuFault f, uint32_t) { if (f.vector == 13 && f.code == 0) denied = true; };
+            c.onFault = [](CpuFault fault, uint32_t) { throw fault; };
             std::copy(code.begin(), code.end(), c.mem.begin() + 0x500);
-            try { c.step(); } catch (const std::runtime_error&) { check(denied, "Privileged opcode failed before its expected #GP"); }
+            try { c.step(); } catch (const CpuFault& f) { denied = f.vector == 13 && f.code == 0; }
             check(denied, "486 cache and TLB maintenance instructions must be privileged in VM86 mode");
         }
     }
@@ -1436,6 +1447,110 @@ void serialTests() {
     c.out(0x3fc, 11); p.run(50000);
     check(c.mem[0x600] == 'M' && c.r[SP] == 0x8000, "Guest IRQ4 handler must read COM1 and return through IRET");
 }
+void ideTests(const std::filesystem::path& path) {
+    for (auto model : {CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
+        Pc p; p.setModel(model); auto& c = p.cpu;
+        p.hard = std::make_unique<Disk>(path, false, false);
+        for (auto seg : {ES, CS, SS, DS}) c.loadSegment(seg, 0);
+        c.setFlags(2); c.r[SP] = 0x8000;
+        c.out(0x21, 0xfb); c.out(0xa1, 0xbf);
+        auto tick = [&]() { p.advanceClock(p.clock + 120); };
+        auto acknowledge = [&]() { c.in(0x1f7); c.out(0xa0, 0x20); c.out(0x20, 0x20); };
+        auto address = [&](uint32_t lba, uint8_t count) {
+            c.out(0x1f6, uint8_t(0xe0 | (lba >> 24))); c.out(0x1f2, count); c.out(0x1f3, uint8_t(lba));
+            c.out(0x1f4, uint8_t(lba >> 8)); c.out(0x1f5, uint8_t(lba >> 16));
+        };
+        c.out(0x1f7, 0xec);
+        check(c.in(0x3f6) == 0x80 && c.irq() == -1, "ATA must remain busy and defer IRQ14 until command completion");
+        p.advanceClock(p.clock + 119);
+        check(c.in(0x3f6) == 0x80 && c.irq() == -1, "ATA completion must respect its device-clock deadline");
+        p.advanceClock(p.clock + 1);
+        check(c.in(0x3f6) == 0x58 && c.irq() == 0x76 && c.irq() == -1, "ATA DRQ must raise IRQ14 through both PICs exactly once");
+        acknowledge();
+        std::array<uint16_t, 256> identity{};
+        for (auto& word : identity) word = uint16_t(c.inputPort(0x1f0, 2));
+        check((uint32_t(identity[61]) << 16 | identity[60]) == p.hard->sectors && (identity[49] & 0x300) == 0x200
+            && c.in(0x3f6) == 0x50, "ATA IDENTIFY must expose the mounted disk's capacity and PIO/LBA, but not DMA");
+        c.out(0x21, 0xff); c.out(0xa1, 0xff);
+        auto run = [&](std::vector<uint8_t> code) {
+            std::copy(code.begin(), code.end(), c.mem.begin() + 0x500); c.ip = 0x500; c.halted = false;
+            p.runCpu(1000);
+            check(c.halted, "ATA guest PIO program did not halt");
+        };
+        for (unsigned width : {2u, 4u}) {
+            if (width == 4 && !c.supports386()) continue;
+            std::array<uint8_t, 512> expected{};
+            for (unsigned i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i * 37 + width);
+            std::copy(expected.begin(), expected.end(), c.mem.begin() + 0x4000);
+            address(100 + width, 1); c.out(0x1f7, 0x30);
+            check(c.in(0x3f6) == 0x58, "ATA first write block must request data without an initial completion interrupt");
+            c.r[DX] = 0x1f0; c.r[SI] = 0x4000; c.r[CX] = uint16_t(512 / width);
+            run(width == 2 ? std::vector<uint8_t>{0xf3,0x6f,0xf4} : std::vector<uint8_t>{0x66,0xf3,0x6f,0xf4});
+            check(c.in(0x3f6) == 0x80, "ATA write must report busy until its completion deadline");
+            tick(); c.in(0x1f7);
+            check(c.in(0x3f6) == 0x50 && c.in(0x1f2) == 0, "A complete PIO write must consume the sector count");
+            address(100 + width, 1); c.out(0x1f7, 0x20); tick(); c.in(0x1f7);
+            c.r[DI] = 0x5000; c.r[CX] = uint16_t(512 / width);
+            run(width == 2 ? std::vector<uint8_t>{0xf3,0x6d,0xf4} : std::vector<uint8_t>{0x66,0xf3,0x6d,0xf4});
+            check(std::equal(expected.begin(), expected.end(), c.mem.begin() + 0x5000),
+                "REP INSW/INSD and OUTSW/OUTSD must transfer complete words at the same ATA data port, not adjacent task-file registers");
+            c.out(0x1f7, 0xe7); tick(); c.in(0x1f7);
+            p.hard.reset();
+            {
+                Disk reopened(path, false, true); std::array<uint8_t, 512> actual{};
+                check(reopened.read(100 + width, actual.data()) && actual == expected,
+                    "PIO writes and FLUSH CACHE must persist through closing and reopening the disk");
+            }
+            p.hard = std::make_unique<Disk>(path, false, false);
+        }
+        c.out(0x1f6, 0xa0); c.out(0x1f2, 1); c.out(0x1f3, 40); c.out(0x1f4, 0); c.out(0x1f5, 0);
+        std::array<uint8_t, 512> chs{}; chs[0] = 0x34; chs[1] = 0x12; check(p.hard->write(39, chs.data()), "Cannot prepare CHS sector");
+        c.out(0x1f7, 0x20); tick(); c.in(0x1f7); c.r[DX] = 0x1f0;
+        run({0xed,0xf4});
+        check(c.r[AX] == 0x1234, "IN AX,DX must use a single ATA word transfer and support CHS addressing");
+        for (unsigned i = 1; i < 256; ++i) c.inputPort(0x1f0, 2);
+        c.out(0x1f2, 16); c.out(0x1f7, 0xc6); tick(); c.in(0x1f7);
+        address(200, 18); c.out(0x1f7, 0xc5);
+        for (unsigned sector = 0; sector < 18; ++sector) {
+            if (sector == 16) { check(c.in(0x3f6) == 0x80, "WRITE MULTIPLE must delay the next block"); tick(); c.in(0x1f7); }
+            for (unsigned i = 0; i < 256; ++i) c.outputPort(0x1f0, 0x8000 + sector, 2);
+        }
+        tick(); c.in(0x1f7); address(200, 18); c.out(0x1f7, 0xc4); tick(); c.in(0x1f7);
+        for (unsigned sector = 0; sector < 18; ++sector) {
+            if (sector == 16) { check(c.in(0x3f6) == 0x80 && c.in(0x1f2) == 2, "READ MULTIPLE must handle a partial final block"); tick(); c.in(0x1f7); }
+            for (unsigned i = 0; i < 256; ++i)
+                check(c.inputPort(0x1f0, 2) == 0x8000 + sector, "READ/WRITE MULTIPLE must preserve every sector's data across blocks");
+        }
+        address(300, 0); c.out(0x1f7, 0xc4);
+        for (unsigned block = 0; block < 16; ++block) {
+            tick(); c.in(0x1f7);
+            for (unsigned i = 0; i < 16 * 256; ++i) c.inputPort(0x1f0, 2);
+        }
+        check(c.in(0x3f6) == 0x50 && c.in(0x1f2) == 0 && c.in(0x1f3) == uint8_t(555),
+            "An ATA sector count of zero must transfer 256 sectors, not zero");
+        address(p.hard->sectors, 1); c.out(0x1f7, 0x20); tick();
+        check((c.in(0x1f7) & 9) == 1 && c.in(0x1f1) == 0x10, "Out-of-range ATA sectors must report IDNF without DRQ");
+        c.out(0x1f7, 0xc8); tick();
+        check((c.in(0x1f7) & 1) && c.in(0x1f1) == 4, "Unsupported ATA DMA commands must report ABRT, not successful completion");
+        c.out(0x1f6, 0xb0);
+        check(c.in(0x1f7) == 0, "The unmounted ATA slave must not impersonate a second disk");
+        c.out(0x1f6, 0xa0); c.out(0x21, 0xfb); c.out(0xa1, 0xbf);
+        c.out(0x3f6, 2); c.out(0x1f7, 0xec); tick();
+        check(c.irq() == -1 && c.in(0x3f6) == 0x58, "ATA nIEN must mask IRQ14 without suppressing command completion");
+        c.out(0x3f6, 0);
+        check(c.irq() == 0x76, "Reenabling ATA interrupts must expose a pending completion");
+        acknowledge();
+        c.out(0x3f6, 4); check(c.in(0x3f6) == 0x80, "ATA SRST must assert busy");
+        c.out(0x3f6, 0); tick();
+        check(c.in(0x1f7) == 0x50 && c.in(0x1f1) == 1 && c.in(0x1f2) == 1 && c.in(0x1f3) == 1
+            && c.in(0x1f4) == 0 && c.in(0x1f5) == 0 && c.inputPort(0x1f0, 2) == 0xffff,
+            "ATA software reset must restore its signature and discard any interrupted transfer");
+        p.hard.reset(); p.hard = std::make_unique<Disk>(path, false, true);
+        address(100, 1); c.out(0x1f7, 0x30); tick();
+        check((c.in(0x1f7) & 9) == 1 && c.in(0x1f1) == 4, "ATA writes to read-only media must fail before accepting data");
+    }
+    std::cout << "ATA PIO / CHS-LBA / IRQ14 / word-dword I/O / multi-sector / reset / disk-persistence checks passed\n";
+}
 void unit() {
     videoTests(); serialTests(); keyboardProbeTests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
@@ -1481,7 +1596,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        videoFirmwareTests(path); pagedBiosTests(path);
+        ideTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

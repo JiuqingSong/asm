@@ -3,6 +3,7 @@
 #include "video.h"
 #include "serial.h"
 #include "at.h"
+#include "ide.h"
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -38,6 +39,7 @@ public:
     Cpu cpu;
     Vga vga;
     SerialMouse serialMouse;
+    IdeChannel ide;
     std::unique_ptr<Disk> floppy, hard;
     uint64_t instructions = 0;
     double clock = 0;

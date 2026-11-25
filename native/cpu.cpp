@@ -55,6 +55,18 @@ uint8_t Cpu::fetch8() {
 }
 uint16_t Cpu::fetch16() { auto lo = fetch8(); return lo | (uint16_t(fetch8()) << 8); }
 uint32_t Cpu::fetch(int size) { return size == 1 ? fetch8() : size == 4 ? fetch32() : fetch16(); }
+uint32_t Cpu::inputPort(uint16_t port, unsigned size) {
+    if (size != 1 && size != 2 && size != 4) throw std::runtime_error("Invalid CPU I/O operand size");
+    if (size > 1 && inWide) return inWide(port, size);
+    uint32_t value = 0;
+    for (unsigned i = 0; i < size; ++i) value |= uint32_t(in ? in(uint16_t(port + i)) : 255) << (i * 8);
+    return value;
+}
+void Cpu::outputPort(uint16_t port, uint32_t value, unsigned size) {
+    if (size != 1 && size != 2 && size != 4) throw std::runtime_error("Invalid CPU I/O operand size");
+    if (size > 1 && outWide) { outWide(port, value, size); return; }
+    if (out) for (unsigned i = 0; i < size; ++i) out(uint16_t(port + i), uint8_t(value >> (i * 8)));
+}
 void Cpu::push(uint16_t v) {
     if (supports386()) { pushValue(v, 2); return; }
     auto sp = uint16_t(r[SP] - 2); wwS(SS, sp, v); r[SP] = sp;
@@ -196,13 +208,12 @@ void Cpu::string(uint8_t op) {
     switch (op & 0xfe) {
     case 0x6c: {
         requireIo(); checkSegment(ES, r[DI], unsigned(size), true);
-        uint16_t value = in ? in(r[DX]) : 255;
-        if (size == 2) value |= uint16_t(in ? in(uint16_t(r[DX] + 1)) : 255) << 8;
+        auto value = uint16_t(inputPort(r[DX], unsigned(size)));
         write(ES, r[DI], value); r[DI] += delta; break;
     }
     case 0x6e: {
         requireIo(); auto value = read(seg, r[SI]);
-        if (out) { out(r[DX], uint8_t(value)); if (size == 2) out(uint16_t(r[DX] + 1), uint8_t(value >> 8)); }
+        outputPort(r[DX], value, unsigned(size));
         r[SI] += delta; break;
     }
     case 0xa4: write(ES, r[DI], read(seg, r[SI])); r[SI] += delta; r[DI] += delta; break;
@@ -394,14 +405,12 @@ void Cpu::execute(uint8_t op) {
     case 0xe4: case 0xe5: case 0xec: case 0xed: {
         uint16_t p = op < 0xe8 ? fetch8() : r[DX];
         checkIo(p, unsigned(size));
-        uint16_t value = in ? in(p) : 255;
-        if (size == 2) value |= uint16_t(in ? in(uint16_t(p + 1)) : 255) << 8;
-        setReg(size, AX, value); return;
+        setReg(size, AX, inputPort(p, unsigned(size))); return;
     }
     case 0xe6: case 0xe7: case 0xee: case 0xef: {
         uint16_t p = op < 0xe8 ? fetch8() : r[DX];
         checkIo(p, unsigned(size));
-        if (out) { out(p, reg8(0)); if (size == 2) out(uint16_t(p + 1), reg8(4)); } return;
+        outputPort(p, r[AX], unsigned(size)); return;
     }
     case 0xe8: { auto d = fetch16(); auto ret = ip; push(uint16_t(ret)); ip = uint16_t(ret + d); return; }
     case 0xe9: { auto d = fetch16(); ip += d; return; }

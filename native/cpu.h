@@ -29,6 +29,8 @@ public:
     bool halted = false, waiting = false, repContinue = false;
     std::function<uint8_t(uint16_t)> in;
     std::function<void(uint16_t, uint8_t)> out;
+    std::function<uint32_t(uint16_t, unsigned)> inWide;
+    std::function<void(uint16_t, uint32_t, unsigned)> outWide;
     std::function<bool(uint8_t)> trap;
     std::function<int()> irq;
     std::function<void()> resetSignal;
@@ -65,6 +67,8 @@ public:
     void setModel(CpuModel value);
     bool supports386() const { return model >= CpuModel::I386; }
     void setFlags(uint16_t value);
+    uint32_t inputPort(uint16_t port, unsigned size);
+    void outputPort(uint16_t port, uint32_t value, unsigned size);
     bool protectedMode() const { return msw & 1; }
     uint8_t readPhysical(uint32_t address) const;
     uint16_t readWord(uint32_t address) const;

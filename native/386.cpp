@@ -306,14 +306,15 @@ void Cpu::string386(uint8_t op) {
     bool moveSi = false, moveDi = false;
     switch (op & 0xfe) {
     case 0x6c: {
-        checkIo(r[DX], size); checkSegment(ES, di, size, true); uint32_t value = 0;
+        checkIo(r[DX], size); checkSegment(ES, di, size, true);
         for (unsigned i = 0; i < size; ++i) translate(segmentBase(ES) + di + i, true, false);
-        for (unsigned i = 0; i < size; ++i) value |= uint32_t(in ? in(uint16_t(r[DX] + i)) : 255) << (i * 8);
+        checkAlignment(segmentBase(ES) + di, size);
+        auto value = inputPort(r[DX], size);
         writeSegment(ES, di, value, size); moveDi = true; break;
     }
     case 0x6e: {
         checkIo(r[DX], size); auto value = readSegment(source, si, size);
-        if (out) for (unsigned i = 0; i < size; ++i) out(uint16_t(r[DX] + i), uint8_t(value >> (i * 8)));
+        outputPort(r[DX], value, size);
         moveSi = true; break;
     }
     case 0xa4: writeSegment(ES, di, readSegment(source, si, size), size); moveSi = moveDi = true; break;
@@ -626,13 +627,12 @@ bool Cpu::exec386(uint8_t op) {
     case 0xcb: farReturn(0, false); break;
     case 0xcf: farReturn(0, true); break;
     case 0xe5: case 0xed: {
-        auto port = op == 0xe5 ? uint16_t(fetch8()) : r[DX]; checkIo(port, 4); uint32_t value = 0;
-        for (unsigned i = 0; i < 4; ++i) value |= uint32_t(in ? in(uint16_t(port + i)) : 255) << (i * 8);
-        r32(AX, value); break;
+        auto port = op == 0xe5 ? uint16_t(fetch8()) : r[DX]; checkIo(port, 4);
+        r32(AX, inputPort(port, 4)); break;
     }
     case 0xe7: case 0xef: {
         auto port = op == 0xe7 ? uint16_t(fetch8()) : r[DX]; checkIo(port, 4);
-        if (out) for (unsigned i = 0; i < 4; ++i) out(uint16_t(port + i), uint8_t(r32(AX) >> (i * 8)));
+        outputPort(port, r32(AX), 4);
         break;
     }
     case 0xf7:
