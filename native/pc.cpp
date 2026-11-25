@@ -14,6 +14,31 @@ static constexpr uint16_t font16Offset = 0x8000;
 static std::runtime_error osError(const char* operation) {
     return std::runtime_error(std::string(operation) + " (Windows error " + std::to_string(GetLastError()) + ")");
 }
+static uint32_t floppyPayloadSectors(HANDLE file, uint32_t sectors) {
+    uint32_t payload = sectors >= 2 ? sectors - 2 : 0;
+    if (payload != 320 && payload != 360 && payload != 640 && payload != 720 &&
+        payload != 1440 && payload != 2400 && payload != 2880) return sectors;
+    std::array<uint8_t, 512> boot{};
+    std::array<char, 1024> footer{};
+    DWORD done = 0; LARGE_INTEGER position{};
+    if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, boot.data(), DWORD(boot.size()), &done, nullptr) || done != boot.size())
+        throw osError("Cannot read floppy geometry");
+    position.QuadPart = uint64_t(payload) * 512;
+    if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN) ||
+        !ReadFile(file, footer.data(), DWORD(footer.size()), &done, nullptr) || done != footer.size())
+        throw osError("Cannot read floppy metadata");
+    auto word = [&](unsigned o) { return unsigned(boot[o]) | unsigned(boot[o + 1]) << 8; };
+    unsigned heads = (payload == 320 || payload == 360) ? 1 : 2;
+    unsigned spt = payload == 320 || payload == 640 ? 8 : payload == 2400 ? 15 : payload == 2880 ? 18 : 9;
+    std::string metadata(footer.data(), footer.size());
+    if (metadata.rfind("[FileVersion 003]", 0) != 0 || word(11) != 512 || word(19) != payload ||
+        word(24) != spt || word(26) != heads || word(510) != 0xaa55 ||
+        metadata.find("[SectorsPerTrack " + std::to_string(spt) + "]") == std::string::npos ||
+        metadata.find("[Tracks " + std::to_string(payload / (heads * spt)) + "]") == std::string::npos)
+        return sectors;
+    return payload;
+}
 static std::runtime_error biosError(Cpu& c, uint8_t number) {
     auto off = c.rwS(SS, c.r[SP]), seg = c.rwS(SS, uint16_t(c.r[SP] + 2));
     std::ostringstream message;
@@ -74,6 +99,8 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro),
     }
     sectors = uint32_t(size.QuadPart / 512);
     if (floppy) {
+        try { sectors = floppyPayloadSectors(file, sectors); }
+        catch (...) { CloseHandle(file); throw; }
         switch (sectors) {
         case 320: heads = 1; spt = 8; floppyType = 1; break;
         case 360: heads = 1; spt = 9; floppyType = 1; break;

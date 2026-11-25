@@ -1969,6 +1969,38 @@ void diskSizingTests(const std::filesystem::path& base) {
         throw;
     }
     std::cout << "126/504 MiB disk creation / BIOS-ATA geometry / final-sector persistence checks passed\n";
+    auto floppyPath = std::filesystem::path(base.native() + L".footer");
+    check(!std::filesystem::exists(floppyPath), "Footer fixture already exists");
+    try {
+        std::vector<uint8_t> bytes(1440 * 1024 + 1024);
+        bytes[11] = 0; bytes[12] = 2; bytes[19] = 0x40; bytes[20] = 0x0b;
+        bytes[24] = 18; bytes[26] = 2; bytes[510] = 0x55; bytes[511] = 0xaa;
+        bytes[1440 * 1024 - 512] = 0x5a;
+        const char footer[] = "[FileVersion 003] [SectorsPerTrack 18] [Tracks 80]";
+        std::copy(std::begin(footer), std::end(footer), bytes.begin() + 1440 * 1024);
+        auto save = [&]() {
+            std::ofstream f(floppyPath, std::ios::binary);
+            f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+            check(bool(f), "Cannot write footer fixture");
+        };
+        save();
+        {
+            Disk disk(floppyPath, true, true);
+            std::array<uint8_t, 512> sector{};
+            check(disk.sectors == 2880 && disk.cylinders == 80 && disk.spt == 18 &&
+                disk.read(2879, sector.data()) && sector[0] == 0x5a && !disk.read(2880, sector.data()),
+                "Known footer must not expose metadata as extra floppy sectors");
+        }
+        for (auto offset : {size_t(1440 * 1024), size_t(19), size_t(24)}) {
+            auto old = bytes[offset]; bytes[offset] ^= 1; save();
+            bool rejected = false;
+            try { Disk disk(floppyPath, true, true); } catch (const std::runtime_error&) { rejected = true; }
+            check(rejected, "Unknown footer or inconsistent BPB must not be silently truncated");
+            bytes[offset] = old;
+        }
+        std::filesystem::remove(floppyPath);
+    } catch (...) { std::filesystem::remove(floppyPath); throw; }
+    std::cout << "Floppy metadata footer / exact payload / inconsistent geometry rejection checks passed\n";
 }
 void unit() {
     videoTests(); serialTests(); keyboardProbeTests();

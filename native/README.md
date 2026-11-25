@@ -152,11 +152,78 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 BIOS 写请求结束时刷新；同一映像不允许另一个进程同时写入。
 客体的 FDISK/FORMAT 会修改所挂载的硬盘映像，请只使用专门创建的映像或备份。
 
-支持 160/180/320/360/720KB、1.2/1.44MB 原始软盘映像。硬盘采用
+支持 160/180/320/360/720KB、1.2/1.44MB 原始软盘映像。
+软盘也识别附加 1024 字节 `[FileVersion 003]` 元数据的映像：
+仅在尾部标识、BPB 容量及磁头/磁道参数一致时使用前面的标准软盘数据，
+不把元数据当成额外扇区，也不修改或截断原文件。
+硬盘采用
 16 磁头、63 扇区/磁道的 CHS 布局，必须包含完整柱面，最大 1024 柱面（504 MiB）。
 其他几何布局的已有硬盘映像不在本版支持范围内。
 三种创建容量分别为 64/256/1024 柱面；BIOS 与 ATA IDENTIFY 报告一致的实际容量。
 504 MiB 新盘已通过真实 DOS 6.22 的自动分区、格式化、完整安装及独立冷启动文件读回验证。
+
+## 独立 IMG 工具
+
+`image-tool.exe` 是独立命令行程序，`image-gui.exe` 是调用它的 Win32 包装界面，
+不依赖虚拟机、浏览器或管理员权限；两个 EXE 应放在同一目录。
+正常构建会同时生成它们，也可仅构建工具：
+
+```powershell
+.\native\build-image-tools.ps1 -Zig 'C:\tools\zig\zig.exe'
+.\native\build\image-gui.exe
+# 虚拟机 EXE 正在使用时，可构建到独立目录，不关闭当前窗口：
+.\native\build.ps1 -OutputDirectory '.\native\build\image-utilities'
+```
+
+图形界面提供硬盘 **31.5 / 63 / 126 / 252 / 504 MiB**，软盘
+**160 / 180 / 320 / 360 / 720 / 1200 / 1440 KiB**。
+默认新建已格式化数据盘：软盘 FAT12，硬盘 MBR 加单一 FAT16 主分区，
+沿用 16 磁头、63 扇区布局和 DOS 常用簇大小。勾选 **Raw zeros** 则创建纯零空盘。
+两者都不包含 DOS 系统文件；数据盘不能直接启动 DOS，安装系统仍需启动盘和安装程序。
+容量上限集中在 `image.h`，未来更大硬盘仍需同步扩展分区、文件系统和虚拟机支持，
+首版不会接受超过 504 MiB 的容量。
+
+```powershell
+.\native\build\image-tool.exe create-hard 'D:\images\data.img' --size 126
+.\native\build\image-tool.exe create-hard 'D:\images\blank.img' --size 504 --raw
+.\native\build\image-tool.exe create-floppy 'D:\images\files.img' --size 1440
+.\native\build\image-tool.exe put 'D:\images\data.img' 'D:\files\SETUP' 'D:\files\README.TXT' --dest '\INSTALL'
+.\native\build\image-tool.exe list 'D:\images\data.img' --dir '\INSTALL'
+```
+
+命令行硬盘容量单位为 MiB，接受可精确表示完整柱面的十进制大小，不仅限于界面预设。
+格式化 FAT16 最小 10 柱面（4.921875 MiB），纯零盘最小 1 柱面。
+图形界面可一次拖入多个文件或文件夹，多层子目录递归导入并保留结构；
+也可用 **Add files / Add folder**。目标目录不存在时创建，默认不覆盖已有文件；
+`--overwrite` / 界面复选框仅允许替换普通文件，不覆盖目录、只读/隐藏/系统文件或长名别名文件。
+列表为待导入队列，点 **Import all** 才写入；**List target** 可查看映像中的目标目录和剩余容量。
+
+首版导入只支持 FAT12/FAT16，以及 **ASCII DOS 8.3 文件名**（转换为大写），
+不自动截断长文件名、不生成别名；宿主上层路径和 IMG 路径可包含 Unicode。
+源文件夹中不符合 8.3 的名称、符号链接或 junction 会明确报错。
+FAT32、NTFS、扩展分区及多 DOS 主分区映像暂不支持。
+已有映像的启动代码、分区表和其他未修改数据保持不变。
+
+请先从虚拟机中卸载映像。工具拒绝已挂载/正在写入的映像；
+导入在内存中修改副本，按文件簇、目录及 FAT 的实际空间检查。
+总容量不足、根目录已满、源文件读取失败、文件名冲突或损坏 FAT 均报错，原 IMG 不变。
+全部成功后将临时文件写在原文件旁、刷新，并原子替换原 IMG。
+导入需要 **Windows 10+ 和支持 POSIX 原子重命名的文件系统（已验证本机 NTFS）**；
+不支持时明确失败，不降级为原地写入。
+因此需约一个 IMG 容量的内存，以及原目录中额外一个 IMG 容量的空闲空间。
+新建映像永远不覆盖已有目标文件。
+
+工具测试：
+
+```powershell
+.\native\build\image-tests.exe
+$p = Start-Process .\native\build\image-gui.exe -ArgumentList '--ui-test' -Wait -PassThru
+if ($p.ExitCode -ne 0) { throw 'Image GUI check failed' }
+```
+
+测试包含全部预设容量、BPB/CHS、递归导入、空文件、目录扩展、显式覆盖、
+多个源累计超容量回滚、挂载互斥和 FAT 损坏拒绝；界面测试通过拖放消息调用真实 CLI，
+检查嵌套目录读回及超容量错误。生成的 FAT12 软盘和 FAT16 硬盘已由真实 DOS 读回文件。
 
 ## 安装和运行 Windows 3.1 标准模式
 
