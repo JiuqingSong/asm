@@ -15,7 +15,8 @@
 
 namespace {
 enum { Type=101, Size, Raw, CreatePath, SavePath, Create, ImagePath, OpenPath, Destination,
-       Overwrite, Sources, AddFiles, AddFolder, Clear, Import, List, Output };
+       Overwrite, Sources, AddFiles, AddFolder, Clear, Import, List, Output,
+       BootKind, BootPartition, BootFull, BootFile, OpenBoot, SaveBoot, ExportBoot, ImportBoot };
 constexpr UINT Completed = WM_APP + 1;
 HWND window = nullptr;
 HFONT font = nullptr;
@@ -92,7 +93,10 @@ Result execute(const std::vector<std::wstring>& args) {
 }
 void state(bool active) {
     busy = active;
-    for (int id = Type; id <= List; ++id) EnableWindow(GetDlgItem(window, id), !active);
+    for (int id = Type; id <= ImportBoot; ++id)
+        if (id != Output) EnableWindow(GetDlgItem(window, id), !active);
+    EnableWindow(GetDlgItem(window, BootPartition), !active &&
+        SendMessageW(GetDlgItem(window, BootKind), CB_GETCURSEL, 0, 0) == 2);
     DragAcceptFiles(window, !active);
 }
 void start(std::vector<std::wstring> args) {
@@ -121,12 +125,13 @@ void sizes() {
         SendMessageW(list, CB_SETCURSEL, 0, 0);
     }
 }
-std::vector<std::filesystem::path> files(bool save, bool multi) {
+std::vector<std::filesystem::path> files(bool save, bool multi, bool boot = false) {
     std::vector<wchar_t> buffer(65536);
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = window;
     ofn.lpstrFile = buffer.data(); ofn.nMaxFile = DWORD(buffer.size());
-    ofn.lpstrFilter = multi ? L"All files\0*.*\0" : L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
-    ofn.lpstrDefExt = multi ? nullptr : L"img";
+    ofn.lpstrFilter = multi ? L"All files\0*.*\0" : boot ? L"Boot sectors (*.bin)\0*.bin\0All files\0*.*\0" :
+        L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
+    ofn.lpstrDefExt = multi ? nullptr : boot ? L"bin" : L"img";
     ofn.Flags = OFN_EXPLORER | OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST |
         (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST) | (multi ? OFN_ALLOWMULTISELECT : 0);
     if (!(save ? GetSaveFileNameW(&ofn) : GetOpenFileNameW(&ofn))) {
@@ -163,6 +168,25 @@ void import() {
     for (const auto& p : sources) args.push_back(p.wstring());
     start(std::move(args));
 }
+void bootAction(bool importing) {
+    if (text(ImagePath).empty() || text(BootFile).empty())
+        throw std::runtime_error("Select the image above and a boot sector file path first");
+    auto kind = SendMessageW(GetDlgItem(window, BootKind), CB_GETCURSEL, 0, 0);
+    std::vector<std::wstring> args{importing ? L"boot-import" : L"boot-export", text(ImagePath), text(BootFile),
+        L"--sector", kind == 0 ? L"floppy" : kind == 1 ? L"mbr" : L"partition"};
+    if (kind == 2) {
+        args.push_back(L"--partition");
+        args.push_back(std::to_wstring(SendMessageW(GetDlgItem(window, BootPartition), CB_GETCURSEL, 0, 0) + 1));
+    }
+    if (importing && SendMessageW(GetDlgItem(window, BootFull), BM_GETCHECK, 0, 0) == BST_CHECKED) {
+        if (!testing && MessageBoxW(window,
+            L"This replaces ALL 512 bytes, including the partition table or BPB.\n"
+            L"The image may become unreadable. Make a backup first.\n\nContinue?",
+            L"Full boot sector replacement", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+        args.push_back(L"--full");
+    }
+    start(std::move(args));
+}
 HWND control(const wchar_t* cls, const wchar_t* label, DWORD style, int x, int y, int width, int height, int id = 0) {
     HWND h = CreateWindowExW(cls == std::wstring(L"EDIT") ? WS_EX_CLIENTEDGE : 0, cls, label,
         WS_CHILD | WS_VISIBLE | style, x, y, width, height, window,
@@ -195,8 +219,24 @@ void layout() {
     control(L"BUTTON", L"Clear list", WS_TABSTOP, 258, 436, 100, 28, Clear);
     control(L"BUTTON", L"List target", WS_TABSTOP, 520, 436, 110, 28, List);
     control(L"BUTTON", L"Import all", WS_TABSTOP, 644, 436, 116, 28, Import);
+    control(L"STATIC", L"Boot sector (uses the IMG above): export 512 bytes or import boot code", 0, 14, 480, 746, 24);
+    auto kind = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 14, 510, 242, 180, BootKind);
+    for (auto name : {L"Floppy boot sector", L"Hard disk MBR", L"Hard disk partition boot sector"})
+        SendMessageW(kind, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
+    SendMessageW(kind, CB_SETCURSEL, 0, 0);
+    auto partition = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 270, 510, 122, 150, BootPartition);
+    for (auto name : {L"Primary slot 1", L"Primary slot 2", L"Primary slot 3", L"Primary slot 4"})
+        SendMessageW(partition, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(name));
+    SendMessageW(partition, CB_SETCURSEL, 0, 0); EnableWindow(partition, FALSE);
+    control(L"BUTTON", L"Full 512 bytes (destructive import)", BS_AUTOCHECKBOX | WS_TABSTOP, 406, 510, 354, 24, BootFull);
+    control(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 14, 548, 540, 26, BootFile);
+    control(L"BUTTON", L"Open BIN...", WS_TABSTOP, 564, 548, 92, 26, OpenBoot);
+    control(L"BUTTON", L"Save as...", WS_TABSTOP, 666, 548, 94, 26, SaveBoot);
+    control(L"STATIC", L"Default import preserves BPB / disk identity / partition table. Back up first.", 0, 14, 590, 495, 38);
+    control(L"BUTTON", L"Export sector", WS_TABSTOP, 520, 586, 110, 28, ExportBoot);
+    control(L"BUTTON", L"Import sector", WS_TABSTOP, 644, 586, 116, 28, ImportBoot);
     control(L"EDIT", L"Ready. Import is all-or-nothing; insufficient space leaves the original IMG unchanged.",
-        ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | WS_TABSTOP, 14, 480, 746, 150, Output);
+        ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | WS_TABSTOP, 14, 640, 746, 150, Output);
     DragAcceptFiles(window, TRUE);
 }
 void startTest() {
@@ -257,7 +297,24 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     std::ifstream image(std::filesystem::path(text(ImagePath)), std::ios::binary);
                     std::string after(std::istreambuf_iterator<char>(image), {});
                     if (after != testImage) throw std::runtime_error("GUI failed-import rollback verification failed");
-                    std::cout << "GUI multi-source drag/drop / recursive CLI import / disk-full error / rollback checks passed\n" << std::flush;
+                    setText(BootFile, (testRoot / L"BOOT.BIN").wstring());
+                    ++testStep; bootAction(false); return 0;
+                }
+                if (testStep == 4) {
+                    if (result->code || std::filesystem::file_size(testRoot / L"BOOT.BIN") != 512)
+                        throw std::runtime_error("GUI boot export must produce exactly 512 bytes");
+                    std::fstream boot(testRoot / L"BOOT.BIN", std::ios::binary | std::ios::in | std::ios::out);
+                    boot.seekp(100); boot.put(char(0x90)); boot.flush();
+                    if (!boot) throw std::runtime_error("Cannot prepare GUI boot import fixture");
+                    boot.close(); testImage[100] = char(0x90);
+                    ++testStep; bootAction(true); return 0;
+                }
+                if (testStep == 5) {
+                    if (result->code) throw std::runtime_error("GUI boot code import failed");
+                    std::ifstream image(std::filesystem::path(text(ImagePath)), std::ios::binary);
+                    std::string after(std::istreambuf_iterator<char>(image), {});
+                    if (after != testImage) throw std::runtime_error("GUI boot import modified more than selected code");
+                    std::cout << "GUI drag/drop / recursive import / disk-full rollback / boot-sector export-import checks passed\n" << std::flush;
                     DestroyWindow(hwnd); return 0;
                 }
                 if (result->code) throw std::runtime_error("GUI command failed");
@@ -296,6 +353,11 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case Clear: sources.clear(); SendMessageW(GetDlgItem(hwnd, Sources), LB_RESETCONTENT, 0, 0); break;
             case Import: import(); break;
             case List: start({L"list", text(ImagePath), L"--dir", text(Destination)}); break;
+            case BootKind: if (HIWORD(wp) == CBN_SELCHANGE) state(false); break;
+            case OpenBoot: { auto selected = files(false, false, true); if (!selected.empty()) setText(BootFile, selected.front().wstring()); break; }
+            case SaveBoot: { auto selected = files(true, false, true); if (!selected.empty()) setText(BootFile, selected.front().wstring()); break; }
+            case ExportBoot: bootAction(false); break;
+            case ImportBoot: bootAction(true); break;
             }
             return 0;
         }
@@ -323,7 +385,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     WNDCLASSW cls{}; cls.lpfnWndProc = proc; cls.hInstance = instance; cls.lpszClassName = L"Asm86ImageUtility";
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW); cls.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
     if (!RegisterClassW(&cls)) { CoUninitialize(); return 1; }
-    RECT rect{0,0,774,644};
+    RECT rect{0,0,774,804};
     AdjustWindowRect(&rect, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
     HWND hwnd = CreateWindowW(cls.lpszClassName, L"Asm86 disk image utility", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         CW_USEDEFAULT, CW_USEDEFAULT, rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);

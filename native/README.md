@@ -213,7 +213,37 @@ FAT32、NTFS、扩展分区及多 DOS 主分区映像暂不支持。
 因此需约一个 IMG 容量的内存，以及原目录中额外一个 IMG 容量的空闲空间。
 新建映像永远不覆盖已有目标文件。
 
-工具测试：
+### 引导扇区导出／导入
+
+界面下方的 **Boot sector** 使用上方 **Open IMG** 选择的映像。
+选择 **Floppy boot sector / Hard disk MBR / Hard disk partition boot sector**，
+分区引导扇区另选主分区表槽位 1–4，再选择 BIN 路径并点击 **Export sector / Import sector**。
+导出为原始 **512 字节** BIN，不自动覆盖已有输出。
+
+```powershell
+.\native\build\image-tool.exe boot-export 'D:\images\floppy.img' 'D:\images\floppy-boot.bin' --sector floppy
+.\native\build\image-tool.exe boot-export 'D:\images\data.img' 'D:\images\mbr.bin' --sector mbr
+.\native\build\image-tool.exe boot-export 'D:\images\data.img' 'D:\images\vbr.bin' --sector partition --partition 1
+.\native\build\image-tool.exe boot-import 'D:\images\data.img' 'D:\images\vbr.bin' --sector partition --partition 1
+# 明确替换全部 512 字节（包括 BPB 或分区表），操作前备份：
+.\native\build\image-tool.exe boot-import 'D:\images\data.img' 'D:\images\mbr.bin' --sector mbr --full
+```
+
+导入文件必须恰好 512 字节，默认 **仅替换引导代码**：
+
+- MBR 替换 0–439 和签名字节 510–511，保留磁盘标识、保留字节及分区表 440–509。
+- FAT12/FAT16 卷引导扇区替换开头跳转、BPB 后的代码及 55AA 签名；
+  保留 OEM/BPB/扩展 BPB，包括卷标、序列号、容量、FAT 布局和隐藏扇区数。
+  来源和目标必须具有有效、兼容的 BPB 头部格式，跳转不能进入保留的头部。
+- 分区槽位是 MBR 主分区表中的位置，不是 DOS 盘符；按该槽位的 LBA 定位。
+  空分区、越界分区、扩展分区和非 FAT12/FAT16 分区均拒绝。
+
+**Full 512 bytes** / `--full` 则不合并或保留扇区内部字段，可用于完整恢复或未格式化介质。
+这可能破坏文件系统或分区表；界面导入时必须再次确认，CLI 的显式 `--full` 即确认。
+其他扇区和软盘元数据尾部保持不变，仍遵守挂载互斥、临时副本、刷新与原子替换规则。
+导入引导代码不等于安装 DOS，也不会自动放入系统文件；代码必须适合目标系统和布局。
+
+### 工具验证
 
 ```powershell
 .\native\build\image-tests.exe
@@ -224,6 +254,9 @@ if ($p.ExitCode -ne 0) { throw 'Image GUI check failed' }
 测试包含全部预设容量、BPB/CHS、递归导入、空文件、目录扩展、显式覆盖、
 多个源累计超容量回滚、挂载互斥和 FAT 损坏拒绝；界面测试通过拖放消息调用真实 CLI，
 检查嵌套目录读回及超容量错误。生成的 FAT12 软盘和 FAT16 硬盘已由真实 DOS 读回文件。
+引导扇区测试覆盖精确导出、MBR/卷 BPB 保留、主分区槽位及边界、
+完整覆盖、无效输入回滚和挂载互斥；界面测试通过真实 CLI 完成导出、修改代码和导入，
+并验证其余映像字节不变。
 
 ## 安装和运行 Windows 3.1 标准模式
 

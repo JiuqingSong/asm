@@ -17,6 +17,11 @@ struct Info {
     unsigned fatBits;
     std::vector<Entry> entries;
 };
+enum class BootSector { Floppy, Mbr, Partition };
+void exportBoot(const std::filesystem::path& image, const std::filesystem::path& output,
+                BootSector sector, unsigned partition = 1);
+void importBoot(const std::filesystem::path& image, const std::filesystem::path& input,
+                BootSector sector, unsigned partition = 1, bool full = false);
 uint64_t hardSize(const std::wstring& mib);
 uint64_t floppySize(const std::wstring& kib);
 void create(const std::filesystem::path& path, uint64_t bytes, bool floppy, bool raw);

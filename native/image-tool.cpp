@@ -12,6 +12,10 @@ int wmain(int argc, wchar_t** argv) {
                 "  image-tool create-floppy IMAGE --size 160|180|320|360|720|1200|1440 [--raw]\n"
                 "  image-tool put IMAGE SOURCE... [--dest \\DIR\\SUB] [--overwrite]\n"
                 "  image-tool list IMAGE [--dir \\DIR]\n"
+                "  image-tool boot-export IMAGE OUTPUT --sector floppy|mbr|partition [--partition 1..4]\n"
+                "  image-tool boot-import IMAGE INPUT --sector floppy|mbr|partition [--partition 1..4] [--full]\n"
+                "Boot exports are exactly 512 bytes. Import preserves BPB/partition table by default.\n"
+                "--full replaces all 512 bytes, including BPB or partition table: BACK UP FIRST.\n"
                 "FAT data disks are formatted but NOT bootable DOS disks. --raw creates only zeros.\n"
                 "Import requires FAT12/FAT16 and ASCII DOS 8.3 source names; folders are recursive.\n"
                 "Unmount the image first. Existing images/files are never overwritten implicitly.\n";
@@ -19,13 +23,35 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (argc < 3) throw std::runtime_error("Missing command or image path; use --help");
         std::wstring command = argv[1], size, destination = L"\\";
-        bool raw = false, overwrite = false;
+        bool raw = false, overwrite = false, full = false, hasSector = false, hasPartition = false;
+        BootSector sector = BootSector::Floppy;
+        unsigned partition = 1;
+        bool boot = command == L"boot-export" || command == L"boot-import";
+        if (boot && argc < 4) throw std::runtime_error("Boot command requires a sector file path");
         std::vector<std::filesystem::path> sources;
         bool literal = false, hasSize = false, hasDest = false;
-        for (int i = 3; i < argc; ++i) {
+        for (int i = boot ? 4 : 3; i < argc; ++i) {
             std::wstring arg = argv[i];
             if (!literal && arg == L"--") { literal = true; continue; }
-            if (!literal && (arg == L"--size" || arg == L"--dest" || arg == L"--dir")) {
+            if (!literal && (arg == L"--sector" || arg == L"--partition")) {
+                if (!boot || ++i == argc) throw std::runtime_error("Boot sector option requires a value and a boot command");
+                std::wstring value = argv[i];
+                if (arg == L"--sector") {
+                    if (hasSector) throw std::runtime_error("Repeated --sector");
+                    hasSector = true;
+                    if (value == L"floppy") sector = BootSector::Floppy;
+                    else if (value == L"mbr") sector = BootSector::Mbr;
+                    else if (value == L"partition") sector = BootSector::Partition;
+                    else throw std::runtime_error("--sector must be floppy, mbr or partition");
+                } else {
+                    if (hasPartition || value.size() != 1 || value[0] < L'1' || value[0] > L'4')
+                        throw std::runtime_error("--partition must occur once and be 1..4");
+                    hasPartition = true; partition = unsigned(value[0] - L'0');
+                }
+            } else if (!literal && arg == L"--full") {
+                if (full || command != L"boot-import") throw std::runtime_error("--full is only valid once for boot-import");
+                full = true;
+            } else if (!literal && (arg == L"--size" || arg == L"--dest" || arg == L"--dir")) {
                 if (++i == argc) throw std::runtime_error("Option requires a value");
                 if (arg == L"--size") {
                     if (hasSize || (command != L"create-hard" && command != L"create-floppy")) throw std::runtime_error("Invalid or repeated --size");
@@ -45,7 +71,15 @@ int wmain(int argc, wchar_t** argv) {
                 sources.emplace_back(arg);
             }
         }
-        if (command == L"create-hard" || command == L"create-floppy") {
+        if (boot) {
+            if (!hasSector) throw std::runtime_error("--sector is required");
+            if (hasPartition && sector != BootSector::Partition) throw std::runtime_error("--partition is only valid for --sector partition");
+            if (command == L"boot-export") exportBoot(argv[2], argv[3], sector, partition);
+            else importBoot(argv[2], argv[3], sector, partition, full);
+            std::cout << (command == L"boot-export" ? "Exported exactly 512 bytes.\n" : full ?
+                "Imported complete 512-byte sector (including BPB/partition table); image published atomically.\n" :
+                "Imported boot code, preserved BPB/partition table; image published atomically.\n");
+        } else if (command == L"create-hard" || command == L"create-floppy") {
             if (!hasSize) throw std::runtime_error("--size is required");
             bool floppy = command == L"create-floppy";
             create(argv[2], floppy ? floppySize(size) : hardSize(size), floppy, raw);

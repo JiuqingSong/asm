@@ -47,6 +47,13 @@ Bytes load(File& f, uint64_t limit) {
     f.transfer(data.data(), data.size(), false);
     return data;
 }
+File editableImage(const std::filesystem::path& path) {
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) throw error("Cannot inspect image");
+    if (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_REPARSE_POINT))
+        throw std::runtime_error("Read-only images, symbolic links and junctions cannot be modified");
+    return File(path, GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, OPEN_EXISTING);
+}
 // Hold the original open without write sharing until the atomic rename completes.
 void publish(const std::filesystem::path& path, Bytes& data, bool replace) {
     wchar_t temp[MAX_PATH]{};
@@ -359,6 +366,51 @@ constexpr Floppy floppies[] = {
     {320,2,0xff,112,1,8,2}, {360,2,0xfd,112,2,9,2},
     {720,2,0xf9,112,3,9,2}, {1200,1,0xf9,224,7,15,2}, {1440,1,0xf0,224,9,18,2}
 };
+size_t bootOffset(const Bytes& b, BootSector sector, unsigned partition) {
+    if (b.size() < 512 || b.size() % 512 || b.size() > MaxHardBytes)
+        throw std::runtime_error("Image must contain 512-byte sectors and be at most 504 MiB");
+    if (sector == BootSector::Floppy) {
+        bool floppy = std::any_of(std::begin(floppies), std::end(floppies), [&](auto f) {
+            if (b.size() == f.kib * 1024ULL) return true;
+            size_t size = f.kib * 1024;
+            const char tag[] = "[FileVersion 003]";
+            return b.size() == size + 1024 && std::equal(std::begin(tag), std::end(tag) - 1, b.begin() + size) &&
+                w(b, 11) == 512 && w(b, 19) == size / 512 && w(b, 24) == f.spt && w(b, 26) == f.heads;
+        });
+        if (!floppy) throw std::runtime_error("Selected floppy image has unsupported geometry");
+        return 0;
+    }
+    if (b.size() % CylinderBytes)
+        throw std::runtime_error("Hard image must use complete 16-head/63-sector cylinders");
+    if (sector == BootSector::Mbr) return 0;
+    if (partition < 1 || partition > 4) throw std::runtime_error("Primary partition slot must be 1..4");
+    if (w(b, 510) != 0xaa55) throw std::runtime_error("MBR has no 55AA signature");
+    size_t entry = 446 + (partition - 1) * 16;
+    uint8_t type = b[entry + 4];
+    if (type != 1 && type != 4 && type != 6 && type != 0x0e)
+        throw std::runtime_error("Selected primary partition is not FAT12/FAT16");
+    uint32_t start = d(b, entry + 8), count = d(b, entry + 12);
+    if (!start || !count || uint64_t(start) + count > b.size() / 512)
+        throw std::runtime_error("Selected partition is empty or outside image bounds");
+    return size_t(start) * 512;
+}
+size_t bootHeader(const Bytes& b) {
+    unsigned spc = b[13], fats = b[16], roots = w(b, 17), fat = w(b, 22), reserved = w(b, 14);
+    uint32_t total = w(b, 19) ? w(b, 19) : d(b, 32);
+    uint64_t metadata = reserved + uint64_t(fats) * fat + (roots * 32 + 511) / 512;
+    if (w(b, 11) != 512 || !spc || (spc & (spc - 1)) || spc > 128 ||
+        !reserved || !fats || fats > 2 || !roots || !fat || total <= metadata)
+        throw std::runtime_error("Code-only volume import requires valid FAT12/FAT16 BPBs; use --full only for intentional sector replacement");
+    auto clusters = (total - metadata) / spc;
+    if (!clusters || clusters > 65518 || (uint64_t(clusters + 2) * (clusters < 4085 ? 12 : 16) + 7) / 8 > uint64_t(fat) * 512)
+        throw std::runtime_error("Code-only volume import does not support this FAT layout");
+    size_t header = b[38] == 0x28 || b[38] == 0x29 ? 62 : 36;
+    int entry = b[0] == 0xeb && b[2] == 0x90 ? 2 + int(int8_t(b[1]))
+        : b[0] == 0xe9 ? 3 + int(int16_t(w(b, 1))) : -1;
+    if (entry < int(header) || entry >= 510)
+        throw std::runtime_error("Unsupported boot jump or BPB layout; code must start after the preserved header");
+    return header;
+}
 void nonboot(Bytes& b, size_t at) {
     // Data disks deliberately contain no DOS system files or borrowed DOS boot code.
     const uint8_t code[] = {0xfa,0x31,0xc0,0x8e,0xd8,0x8e,0xd0,0xbc,0x00,0x7c,0xfb,
@@ -452,11 +504,7 @@ void create(const std::filesystem::path& path, uint64_t bytes, bool floppy, bool
 void put(const std::filesystem::path& path, const std::vector<std::filesystem::path>& sources,
          const std::wstring& destination, bool overwrite) {
     if (sources.empty()) throw std::runtime_error("At least one source file or directory is required");
-    DWORD attrs = GetFileAttributesW(path.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES) throw error("Cannot inspect image");
-    if (attrs & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_REPARSE_POINT))
-        throw std::runtime_error("Read-only images, symbolic links and junctions cannot be modified");
-    File original(path, GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, OPEN_EXISTING);
+    auto original = editableImage(path);
     Bytes b = load(original, MaxHardBytes);
     Volume volume(b);
     uint32_t dir = volume.resolve(destination, true);
@@ -469,6 +517,43 @@ void put(const std::filesystem::path& path, const std::vector<std::filesystem::p
         volume.import(dir, absolute, overwrite);
     }
     volume.validate();
+    publish(path, b, true);
+}
+void exportBoot(const std::filesystem::path& path, const std::filesystem::path& output,
+                BootSector sector, unsigned partition) {
+    if (std::filesystem::exists(output)) throw std::runtime_error("Export destination already exists; export never overwrites files");
+    File input(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+    auto b = load(input, MaxHardBytes);
+    auto offset = bootOffset(b, sector, partition);
+    Bytes boot(b.begin() + offset, b.begin() + offset + 512);
+    publish(output, boot, false);
+}
+void importBoot(const std::filesystem::path& path, const std::filesystem::path& input,
+                BootSector sector, unsigned partition, bool full) {
+    Bytes source;
+    {
+        File file(input, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
+        if (file.size() != 512) throw std::runtime_error("Boot sector input must be exactly 512 bytes");
+        source = load(file, 512);
+    }
+    auto original = editableImage(path);
+    auto b = load(original, MaxHardBytes);
+    auto offset = bootOffset(b, sector, partition);
+    if (full) std::copy(source.begin(), source.end(), b.begin() + offset);
+    else {
+        if (w(source, 510) != 0xaa55) throw std::runtime_error("Code-only input must have a 55AA boot signature");
+        if (sector == BootSector::Mbr) {
+            std::copy_n(source.begin(), 440, b.begin());
+        } else {
+            Bytes target(b.begin() + offset, b.begin() + offset + 512);
+            size_t header = bootHeader(target);
+            if (header != bootHeader(source))
+                throw std::runtime_error("Source and target BPB header formats differ; code-only import cannot safely merge them");
+            std::copy_n(source.begin(), 3, b.begin() + offset);
+            std::copy(source.begin() + header, source.begin() + 510, b.begin() + offset + header);
+        }
+        b[offset + 510] = source[510]; b[offset + 511] = source[511];
+    }
     publish(path, b, true);
 }
 Info inspect(const std::filesystem::path& path, const std::wstring& directory) {
