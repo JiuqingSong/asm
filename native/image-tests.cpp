@@ -184,6 +184,16 @@ int main() {
         hardExpected[63 * 512 + 100] = boot[100];
         require(bytes(hard) == hardExpected, "Partition code import preserves hidden sectors and other BPB fields");
         require(read(hard, L"\\INSTALL\\TREE\\SUB\\DATA.BIN") == payload, "FAT16 remains readable after VBR import");
+        auto beforeRepair = hardExpected;
+        installMbr(hard); hardExpected = bytes(hard);
+        require(std::equal(beforeRepair.begin() + 440, beforeRepair.end(), hardExpected.begin() + 440) &&
+            !std::equal(beforeRepair.begin(), beforeRepair.begin() + 440, hardExpected.begin()),
+            "Installing MBR repairs only code and preserves disk identity, table, VBR and all files");
+        require(read(hard, L"\\INSTALL\\TREE\\SUB\\DATA.BIN") == payload, "Files persist after MBR repair");
+        auto invalidActive = hardExpected; invalidActive[446] = 0; write(hard, invalidActive);
+        fails([&] { installMbr(hard); }, "No active");
+        require(bytes(hard) == invalidActive, "Missing active partition must not be silently guessed or rewritten");
+        write(hard, hardExpected);
         fails([&] { importBoot(hard, bootFile, BootSector::Partition, 2); }, "not FAT");
         fails([&] { importBoot(hard, bootFile, BootSector::Partition, 5); }, "1..4");
         require(bytes(hard) == hardExpected, "Invalid partition selections leave image unchanged");

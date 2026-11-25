@@ -14,6 +14,8 @@ int wmain(int argc, wchar_t** argv) {
                 "  image-tool list IMAGE [--dir \\DIR]\n"
                 "  image-tool boot-export IMAGE OUTPUT --sector floppy|mbr|partition [--partition 1..4]\n"
                 "  image-tool boot-import IMAGE INPUT --sector floppy|mbr|partition [--partition 1..4] [--full]\n"
+                "  image-tool boot-install-mbr IMAGE\n"
+                "Install self-authored MBR code to load the active partition; preserve disk identity/table.\n"
                 "Boot exports are exactly 512 bytes. Import preserves BPB/partition table by default.\n"
                 "--full replaces all 512 bytes, including BPB or partition table: BACK UP FIRST.\n"
                 "FAT data disks are formatted but NOT bootable DOS disks. --raw creates only zeros.\n"
@@ -84,6 +86,9 @@ int wmain(int argc, wchar_t** argv) {
             bool floppy = command == L"create-floppy";
             create(argv[2], floppy ? floppySize(size) : hardSize(size), floppy, raw);
             std::cout << "Created " << (raw ? "zero-filled raw image" : floppy ? "FAT12 data floppy" : "MBR / FAT16 data hard disk") << ".\n";
+        } else if (command == L"boot-install-mbr") {
+            installMbr(argv[2]);
+            std::cout << "Installed MBR code; preserved disk identity, partition table and all other sectors.\n";
         } else if (command == L"put") {
             put(argv[2], sources, destination, overwrite);
             std::cout << "Imported all sources successfully; image published atomically.\n";

@@ -3,6 +3,7 @@
 #include "preferences.h"
 #include "timing.h"
 #include "softfloat.h"
+#include "image.h"
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -2002,6 +2003,54 @@ void diskSizingTests(const std::filesystem::path& base) {
     } catch (...) { std::filesystem::remove(floppyPath); throw; }
     std::cout << "Floppy metadata footer / exact payload / inconsistent geometry rejection checks passed\n";
 }
+void mbrBootstrapTests(const std::filesystem::path& base) {
+    auto path = std::filesystem::path(base.native() + L".mbr");
+    check(!std::filesystem::exists(path), "MBR fixture already exists");
+    try {
+        image::create(path, 64 * image::CylinderBytes, false, false);
+        std::array<uint8_t, 512> mbr{}, vbr{};
+        {
+            Disk disk(path, false, false); check(disk.read(0, mbr.data()), "Cannot read generated MBR");
+            const uint8_t code[] = {0xc6,0x06,0,0x90,0xa5,0x88,0x16,1,0x90,0xfa,0xf4,0xeb,0xfd};
+            std::copy(std::begin(code), std::end(code), vbr.begin()); vbr[510] = 0x55; vbr[511] = 0xaa;
+            check(disk.write(63, vbr.data()), "Cannot install synthetic VBR"); disk.flush();
+        }
+        auto boot = [&](CpuModel model, bool success) {
+            Pc p; p.setModel(model); p.hard = std::make_unique<Disk>(path, false, true);
+            p.boot(0x80); p.run(10000);
+            check(success ? p.cpu.mem[0x9000] == 0xa5 && p.cpu.mem[0x9001] == 0x80 :
+                p.cpu.mem[0x9000] == 0 && p.text().find("Cannot load active partition boot sector.") != std::string::npos,
+                "MBR must chainload the VBR with DL=80h or explicitly report invalid boot metadata");
+        };
+        for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) boot(model, true);
+        std::filesystem::remove(path);
+        Disk::create(path, 1024);
+        auto putDword = [&](size_t o, uint32_t v) {
+            for (unsigned i = 0; i < 4; ++i) mbr[o + i] = uint8_t(v >> (8 * i));
+        };
+        auto saveMbr = [&]() { Disk d(path, false, false); check(d.write(0, mbr.data()), "Cannot write test MBR"); d.flush(); };
+        std::fill(mbr.begin() + 446, mbr.begin() + 510, 0);
+        constexpr uint32_t start = 300 * 1008 + 63;
+        mbr[494] = 0x80; mbr[498] = 6; putDword(502, start); putDword(506, 1024 * 1008 - start);
+        {
+            Disk disk(path, false, false); check(disk.write(start, vbr.data()), "Cannot install high-cylinder VBR");
+            disk.flush();
+        }
+        saveMbr();
+        for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) boot(model, true);
+        mbr[494] = 0; saveMbr(); boot(CpuModel::I8088, false);
+        mbr[494] = 0x80; mbr[446] = 0x80; saveMbr(); boot(CpuModel::I8088, false);
+        mbr[446] = 0; putDword(502, 0xffffffff); saveMbr(); boot(CpuModel::I8088, false);
+        putDword(502, start); saveMbr();
+        {
+            Disk disk(path, false, false); vbr[510] = 0;
+            check(disk.write(start, vbr.data()), "Cannot write invalid VBR"); disk.flush();
+        }
+        boot(CpuModel::I8088, false);
+        std::filesystem::remove(path);
+    } catch (...) { std::filesystem::remove(path); throw; }
+    std::cout << "Generated MBR / VBR chainload / high-cylinder LBA / fourth slot / DL / invalid metadata checks passed\n";
+}
 void unit() {
     videoTests(); serialTests(); keyboardProbeTests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
@@ -2047,7 +2096,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

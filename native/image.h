@@ -22,6 +22,7 @@ void exportBoot(const std::filesystem::path& image, const std::filesystem::path&
                 BootSector sector, unsigned partition = 1);
 void importBoot(const std::filesystem::path& image, const std::filesystem::path& input,
                 BootSector sector, unsigned partition = 1, bool full = false);
+void installMbr(const std::filesystem::path& image);
 uint64_t hardSize(const std::wstring& mib);
 uint64_t floppySize(const std::wstring& kib);
 void create(const std::filesystem::path& path, uint64_t bytes, bool floppy, bool raw);

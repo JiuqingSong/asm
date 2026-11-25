@@ -16,7 +16,7 @@
 namespace {
 enum { Type=101, Size, Raw, CreatePath, SavePath, Create, ImagePath, OpenPath, Destination,
        Overwrite, Sources, AddFiles, AddFolder, Clear, Import, List, Output,
-       BootKind, BootPartition, BootFull, BootFile, OpenBoot, SaveBoot, ExportBoot, ImportBoot };
+       BootKind, BootPartition, BootFull, BootFile, OpenBoot, SaveBoot, ExportBoot, ImportBoot, InstallMbr };
 constexpr UINT Completed = WM_APP + 1;
 HWND window = nullptr;
 HFONT font = nullptr;
@@ -93,10 +93,12 @@ Result execute(const std::vector<std::wstring>& args) {
 }
 void state(bool active) {
     busy = active;
-    for (int id = Type; id <= ImportBoot; ++id)
+    for (int id = Type; id <= InstallMbr; ++id)
         if (id != Output) EnableWindow(GetDlgItem(window, id), !active);
     EnableWindow(GetDlgItem(window, BootPartition), !active &&
         SendMessageW(GetDlgItem(window, BootKind), CB_GETCURSEL, 0, 0) == 2);
+    EnableWindow(GetDlgItem(window, InstallMbr), !active &&
+        SendMessageW(GetDlgItem(window, BootKind), CB_GETCURSEL, 0, 0) == 1);
     DragAcceptFiles(window, !active);
 }
 void start(std::vector<std::wstring> args) {
@@ -187,6 +189,15 @@ void bootAction(bool importing) {
     }
     start(std::move(args));
 }
+void installMbr() {
+    if (text(ImagePath).empty()) throw std::runtime_error("Select the hard disk image above first");
+    if (!testing && MessageBoxW(window,
+        L"Install MBR boot code that loads the active partition?\n"
+        L"Disk identity, partition table and partition contents will be preserved.\n"
+        L"Back up the image first; unmount it from the VM before continuing.",
+        L"Install MBR code", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    start({L"boot-install-mbr", text(ImagePath)});
+}
 HWND control(const wchar_t* cls, const wchar_t* label, DWORD style, int x, int y, int width, int height, int id = 0) {
     HWND h = CreateWindowExW(cls == std::wstring(L"EDIT") ? WS_EX_CLIENTEDGE : 0, cls, label,
         WS_CHILD | WS_VISIBLE | style, x, y, width, height, window,
@@ -232,7 +243,9 @@ void layout() {
     control(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 14, 548, 540, 26, BootFile);
     control(L"BUTTON", L"Open BIN...", WS_TABSTOP, 564, 548, 92, 26, OpenBoot);
     control(L"BUTTON", L"Save as...", WS_TABSTOP, 666, 548, 94, 26, SaveBoot);
-    control(L"STATIC", L"Default import preserves BPB / disk identity / partition table. Back up first.", 0, 14, 590, 495, 38);
+    control(L"STATIC", L"Code-only preserves BPB / partition table. Back up first.", 0, 14, 590, 364, 38);
+    auto install = control(L"BUTTON", L"Install MBR", WS_TABSTOP, 392, 586, 116, 28, InstallMbr);
+    EnableWindow(install, FALSE);
     control(L"BUTTON", L"Export sector", WS_TABSTOP, 520, 586, 110, 28, ExportBoot);
     control(L"BUTTON", L"Import sector", WS_TABSTOP, 644, 586, 116, 28, ImportBoot);
     control(L"EDIT", L"Ready. Import is all-or-nothing; insufficient space leaves the original IMG unchanged.",
@@ -314,7 +327,29 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     std::ifstream image(std::filesystem::path(text(ImagePath)), std::ios::binary);
                     std::string after(std::istreambuf_iterator<char>(image), {});
                     if (after != testImage) throw std::runtime_error("GUI boot import modified more than selected code");
-                    std::cout << "GUI drag/drop / recursive import / disk-full rollback / boot-sector export-import checks passed\n" << std::flush;
+                    ++testStep;
+                    SendMessageW(GetDlgItem(window, Type), CB_SETCURSEL, 0, 0); sizes();
+                    setText(CreatePath, (testRoot / L"HARD.IMG").wstring());
+                    setText(ImagePath, text(CreatePath)); create(); return 0;
+                }
+                if (testStep == 6) {
+                    if (result->code) throw std::runtime_error("GUI MBR fixture creation failed");
+                    std::fstream image(testRoot / L"HARD.IMG", std::ios::binary | std::ios::in | std::ios::out);
+                    image.write(std::string(440, char(0x90)).data(), 440); image.close();
+                    if (!image) throw std::runtime_error("Cannot prepare obsolete MBR fixture");
+                    std::ifstream before(testRoot / L"HARD.IMG", std::ios::binary);
+                    testImage.assign(std::istreambuf_iterator<char>(before), {});
+                    SendMessageW(GetDlgItem(window, BootKind), CB_SETCURSEL, 1, 0); state(false);
+                    ++testStep; installMbr(); return 0;
+                }
+                if (testStep == 7) {
+                    if (result->code) throw std::runtime_error("GUI MBR repair failed");
+                    std::ifstream image(testRoot / L"HARD.IMG", std::ios::binary);
+                    std::string after(std::istreambuf_iterator<char>(image), {});
+                    if (after.size() != testImage.size() || after.substr(440) != testImage.substr(440) ||
+                        after.substr(0, 440) == testImage.substr(0, 440))
+                        throw std::runtime_error("GUI MBR repair changed data or left old code intact");
+                    std::cout << "GUI drag/drop / boot export-import / MBR repair preservation checks passed\n" << std::flush;
                     DestroyWindow(hwnd); return 0;
                 }
                 if (result->code) throw std::runtime_error("GUI command failed");
@@ -358,6 +393,7 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             case SaveBoot: { auto selected = files(true, false, true); if (!selected.empty()) setText(BootFile, selected.front().wstring()); break; }
             case ExportBoot: bootAction(false); break;
             case ImportBoot: bootAction(true); break;
+            case InstallMbr: installMbr(); break;
             }
             return 0;
         }
