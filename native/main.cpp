@@ -94,7 +94,7 @@ void render(HDC target, int width, int height) {
         pixels.resize(pc->vga.width() * pc->vga.height());
         for (unsigned y = 0; y < pc->vga.height(); ++y) for (unsigned x = 0; x < pc->vga.width(); ++x) {
             auto color = pc->vga.pixel(x, y);
-            auto index = pc->vga.mode == 0x13 ? color : pc->vga.paletteIndex(color);
+            auto index = pc->vga.indexed256() ? color : pc->vga.paletteIndex(color);
             pixels[y * pc->vga.width() + x] = pc->vga.blanked() ? 0 : pc->vga.color(index);
         }
     } else {
@@ -104,9 +104,9 @@ void render(HDC target, int width, int height) {
             auto rgb = pc->vga.color(pc->vga.paletteIndex(index));
             return pc->vga.blanked() ? RGB(0,0,0) : RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
         };
-        const unsigned base = 0xb8000 + page * 4096;
+        const unsigned base = page * 4096;
         for (unsigned y = 0; y < 25; ++y) for (unsigned x = 0; x < cols; ++x) {
-            uint8_t ch = pc->cpu.mem[base + (y * cols + x) * 2], attr = pc->cpu.mem[base + (y * cols + x) * 2 + 1];
+            uint8_t ch = pc->vga.textByte(base + (y * cols + x) * 2), attr = pc->vga.textByte(base + (y * cols + x) * 2 + 1);
             SetTextColor(back, palette(attr & 15)); SetBkColor(back, palette((attr >> 4) & 7));
             RECT cell{int(x) * cellWidth, int(y) * 16, int(x + 1) * cellWidth, int(y + 1) * 16};
             ExtTextOutW(back, cell.left, cell.top, ETO_OPAQUE | ETO_CLIPPED, &cell, &glyphs[ch], 1, nullptr);
@@ -378,7 +378,15 @@ int headless(const std::filesystem::path& script) {
         else if (op == "type") {
             for (unsigned char ch : arg) {
                 SHORT vk = VkKeyScanA(char(ch)); unsigned scan = vk == -1 ? 0 : MapVirtualKeyW(uint8_t(vk), MAPVK_VK_TO_VSC);
-                tapKey(uint8_t(scan), ch); pc->run(5000);
+                if (!scan || scan > 0x7f) throw std::runtime_error("Cannot map scripted character to a keyboard scan code");
+                if (vk & 0x100) pc->key(0x2a, 0);
+                if (vk & 0x200) pc->key(0x1d, 0);
+                if (vk & 0x400) pc->key(0x38, 0);
+                tapKey(uint8_t(scan), ch);
+                if (vk & 0x400) pc->key(0xb8, 0);
+                if (vk & 0x200) pc->key(0x9d, 0);
+                if (vk & 0x100) pc->key(0xaa, 0);
+                pc->run(50000);
             }
         } else if (op == "mouse") {
             std::istringstream input(arg);
@@ -401,8 +409,10 @@ int headless(const std::filesystem::path& script) {
             info.biSize = sizeof(info); info.biWidth = LONG(width); info.biHeight = -LONG(height);
             info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
             std::vector<uint32_t> pixels(width * height);
-            if (!pc->vga.blanked()) for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x)
-                pixels[y * width + x] = pc->vga.color(pc->vga.paletteIndex(pc->vga.pixel(x, y)));
+            if (!pc->vga.blanked())             for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+                auto color = pc->vga.pixel(x, y);
+                pixels[y * width + x] = pc->vga.color(pc->vga.indexed256() ? color : pc->vga.paletteIndex(color));
+            }
             std::ofstream out(std::filesystem::u8path(arg), std::ios::binary);
             out.write(reinterpret_cast<const char*>(&file), sizeof(file)); out.write(reinterpret_cast<const char*>(&info), sizeof(info));
             out.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(uint32_t)));

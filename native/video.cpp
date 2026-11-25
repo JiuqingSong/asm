@@ -1,33 +1,41 @@
 #include "video.h"
+#include "font8x8.h"
 #include <algorithm>
 #include <stdexcept>
 #include <string>
 
 namespace asm86 {
 Vga::Vga() { setMode(3); }
-unsigned Vga::width() const { return mode == 0x0d || mode == 0x13 ? 320 : 640; }
+unsigned Vga::width() const { return graphics() ? (unsigned(crtc[1]) + 1) * (indexed256() ? 4 : 8) : 640; }
 unsigned Vga::height() const {
-    return mode == 0x12 ? 480 : mode == 0x10 ? 350 : graphics() ? 200 : 400;
+    if (!graphics()) return 400;
+    unsigned lines = (unsigned(crtc[0x12]) | ((crtc[7] & 2) << 7) | ((crtc[7] & 0x40) << 3)) + 1;
+    return std::max(1u, lines / ((crtc[9] & 31) + 1) / (crtc[9] & 0x80 ? 2 : 1));
 }
 unsigned Vga::charHeight() const { return mode == 0x10 ? 14 : mode == 0x12 || !graphics() ? 16 : 8; }
 void Vga::setMode(uint8_t value, bool clear) {
     if (value > 3 && value != 0x0d && value != 0x0e && value != 0x10 && value != 0x12 && value != 0x13)
         throw std::runtime_error("Unsupported native VGA mode " + std::to_string(value));
     mode = value;
+    const bool graphical = mode >= 0x0d;
     if (clear) for (auto& plane : planes) plane.fill(0);
+    if (!graphical)
+        for (unsigned ch = 0; ch < 256; ++ch)
+            for (unsigned row = 0; row < 16; ++row)
+                planes[2][ch * 32 + row] = biosFont8x8[ch * 8 + row / 2];
     latch.fill(0); seq.fill(0); gc.fill(0); attr.fill(0);
     seqIndex = gcIndex = crtcIndex = readIndex = writeIndex = readPart = writePart = dacState = 0;
     attrAddress = 0x20; attrData = false; pelMask = 255;
     seq[0] = 3; seq[1] = mode == 0x0d ? 9 : 1;
-    seq[2] = graphics() ? 15 : 3; seq[4] = mode == 0x13 ? 14 : graphics() ? 6 : 2;
-    gc[5] = mode == 0x13 ? 0x40 : graphics() ? 0 : 0x10;
-    gc[6] = graphics() ? 5 : 14; gc[7] = 15; gc[8] = 255;
+    seq[2] = graphical ? 15 : 3; seq[4] = mode == 0x13 ? 14 : graphical ? 6 : 2;
+    gc[5] = mode == 0x13 ? 0x40 : graphical ? 0 : 0x10;
+    gc[6] = graphical ? 5 : 14; gc[7] = 15; gc[8] = 255;
     const uint8_t palette[] = {0,1,2,3,4,5,0x14,7,0x38,0x39,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f};
     std::copy(std::begin(palette), std::end(palette), attr.begin());
-    attr[0x10] = mode == 0x13 ? 0x41 : graphics() ? 1 : 0x0c; attr[0x12] = 15;
+    attr[0x10] = mode == 0x13 ? 0x41 : graphical ? 1 : 0x0c; attr[0x12] = 15;
     if (mode == 0x0d || mode == 0x0e || mode == 0x13)
         for (unsigned i = 0; i < 16; ++i) attr[i] = uint8_t(i);
-    misc = mode == 0x12 ? 0xe3 : mode == 0x10 ? 0xa3 : graphics() ? 0x63 : 0x67;
+    misc = mode == 0x12 ? 0xe3 : mode == 0x10 ? 0xa3 : graphical ? 0x63 : 0x67;
     crtc = {0x5f,0x4f,0x50,0x82,0x54,0x80,0xbf,0x1f,0,0x40,0,0,0,0,0,0,
         0x9c,0x8e,0x8f,0x28,0,0x96,0xb9,0xe3,0xff};
     if (mode == 0x12) {
@@ -89,10 +97,10 @@ int Vga::offset(uint32_t address) const {
 }
 uint8_t Vga::read(uint32_t address) {
     int off = offset(address); if (off < 0) return 255;
-    if (seq[4] & 8) return planes[off & 3][(off >> 2) & 65535];
-    if (!(seq[4] & 4)) return planes[off & 1][off & 65534];
-    for (unsigned p = 0; p < 4; ++p) latch[p] = planes[p][off & 65535];
-    if (!(gc[5] & 8)) return latch[gc[4] & 3];
+    bool chain4 = seq[4] & 8, oddEven = !(seq[4] & 4);
+    unsigned index = (chain4 ? off >> 2 : oddEven ? off >> 1 : off) & 65535;
+    for (unsigned p = 0; p < 4; ++p) latch[p] = planes[p][index];
+    if (!(gc[5] & 8)) return latch[chain4 ? off & 3 : oddEven ? (gc[4] & 2) | (off & 1) : gc[4] & 3];
     uint8_t result = 255;
     for (unsigned p = 0; p < 4; ++p)
         if (gc[7] & (1 << p)) result &= gc[2] & (1 << p) ? latch[p] : uint8_t(~latch[p]);
@@ -100,16 +108,14 @@ uint8_t Vga::read(uint32_t address) {
 }
 void Vga::write(uint32_t address, uint8_t value) {
     int off = offset(address); if (off < 0) return;
-    if ((seq[4] & 8) || !(seq[4] & 4)) {
-        unsigned p = off & (seq[4] & 8 ? 3 : 1);
-        if (seq[2] & (1 << p)) planes[p][seq[4] & 8 ? (off >> 2) & 65535 : off & 65534] = value;
-        return;
-    }
+    bool chain4 = seq[4] & 8, oddEven = !(seq[4] & 4);
+    unsigned index = (chain4 ? off >> 2 : oddEven ? off >> 1 : off) & 65535;
+    unsigned planeMask = seq[2] & (chain4 ? 1u << (off & 3) : oddEven ? 5u << (off & 1) : 15u);
     unsigned wm = gc[5] & 3, rotation = gc[3] & 7, operation = (gc[3] >> 3) & 3;
     if ((wm == 0 || wm == 3) && rotation) value = uint8_t((value >> rotation) | (value << (8 - rotation)));
     uint8_t mask = wm == 3 ? uint8_t(gc[8] & value) : gc[8];
     for (unsigned p = 0; p < 4; ++p) {
-        if (!(seq[2] & (1 << p))) continue;
+        if (!(planeMask & (1 << p))) continue;
         uint8_t data = latch[p];
         if (wm != 1) {
             if (wm == 0) data = gc[1] & (1 << p) ? (gc[0] & (1 << p) ? 255 : 0) : value;
@@ -119,14 +125,14 @@ void Vga::write(uint32_t address, uint8_t value) {
             else if (operation == 3) data ^= latch[p];
             data = uint8_t((data & mask) | (latch[p] & ~mask));
         }
-        planes[p][off & 65535] = data;
+        planes[p][index] = data;
     }
 }
 uint8_t Vga::pixel(unsigned x, unsigned y) const {
     if (x >= width() || y >= height()) throw std::runtime_error("VGA pixel is outside the display");
-    if (mode == 0x13) {
-        auto off = y * width() + x;
-        return planes[off & 3][(off >> 2) & 65535];
+    if (indexed256()) {
+        unsigned off = (y * (crtc[0x13] * 2) + x / 4 + ((unsigned(crtc[12]) << 8) | crtc[13])) & 65535;
+        return planes[x & 3][off];
     }
     unsigned off = (y * (crtc[0x13] * 2) + x / 8 + ((unsigned(crtc[12]) << 8) | crtc[13])) & 65535;
     uint8_t result = 0;
@@ -135,12 +141,13 @@ uint8_t Vga::pixel(unsigned x, unsigned y) const {
 }
 void Vga::pixel(unsigned x, unsigned y, uint8_t value, bool exclusiveOr) {
     if (x >= width() || y >= height()) throw std::runtime_error("VGA pixel is outside the display");
-    if (mode == 0x13) {
-        auto off = y * width() + x;
-        planes[off & 3][off >> 2] = value;
+    if (indexed256()) {
+        unsigned off = (y * (crtc[0x13] * 2) + x / 4 + ((unsigned(crtc[12]) << 8) | crtc[13])) & 65535;
+        planes[x & 3][off] = value;
         return;
     }
-    unsigned off = y * (width() / 8) + x / 8, mask = 0x80 >> (x & 7);
+    unsigned off = (y * (crtc[0x13] * 2) + x / 8 + ((unsigned(crtc[12]) << 8) | crtc[13])) & 65535;
+    unsigned mask = 0x80 >> (x & 7);
     for (unsigned p = 0; p < 4; ++p) {
         auto& byte = planes[p][off];
         if (exclusiveOr) { if (value & (1 << p)) byte ^= uint8_t(mask); }

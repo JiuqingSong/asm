@@ -7,7 +7,9 @@ class Vga {
 public:
     Vga();
     void setMode(uint8_t value, bool clear = true);
-    bool graphics() const { return mode >= 0x0d; }
+    bool graphics() const { return gc[6] & 1; }
+    bool indexed256() const { return gc[5] & 0x40; }
+    uint8_t textByte(unsigned offset) const { return planes[offset & 1][(offset >> 1) & 65535]; }
     unsigned width() const;
     unsigned height() const;
     unsigned charHeight() const;

@@ -117,8 +117,8 @@ Pc::Pc() {
     cpu.irq = [this]() { return acknowledge(); };
     cpu.trap = [this](uint8_t n) { return bios(n); };
     cpu.mmioStart = 0xa0000; cpu.mmioEnd = 0xc0000;
-    cpu.mmioRead = [this](uint32_t a) { return vga.graphics() ? vga.read(a) : cpu.mem[a]; };
-    cpu.mmioWrite = [this](uint32_t a, uint8_t v) { if (vga.graphics()) vga.write(a, v); else cpu.mem[a] = v; };
+    cpu.mmioRead = [this](uint32_t a) { return vga.read(a); };
+    cpu.mmioWrite = [this](uint32_t a, uint8_t v) { vga.write(a, v); };
     serialMouse.setIrq = [this](bool raised) { if (raised) pic[0].raise(4); };
     cpu.resetSignal = [this] { pendingReset = true; };
 }
@@ -156,7 +156,7 @@ void Pc::boot(uint8_t drive) {
     const uint8_t timer[] = {0x50, 0xf1, 0x08, 0xcd, 0x1c, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf};
     std::copy(std::begin(timer), std::end(timer), cpu.mem.begin() + 0xf0800);
     cpu.ww(0, 8 * 4, 0x800);
-    const uint8_t keyboard[] = {0x50, 0xf1, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf};
+    const uint8_t keyboard[] = {0x50, 0xe4, 0x60, 0xf1, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf};
     std::copy(std::begin(keyboard), std::end(keyboard), cpu.mem.begin() + 0xf0820);
     cpu.ww(0, 9 * 4, 0x820);
     cpu.ww(0x40, 0, 0x3f8); cpu.wb(0x40, 0x7c, 1);
@@ -183,7 +183,7 @@ void Pc::boot(uint8_t drive) {
     const uint8_t reset[] = {0xea, 0x00, 0x06, 0x00, 0xf0};
     std::copy(std::begin(reset), std::end(reset), cpu.mem.begin() + 0xffff0);
     cpu.wb(0xf000, 0x600, 0xf1); cpu.wb(0xf000, 0x601, 0x19);
-    for (unsigned i = 0; i < 0x4000; i += 2) { cpu.mem[0xb8000 + i] = 32; cpu.mem[0xb8001 + i] = 7; }
+    for (unsigned i = 0; i < 0x4000; i += 2) cpu.ww(0xb800, uint16_t(i), 0x0720);
     std::copy(sector.begin(), sector.end(), cpu.mem.begin() + 0x7c00);
     if (at()) std::copy(cpu.mem.begin() + 0xf0000, cpu.mem.begin() + 0x100000, cpu.mem.begin() + 0xff0000);
     for (auto seg : {ES, CS, SS, DS}) cpu.loadSegment(seg, 0);
@@ -246,7 +246,7 @@ uint8_t Pc::input(uint16_t p) {
     }
     if (p == 0x60) {
         if (at() && !controller.empty()) { auto value = controller.front(); controller.pop_front(); keyboardIrq(); return value; }
-        if (keys.empty()) return 0;
+        if (keys.empty() || (keyboardRead && (pic[0].service & 2))) return uint8_t(keyboardLatch >> 8);
         keyboardLatch = keys.front(); keys.pop_front(); keyboardRead = true;
         keyboardIrq();
         return uint8_t(keyboardLatch >> 8);
@@ -308,16 +308,28 @@ void Pc::key(uint8_t scan, uint8_t ascii) {
     keys.push_back(uint16_t((uint16_t(scan) << 8) | ascii)); keyboardIrq();
 }
 void Pc::modifiers(uint8_t value) { cpu.wb(0x40, 0x17, value); }
-void Pc::keyboard() {
-    uint16_t value;
-    // An IRQ1 hook may read port 60h before chaining to the firmware handler.
-    if (keyboardRead) { value = keyboardLatch; keyboardRead = false; }
-    else {
-        if (at() && !controller.empty()) { controller.pop_front(); keyboardIrq(); return; }
-        if (keys.empty()) return;
-        value = keys.front(); keys.pop_front();
+static uint8_t keyboardAscii(uint8_t scan, uint8_t flags) {
+    static constexpr char plain[] = "\0\0331234567890-=\b\tqwertyuiop[]\r\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 ";
+    static constexpr char shifted[] = "\0\033!@#$%^&*()_+\b\tQWERTYUIOP{}\r\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 ";
+    if (scan >= sizeof(plain) - 1) {
+        static constexpr char keypad[] = "789-456+1230.";
+        return (flags & 0x20) && !(flags & 3) && scan >= 0x47 && scan <= 0x53 ? uint8_t(keypad[scan - 0x47]) : 0;
     }
-    auto scan = value >> 8;
+    auto ch = uint8_t((flags & 3 ? shifted : plain)[scan]);
+    if ((flags & 0x40) && plain[scan] >= 'a' && plain[scan] <= 'z') ch ^= 0x20;
+    if (flags & 4) {
+        if (ch >= 'a' && ch <= 'z') ch -= 'a' - 'A';
+        if (ch >= '@' && ch <= '_') ch &= 31;
+    }
+    return ch;
+}
+void Pc::keyboard() {
+    // The ROM reads port 60h so a VM86 monitor can supply its virtual scan code.
+    auto scan = cpu.reg8(0);
+    auto ascii = keyboardRead && uint8_t(keyboardLatch >> 8) == scan
+        ? uint8_t(keyboardLatch) : keyboardAscii(scan, cpu.rbF(0x40, 0x17));
+    uint16_t value = uint16_t((uint16_t(scan) << 8) | ascii);
+    keyboardRead = false;
     unsigned key = scan & 0x7f;
     uint8_t modifier = key == 0x2a ? 2 : key == 0x36 ? 1 : key == 0x1d ? 4 : key == 0x38 ? 8 : 0;
     if (modifier) {
@@ -343,9 +355,9 @@ void Pc::keyboard() {
     keyboardIrq();
 }
 std::string Pc::text() const {
-    std::string result; unsigned cols = std::min(columns(), 80u), base = 0xb8000 + activePage() * 4096;
+    std::string result; unsigned cols = std::min(columns(), 80u), base = activePage() * 4096;
     for (unsigned y = 0; y < 25; ++y) {
-        for (unsigned x = 0; x < cols; ++x) { auto c = cpu.mem[base + (y * cols + x) * 2]; result += c >= 32 && c < 127 ? char(c) : ' '; }
+        for (unsigned x = 0; x < cols; ++x) { auto c = vga.textByte(base + (y * cols + x) * 2); result += c >= 32 && c < 127 ? char(c) : ' '; }
         result += '\n';
     }
     return result;

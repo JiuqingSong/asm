@@ -960,6 +960,7 @@ void atTests(CpuModel model) {
 void keyboardProbeTests() {
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386}) {
         Pc p; p.setModel(model); auto& c = p.cpu;
+        auto irq1 = [&]() { c.reg8(0, c.in(0x60)); return c.trap(9); };
         c.r[SP] = 0x1000; c.r[BX] = 0x822a; c.r[CX] = 1;
         c.ww(0x40, 0x1a, 0x1e); c.ww(0x40, 0x1c, 0x20); c.ww(0x40, 0x1e, 0x1c0d);
         c.ww(0, 0x1004, 0xa55a);
@@ -979,32 +980,32 @@ void keyboardProbeTests() {
         check(rejected, "Unimplemented keyboard services must still report an explicit error");
         c.ww(0x40, 0x1a, 0x1e); c.ww(0x40, 0x1c, 0x1e);
         p.key(1, 27); p.key(0x1e, 'a');
-        check(c.irq() == 9 && c.in(0x60) == 1 && c.trap(9) && c.rw(0x40, 0x1e) == 0x011b,
+        check(c.irq() == 9 && c.in(0x60) == 1 && irq1() && c.rw(0x40, 0x1e) == 0x011b,
             "An EDIT-style IRQ1 hook must not swallow a key when it reads port 60h before chaining");
         c.out(0x20, 0x20);
-        check(c.irq() == 9 && c.trap(9) && c.rw(0x40, 0x20) == 0x1e61,
+        check(c.irq() == 9 && irq1() && c.rw(0x40, 0x20) == 0x1e61,
             "Chaining a peeked key must leave the following queued key for its own interrupt");
         c.out(0x20, 0x20); p.key(0x2d, 'x');
         check(c.irq() == 9 && c.in(0x60) == 0x2d, "A raw keyboard driver must still receive its scan code");
         c.out(0x20, 0x20); p.key(0x15, 'y');
-        check(c.irq() == 9 && c.trap(9) && c.rw(0x40, 0x22) == 0x1579,
+        check(c.irq() == 9 && irq1() && c.rw(0x40, 0x22) == 0x1579,
             "A new IRQ1 must not reuse a previous driver's unchained key");
         for (auto scan : {0x38, 0xb8, 0x9e}) {
             auto tail = c.rw(0x40, 0x1c);
             c.out(0x20, 0x20); p.key(uint8_t(scan), 0);
-            check(c.irq() == 9 && c.in(0x60) == scan && c.trap(9) && c.rw(0x40, 0x1c) == tail,
+            check(c.irq() == 9 && c.in(0x60) == scan && irq1() && c.rw(0x40, 0x1c) == tail,
                 "Modifier and break scan codes must reach hooks without entering the BIOS character buffer");
             check((c.rb(0x40, 0x17) & 8) == (scan == 0x38 ? 8 : 0),
                 "The BIOS must update Alt state inside IRQ1 so resident hooks observe its transition");
             if (scan == 0x38) {
                 c.out(0x20, 0x20); p.key(0x21, 'f');
-                check(c.irq() == 9 && c.trap(9) && c.rw(0x40, tail) == 0x2100,
+                check(c.irq() == 9 && irq1() && c.rw(0x40, tail) == 0x2100,
                     "Alt+letter must reach DOS menus as an extended BIOS key, not printable text");
             }
         }
         for (auto state : {0x2a02, 0x3603, 0xaa01, 0xb600, 0x3a40, 0x3a40, 0xba40, 0x3a00}) {
             c.out(0x20, 0x20); p.key(uint8_t(state >> 8), 0);
-            check(c.irq() == 9 && c.trap(9) && c.rb(0x40, 0x17) == uint8_t(state),
+            check(c.irq() == 9 && irq1() && c.rb(0x40, 0x17) == uint8_t(state),
                 "BIOS modifier handling must distinguish left/right Shift and suppress Caps Lock auto-repeat");
         }
     }
@@ -1033,6 +1034,20 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
                 && observed->attr == p.vga.attr && observed->dac == p.vga.dac && !p.vga.blanked(),
                 "A guest I/O monitor must observe the complete BIOS mode transition, including return to text");
         }
+        auto monitor = c.in;
+        unsigned keyboardReads = 0;
+        c.in = [&](uint16_t port) {
+            if (port == 0x60) { ++keyboardReads; return uint8_t(0x1e); }
+            return monitor(port);
+        };
+        c.halted = false; c.loadSegment(CS, 0); c.loadSegment(SS, 0);
+        c.ip = 0x500; c.r[SP] = 0x9000; c.r[AX] = 0xa55a; c.setFlags(2);
+        c.mem[0x500] = 0xcd; c.mem[0x501] = 9; c.mem[0x502] = 0xf4;
+        c.ww(0x40, 0x1a, 0x1e); c.ww(0x40, 0x1c, 0x1e);
+        p.runCpu(100);
+        check(c.halted && keyboardReads == 1 && c.r[AX] == 0xa55a && c.rw(0x40, 0x1e) == 0x1e61,
+            "IRQ1 ROM must read a monitor-provided scan code through guest IN and preserve AX");
+        c.in = monitor;
         c.r[AX] = 0x1130; c.r[BX] = 0x600;
         check(c.trap(0x10), "ROM font query failed");
         auto font = (unsigned(c.s[ES]) << 4) + c.r[BP];
@@ -1042,6 +1057,11 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
             check(c.readPhysical(font + ' ' * 16 + row) == 0, "ROM space glyph must be blank");
         }
         check(font + 4096 <= 0x100000 && ink, "ROM graphics font must contain readable 8x16 glyphs inside the BIOS ROM");
+        c.out(0x3c4, 4); c.out(0x3c5, 6);
+        c.out(0x3ce, 6); c.out(0x3cf, 4); c.out(0x3ce, 4); c.out(0x3cf, 2);
+        for (unsigned row = 0; row < 16; ++row)
+            check(c.rb(0xa000, uint16_t('A' * 32 + row)) == c.readPhysical(font + 'A' * 16 + row),
+                "Text-mode planar reads must expose VGA font plane 2 to DOS-window grabbers");
     }
 }
 void pagedBiosTests(const std::filesystem::path& disk) {
@@ -1060,9 +1080,12 @@ void pagedBiosTests(const std::filesystem::path& disk) {
     c.r[AX] = 0x0100;
     check(c.trap(0x16) && c.r[AX] == 0x1c0d && !(c.readWord(0x203004) & ZF) && c.rw(0x40, 0x1c) == 0,
         "VM86 keyboard BIOS must read mapped queue entries and update mapped interrupt-frame flags");
-    p.key(0x1e, 'a');
+    c.reg8(0, 0x1e);
     check(c.trap(9) && c.readWord(0x200420) == 0x1e61 && c.readWord(0x20041c) == 0x22 && c.rw(0x40, 0x1c) == 0,
-        "Firmware IRQ1 must append to the current VM's keyboard queue, not physical page zero");
+        "Firmware IRQ1 must accept a virtual scan code without host input and append to the mapped VM queue");
+    c.reg8(0, 0x2a); c.trap(9); c.reg8(0, 0x1e); c.trap(9); c.reg8(0, 0xaa); c.trap(9);
+    check(c.readWord(0x200422) == 0x1e41 && c.readWord(0x20041c) == 0x24 && c.mem[0x200417] == 0,
+        "Virtual scan-code translation must use the current VM's Shift state and handle key releases");
     c.writeDword(0x20046c, 1234); c.writeDword(0x46c, 5678);
     check(c.trap(8) && c.readDword(0x20046c) == 1235 && c.readDword(0x46c) == 5678,
         "Firmware timer ticks must update the mapped BDA without corrupting another VM's memory");
@@ -1192,6 +1215,37 @@ void videoTests() {
     rejected = false; try { bios(0x1124); } catch (const std::runtime_error&) { rejected = true; }
     check(rejected && c.readDword(0x10c) == vector && c.rb(0x40, 0x84) == rows,
         "Invalid graphics font selection must fail without modifying the current font");
+    auto profile = std::make_unique<Vga>();
+    auto restore = [&]() {
+        for (unsigned i = 0; i < 5; ++i) { c.out(0x3c4, uint8_t(i)); c.out(0x3c5, profile->seq[i]); }
+        for (unsigned i = 0; i < 9; ++i) gc(uint8_t(i), profile->gc[i]);
+        for (unsigned i = 0; i < 25; ++i) { c.out(0x3d4, uint8_t(i)); c.out(0x3d5, profile->crtc[i]); }
+    };
+    bios(3); c.ww(0xb800, 0, 0x1f51); c.ww(0xb800, 2, 0x2e5a);
+    c.out(0x3c4, 4); c.out(0x3c5, 6); gc(6, 4); gc(4, 0);
+    check(c.rb(0xa000, 0) == 'Q' && c.rb(0xa000, 1) == 'Z',
+        "Text characters must share the same plane-zero bytes seen by VGA save/restore code");
+    gc(4, 1);
+    check(c.rb(0xa000, 0) == 0x1f && c.rb(0xa000, 1) == 0x2e,
+        "Text attributes must occupy contiguous plane-one bytes, not sparse CPU byte offsets");
+    mask(1); c.wb(0xa000, 0, 'R'); profile->setMode(3); restore();
+    check(c.rb(0xb800, 0) == 'R' && p.vga.textByte(0) == 'R',
+        "Planar text restoration must update both guest odd/even reads and the host text display");
+    const unsigned dimensions[][3] = {{0x0d,320,200},{0x0e,640,200},{0x10,640,350},{0x12,640,480},{0x13,320,200}};
+    for (const auto& entry : dimensions) {
+        bios(3); profile->setMode(uint8_t(entry[0])); restore();
+        check(p.vga.mode == 3 && p.vga.graphics() && p.vga.width() == entry[1] && p.vga.height() == entry[2]
+            && p.vga.indexed256() == (entry[0] == 0x13),
+            "Direct VGA register restoration must select graphics, geometry and palette independently of BIOS metadata");
+        c.wb(0xa000, 0, 0x80);
+        check(p.vga.pixel(0, 0) == (entry[0] == 0x13 ? 0x80 : 15),
+            "Register-restored graphics must route guest memory writes through the VGA planes");
+        p.vga.pixel(entry[1] - 1, entry[2] - 1, 11);
+        check(p.vga.pixel(entry[1] - 1, entry[2] - 1) == 11, "Restored graphics must address the final visible pixel");
+        profile->setMode(3); restore(); c.wb(0xb800, 0, 'T');
+        check(!p.vga.graphics() && p.vga.textByte(0) == 'T',
+            "Direct text restoration must return guest text memory to the existing text display");
+    }
 }
 void serialTests() {
     Pc p; auto& c = p.cpu;
