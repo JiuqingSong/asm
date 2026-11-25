@@ -37,6 +37,12 @@ void preferenceTests() {
             Preferences prefs(key.c_str());
             check(prefs.cpu() == CpuModel::I386 && prefs.fullSpeed() && prefs.floppy() == std::filesystem::absolute(path),
                 "Experimental 386 selection must persist without changing speed or floppy preferences");
+            prefs.cpu(CpuModel::I486);
+        }
+        {
+            Preferences prefs(key.c_str());
+            check(prefs.cpu() == CpuModel::I486 && prefs.fullSpeed() && prefs.floppy() == std::filesystem::absolute(path),
+                "Experimental 486 selection must survive reopening without changing other preferences");
             prefs.cpu(CpuModel::I8088); prefs.fullSpeed(false); prefs.floppy({});
         }
         {
@@ -64,7 +70,7 @@ void preferenceTests() {
     cleanup();
 }
 void timingTests() {
-    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386}) for (bool full : {false, true}) {
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) for (bool full : {false, true}) {
         Pc p; p.setModel(model);
         auto& c = p.cpu;
         c.loadSegment(CS, 0); c.ip = 0x500; c.setFlags(2);
@@ -128,9 +134,9 @@ void timingTests() {
     check(idle.cpu.halted && idle.instructions == 1 && idle.clock == 0, "A halted CPU must yield without accelerating time or banking instructions");
     std::cout << "Real-time CPU rates / PIT / RTC / UART / speed-toggle checks passed\n";
 }
-void cpu386Tests() {
-    auto real = []() {
-        Cpu c; c.setModel(CpuModel::I386); c.a20 = true;
+void cpu386Tests(CpuModel model) {
+    auto real = [&]() {
+        Cpu c; c.setModel(model); c.a20 = true;
         for (auto seg : {ES, CS, SS, DS, FS, GS}) c.loadSegment(seg, 0);
         c.r[SP] = 0x8000; c.ip = 0x500; c.setFlags(2); return c;
     };
@@ -139,6 +145,80 @@ void cpu386Tests() {
         for (unsigned i = 0; i < 1000 && !c.halted; ++i) c.step();
         check(c.halted, "386 test program did not halt");
     };
+    {
+        auto c = real();
+        c.r32(AX, 0x240002);
+        run(c, {0x66,0x50,0x66,0x9d,0x66,0x9c,0x66,0x5b,0xf4});
+        check(c.r32(BX) == (model == CpuModel::I486 ? 0x240002u : 2u),
+            "PUSHFD/POPFD must distinguish 486 AC/ID flags from reserved 386 bits");
+        c.setEflags(2); c.r[SP] = 0x8000;
+        c.writeDword(0x8000, 0x700); c.writeDword(0x8004, 0); c.writeDword(0x8008, 0x240002); c.mem[0x700] = 0xf4;
+        run(c, {0x66,0xcf});
+        check(c.eflags() == (model == CpuModel::I486 ? 0x240002u : 2u),
+            "Real-mode IRETD must restore supported AC/ID flags without exposing them on a 386");
+    }
+    if (model == CpuModel::I486) {
+        auto c = real(); c.r32(AX, 0x12345678);
+        run(c, {0x0f,0xc8,0xf4});
+        check(c.r32(AX) == 0x78563412, "486 BSWAP must exchange all four bytes regardless of the default operand size");
+        c.r32(AX, 0x7fffffff); c.r32(CX, 1);
+        run(c, {0x66,0x0f,0xc1,0xc8,0xf4});
+        check(c.r32(AX) == 0x80000000 && c.r32(CX) == 0x7fffffff && (c.flags & (OF|SF|CF|ZF)) == (OF|SF),
+            "Dword XADD must exchange the source and compute signed-overflow flags");
+        c.r32(AX, 0x1234ff80);
+        run(c, {0x0f,0xc0,0xc0,0xf4});
+        check(c.r32(AX) == 0x1234ff00 && (c.flags & (OF|CF|ZF)) == (OF|CF|ZF),
+            "XADD with the same byte register must leave the sum, preserving the rest of EAX");
+        c.r[AX] = 0x7fff; c.r[CX] = 1;
+        run(c, {0x0f,0xc1,0xc8,0xf4});
+        check(c.r[AX] == 0x8000 && c.r[CX] == 0x7fff && (c.flags & OF), "Word XADD must honor 16-bit operands");
+        c.r32(AX, 0x12345678); c.r32(CX, 0xabcdef01); c.writeDword(0x2000, 0x12345678);
+        run(c, {0x66,0x0f,0xb1,0x0e,0,0x20,0xf4});
+        check(c.readDword(0x2000) == 0xabcdef01 && c.r32(AX) == 0x12345678 && (c.flags & ZF),
+            "Successful CMPXCHG must store the source without changing the accumulator");
+        unsigned writes = 0; c.onWrite = [&](uint32_t address) { if (address == 0x2000) ++writes; };
+        run(c, {0x66,0x0f,0xb1,0x0e,0,0x20,0xf4});
+        check(c.r32(AX) == 0xabcdef01 && c.readDword(0x2000) == 0xabcdef01 && !(c.flags & ZF) && writes == 1,
+            "Failed CMPXCHG must load the accumulator and still perform a destination write cycle");
+        c.r[AX] = 7; c.r[BX] = 8; c.r[CX] = 9;
+        run(c, {0x0f,0xb0,0xcb,0xf4});
+        check(c.reg8(0) == 8 && c.reg8(3) == 8 && !(c.flags & ZF), "Byte CMPXCHG must compare AL and preserve a mismatched destination");
+        c.onWrite = {}; c.r32(AX, 0);
+        run(c, {0x0f,0xa2,0xf4});
+        check(c.r32(AX) == 1 && c.r32(BX) == 0x756e6547 && c.r32(DX) == 0x49656e69 && c.r32(CX) == 0x6c65746e,
+            "486 CPUID leaf zero must identify GenuineIntel and the supported leaf range");
+        c.r32(AX, 1); run(c, {0x0f,0xa2,0xf4});
+        check(c.r32(AX) == 0x450 && !c.r32(DX) && !c.r32(CX),
+            "486 CPUID must not advertise an x87 or other unavailable instruction-set extensions");
+        c.r32(AX, 0xffffffff); run(c, {0x0f,0xa2,0xf4});
+        check(!c.r32(AX) && !c.r32(BX) && !c.r32(CX) && !c.r32(DX), "Unsupported CPUID leaves must return no features");
+        c.r32(AX, 0x2000); unsigned reads = 0;
+        c.mmioStart = 0x2000; c.mmioEnd = 0x3000; c.mmioRead = [&](uint32_t) { ++reads; return uint8_t(0); };
+        run(c, {0x67,0x0f,1,0x38,0x0f,8,0x0f,9,0xf4});
+        check(reads == 0, "INVLPG and cache invalidation must not read or write the memory operand");
+        c.mmioRead = {}; c.mmioStart = c.mmioEnd = 0;
+        c.r32(AX, 0x50030); run(c, {0x0f,0x22,0xc0,0x0f,0x20,0xc3,0xf4});
+        check(c.r32(BX) == 0x50030, "486 MOV CR0 must preserve AM, WP and NE");
+        c.r32(AX, 0x12345018); run(c, {0x0f,0x22,0xd8,0x0f,0x20,0xd9,0xf4});
+        check(c.r32(CX) == 0x12345018, "486 CR3 must preserve page-directory cache-control bits");
+        c.r32(CX, 2); c.writeDword(0x2000, 3);
+        run(c, {0xf0,0x66,0x0f,0xc1,0x0e,0,0x20,0xf4});
+        check(c.readDword(0x2000) == 5 && c.r32(CX) == 3, "LOCK XADD must accept a memory destination");
+        for (const auto& code : {std::vector<uint8_t>{0xf0,0x0f,0xc8}, {0xf0,0x0f,0xa2},
+            {0xf0,0x0f,0xc1,0xc0}, {0xf0,0x0f,0xb1,0xc0}, {0xf0,0x0f,1,0x3e,0,0x20}}) {
+            auto invalid = real(); invalid.ww(0, 24, 0x700); invalid.ww(0, 26, 0); invalid.mem[0x700] = 0xf4;
+            run(invalid, code);
+            check(invalid.ip == 0x701 && invalid.rwS(SS, invalid.r[SP]) == 0x500,
+                "486 instructions must reject LOCK on register destinations and non-lockable operations");
+        }
+    } else {
+        for (const auto& code : {std::vector<uint8_t>{0x0f,0xc8}, {0x0f,0xc1,0xc0}, {0x0f,0xb1,0xc0},
+            {0x0f,0xa2}, {0x0f,8}, {0x0f,9}, {0x0f,1,0x3e,0,0x20}}) {
+            auto c = real(); c.ww(0, 24, 0x700); c.ww(0, 26, 0); c.mem[0x700] = 0xf4;
+            run(c, code);
+            check(c.ip == 0x701 && c.rwS(SS, c.r[SP]) == 0x500, "486-only opcodes must remain #UD on a 386");
+        }
+    }
     {
         auto c = real();
         run(c, {0x66,0xb8,0xff,0xff,0xff,0x7f, 0x66,0x05,1,0,0,0,
@@ -223,6 +303,53 @@ void cpu386Tests() {
         check(c.halted && c.protectedMode(), "386 real-mode LGDT/MOV CR0/far jump must enter a 32-bit code segment");
         return c;
     };
+    if (model == CpuModel::I486) {
+        auto c = protectedMachine({0xf4});
+        c.msw |= 0x40000; c.setEflags(0x63002); c.cpl = 3;
+        c.loadSegment(DS, 0); c.loadSegment(SS, 0);
+        for (unsigned size : {2u, 4u}) {
+            c.writeDword(0x200, 0x12345678);
+            bool rejected = false;
+            try { c.readSegment(DS, 0x201, size); } catch (const CpuFault& f) { rejected = f.vector == 17 && f.code == 0; }
+            check(rejected, "486 user and VM86 unaligned reads must raise #AC when CR0.AM and EFLAGS.AC are set");
+            rejected = false;
+            try { c.writeSegment(DS, 0x201, 0xaabbccdd, size); } catch (const CpuFault& f) { rejected = f.vector == 17 && f.code == 0; }
+            check(rejected && c.readDword(0x200) == 0x12345678, "An alignment fault must occur before an unaligned store modifies memory");
+            check(c.readSegment(DS, 0x200, size) == (size == 2 ? 0x5678u : 0x12345678u), "Aligned operands must remain accessible with alignment checking enabled");
+        }
+        c.msw &= ~0x40000u;
+        check(c.readSegment(DS, 0x201, 2) == 0x3456, "Clearing CR0.AM must disable alignment faults");
+        c.msw |= 0x40000; c.setEflags(0x23002);
+        check(c.readSegment(DS, 0x201, 2) == 0x3456, "Clearing EFLAGS.AC must disable alignment faults");
+        c.setEflags(0x63002); c.cr3 = 0x10000; c.writeDword(0x10000, 0x11007); c.msw |= 0x80000000u;
+        bool rejected = false;
+        try { c.readSegment(DS, 0x201, 4); } catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 4 && c.cr2 == 0x201; }
+        check(rejected, "Page faults must take precedence over alignment faults for an unmapped unaligned operand");
+        c = protectedMachine({0xf4}); c.msw |= 0x40000; c.setEflags(0x40002);
+        c.mem[0x201] = 0x5a;
+        check(c.readSegment(DS, 0x201, 4) == 0x5a, "Ring-zero memory accesses must not generate alignment checks");
+        c.mem[0x101d] |= 0x60; c.mem[0x1025] |= 0x60;
+        const uint32_t userFrame[] = {0x700, 0x1b, 0x40002, 0x8000, 0x23};
+        for (unsigned i = 0; i < std::size(userFrame); ++i) c.writeDword(0x200000 + i * 4, userFrame[i]);
+        c.mem[0x3000] = 0xcf; c.ip = 0x3000; c.halted = false; c.step();
+        c.loadSegment(DS, 0x23);
+        rejected = false;
+        try { c.readSegment(DS, 0x201, 2); } catch (const CpuFault& f) { rejected = f.vector == 17 && f.code == 0; }
+        check(c.cpl == 3 && rejected, "Protected-mode IRETD must restore AC and enforce alignment in an actual ring-three context");
+        c.writeDword(0x8000, 0x240002); c.mem[0x700] = 0x66; c.mem[0x701] = 0x9d; c.step();
+        check((c.eflags() & 0x240000) == 0x240000 && !(c.flags & 0x3000),
+            "User POPFD may change AC/ID without acquiring IOPL privileges");
+        for (const auto& code : {std::vector<uint8_t>{0x0f,8}, {0x0f,9}, {0x67,0x0f,1,0x38}}) {
+            c = protectedMachine({0xf4}); c.setEflags(0x23002); c.cpl = 3;
+            c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.ip = 0x500; c.halted = false; c.r[SP] = 0x8000;
+            c.gdtr = {}; c.idtr = {};
+            bool denied = false;
+            c.onFault = [&](CpuFault f, uint32_t) { if (f.vector == 13 && f.code == 0) denied = true; };
+            std::copy(code.begin(), code.end(), c.mem.begin() + 0x500);
+            try { c.step(); } catch (const std::runtime_error&) { check(denied, "Privileged opcode failed before its expected #GP"); }
+            check(denied, "486 cache and TLB maintenance instructions must be privileged in VM86 mode");
+        }
+    }
     {
         auto c = protectedMachine({0xb8,0x78,0x56,0x34,0x12, 0xa3,0,0,0x10,0,
             0x8b,0x1d,0,0,0x10,0, 0x50,0x5a, 0x0f,0xb6,0xc8, 0x8d,0x34,0x8d,0,0x10,0,0, 0xf4});
@@ -283,8 +410,15 @@ void cpu386Tests() {
         bool rejected = false;
         try { c.writeLinear(0x40000000, 0xa5); } catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 7 && c.cr2 == 0x40000000; }
         check(rejected && c.mem[0x100000] == 0x5a, "User writes to read-only pages must fault with CR2 and P/W/U error bits");
-        c.cpl = 0; c.msw |= 0x10000; c.writeLinear(0x40000000, 0xa5);
-        check(c.mem[0x100000] == 0xa5, "386 supervisor writes must not incorrectly implement 486 CR0.WP");
+        c.cpl = 0; c.msw |= 0x10000;
+        if (model == CpuModel::I486) {
+            rejected = false;
+            try { c.writeLinear(0x40000000, 0xa5); } catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 3; }
+            check(rejected && c.mem[0x100000] == 0x5a, "486 CR0.WP must protect read-only pages against supervisor writes");
+            c.msw &= ~0x10000u;
+        }
+        c.writeLinear(0x40000000, 0xa5);
+        check(c.mem[0x100000] == 0xa5, "Supervisor writes must ignore read-only permissions on a 386 or with 486 WP clear");
         c.writeDword(0x11000 + 8 * 4, 0x8007); c.mem[0x8ffe] = 0x55; c.mem[0x8fff] = 0x66;
         rejected = false;
         try { c.writeSegment(DS, 0x8ffe, 0x12345678, 4); } catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 2 && c.cr2 == 0x9000; }
@@ -958,7 +1092,7 @@ void atTests(CpuModel model) {
         "A deliberate triple fault must perform CMOS 09h's stack-based real-mode return instead of rebooting DOS");
 }
 void keyboardProbeTests() {
-    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386}) {
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         Pc p; p.setModel(model); auto& c = p.cpu;
         auto irq1 = [&]() { c.reg8(0, c.in(0x60)); return c.trap(9); };
         c.r[SP] = 0x1000; c.r[BX] = 0x822a; c.r[CX] = 1;
@@ -1017,7 +1151,7 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
     c.in = [&](uint16_t port) { observed->input(port); return input(port); };
     c.out = [&](uint16_t port, uint8_t value) { observed->output(port, value); output(port, value); };
     p.hard = std::make_unique<Disk>(disk, false, false);
-    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386}) {
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         p.setModel(model); p.boot(0x80); observed->setMode(3);
         for (uint16_t mode : {0x12, 0x93, 3}) {
             c.halted = false;
@@ -1356,6 +1490,7 @@ void unit() {
 }
 }
 int main(int argc, char** argv) {
-    try { if (argc == 2) return corpus(argv[1]); preferenceTests(); timingTests(); cpu386Tests(); protectedTests(); atTests(CpuModel::I286); atTests(CpuModel::I386); unit(); return 0; }
+    try { if (argc == 2) return corpus(argv[1]); preferenceTests(); timingTests(); cpu386Tests(CpuModel::I386); cpu386Tests(CpuModel::I486);
+        protectedTests(); atTests(CpuModel::I286); atTests(CpuModel::I386); atTests(CpuModel::I486); unit(); return 0; }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

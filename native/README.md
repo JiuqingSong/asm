@@ -23,6 +23,7 @@ Program Manager、COM1 鼠标双击打开 File Manager、键盘操作均已验�
 字体查询返回当前几何信息，不再固定报告 25 行。
 Windows 3.1 / 3.2 增强模式的 MS-DOS 会话已验证：执行 `VER`、Alt+Enter 全屏/窗口切换、
 窗口内命令输入及文件写入、`EXIT` 返回桌面，并在重启后读回文件。
+实验性 486 档位也已通过 Windows 3.1 / 3.2 增强模式冷启动及上述 DOS 会话验证。
 IRQ1 固件通过客户机 `IN 60h` 接收虚拟扫描码；文本、属性与字体使用真实 VGA 平面布局，
 避免绕过 Windows 的虚拟键盘或让 DOS 窗口抓取到空白文本。
 MS-DOS EDIT 已验证在 8088 和 286 上输入文字、通过 Alt+F 菜单保存、退出，
@@ -52,6 +53,8 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\run.ps1 -Cpu 286 -HardDisk '.\native\win31.img' -FullSpeed
 # 运行包含增强模式组件的独立 Windows 3.1 安装：
 .\native\run.ps1 -Cpu 386 -HardDisk '.\native\win31-386.img' -FullSpeed
+# 使用实验性 486 整数核心（暂不带 x87）：
+.\native\run.ps1 -Cpu 486 -HardDisk '.\native\win31-386.img' -FullSpeed
 # 或直接指定映像：
 .\native\build\asm86-native.exe --hard 'D:\images\dos622.img' --boot c
 ```
@@ -67,10 +70,11 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
   有软盘时从 A: 启动，否则从 C: 启动，保留 CPU 型号和速度设置，不触发宿主安全界面。
 - **Machine > Full speed**：勾选时取消执行限速，再次点击恢复正常速度，无需重启客体。
   标题栏显示 **Full speed / Normal speed**；首次运行默认正常速度，以后自动记住选择。
-  正常档随 CPU 型号切换：8088 约 0.33 MIPS，286 约 2 MIPS，386 约 4 MIPS；标题栏显示当前档位。
+  正常档随 CPU 型号切换：8088 约 0.33 MIPS，286 约 2 MIPS，386 约 4 MIPS，486 约 8 MIPS；标题栏显示当前档位。
   这是指令吞吐量近似值，不代表周期精确的 CPU 主频。
-- **Machine > CPU: 8088 / CPU: 80286 / AT / CPU: 80386 / AT (experimental)**：停机后选择 CPU；
-  首次运行默认 8088，以后自动记住选择；Windows 3.1 标准模式选择 286，增强模式选择实验性 386。
+- **Machine > CPU: 8088 / CPU: 80286 / AT / CPU: 80386 / AT (experimental) / CPU: 80486SX / AT (experimental)**：
+  停机后选择 CPU；首次运行默认 8088，以后自动记住选择；Windows 3.1 标准模式选择 286，
+  增强模式可选择实验性 386 或 486。
   切换型号会重置机器，请先在客体中退出程序。
 - **View > Maximize** 或标题栏最大化按钮：窗口最大化，DOS 内容随之等比放大，空余区域留黑。
 - **View > Original size**：文本模式恢复到 **640×400 客户区**；
@@ -248,6 +252,21 @@ LAR/LSL 已支持 32 位结果和适用的 386 系统描述符。调试寄存器
 调试陷阱仍会明确报错，DR4/DR5 不受支持。386 兼容性仍以真实系统和应用回归逐步扩展，
 不能仅凭合成 CPU 测试或一次成功启动宣称所有增强模式功能均已完成。
 
+## 实验性 486 整数核心
+
+菜单、`--cpu 486` 和 `run.ps1 -Cpu 486` 提供不带 x87 的 486SX 级别核心；
+`CPUID` 报告 family 4、model 5（SX2），不宣告 FPU、Pentium 或其他未提供的扩展。
+386 的寻址、保护模式、分页、VM86、系统门和任务切换路径由 386/486 共享，
+同一套 CPU/系统测试分别在两个型号下运行，原有 386 不会获得 486 专属指令或标志位。
+
+已实现 `BSWAP`、8/16/32 位 `XADD` / `CMPXCHG`、`INVLPG`、`INVD` / `WBINVD` 和 `CPUID`；
+支持 AC/ID 标志的 PUSHFD/POPFD/IRETD、CR0 的 WP/AM/NE/cache 控制位及 CR3 的 PWT/PCD。
+WP 对内核写只读页生效；AM+AC 在 3 级保护模式与 VM86 下产生对齐异常，缺页异常优先。
+INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据缓存需要实际清空。
+
+真实 Windows 3.1 / 3.2 已验证增强模式桌面、DOS 全屏/窗口切换、命令与持久化文件写入。
+这只是后续 Windows 95/98 工作的 CPU 底座，尚不代表完整 486 硬件或后续 Windows 安装兼容性。
+
 ## 边界
 
 - 不是周期精确的 XT：不模拟预取队列、总线争用或 8086/8088 总线宽度差异。
@@ -257,14 +276,14 @@ LAR/LSL 已支持 32 位结果和适用的 386 系统描述符。调试寄存器
 - 显示使用宿主固定宽度字体绘制 CP437 字符，不模拟可编程 VGA 字形和全部扩展功能。
   图形模式 ROM 的 8×16 点阵由现有内置 8×8 字库纵向扩展，包含可见 ASCII、制表符和方块；
   不是完整的 IBM VGA 字库，缺少的扩展字形不会借用浏览器字体填充。
-- 386、虚拟 8086 和 Windows 3.1 增强模式仍属实验支持；不提供 486、更高 CPU、Windows 95 或 x87。
+- 386/486、虚拟 8086 和 Windows 3.x 增强模式仍属实验支持；不提供更高 CPU、Windows 95 或 x87。
 - RTC 目前只实现周期中断，不包含完整的闹钟、更新中断和日期时间设置。
 - 支持 DOS 安装和普通命令行程序，不等同于兼容全部 DOS 游戏、驱动或磁盘工具。
 
 ## 文件
 
 - `cpu.h/cpp`、`protected.cpp`：不依赖 Windows 的解释器、保护模式、描述符和系统门。
-- `386.cpp`：内部实验性的 386 整数执行、32 位寻址、分页、VM86、I/O 权限、返回和任务切换。
+- `386.cpp`：实验性的 386/486 整数执行、32 位寻址、分页、VM86、I/O 权限、返回和任务切换。
 - `at.h/cpp`：8259 PIC、8042、A20、CMOS/RTC 和 AT 暖复位。
 - `pc.h/cpp`：设备、BIOS、启动和磁盘映像；磁盘 I/O 使用 Windows API。
 - `video.h/cpp`：VGA 显存、寄存器、调色板和图形像素。

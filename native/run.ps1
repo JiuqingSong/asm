@@ -2,7 +2,7 @@ param(
     [string]$HardDisk = (Join-Path $PSScriptRoot 'dos622.img'),
     [string]$Floppy,
     [switch]$FullSpeed,
-    [ValidateSet('8088', '286', '386')][string]$Cpu,
+    [ValidateSet('8088', '286', '386', '486')][string]$Cpu,
     [switch]$NormalSpeed
 )
 $ErrorActionPreference = 'Stop'

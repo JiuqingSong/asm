@@ -18,7 +18,7 @@ uint32_t Cpu::segmentBase(int segment) const {
 }
 void Cpu::checkSegment(int segment, uint32_t offset, unsigned size, bool write, bool execute) const {
     if (!protectedMode() || virtual8086()) {
-        if (model == CpuModel::I386 && uint64_t(offset) + size - 1 > segments[segment].limit) fault(segment == SS ? 12 : 13, 0);
+        if (supports386() && uint64_t(offset) + size - 1 > segments[segment].limit) fault(segment == SS ? 12 : 13, 0);
         return;
     }
     const auto& d = segments[segment]; uint8_t vector = segment == SS ? 12 : 13;
@@ -31,23 +31,28 @@ void Cpu::checkSegment(int segment, uint32_t offset, unsigned size, bool write, 
 }
 uint8_t Cpu::rbS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 1, false);
-    return model == CpuModel::I386 ? readLinear(segmentBase(segment) + offset) : readPhysical(segmentBase(segment) + offset);
+    return supports386() ? readLinear(segmentBase(segment) + offset) : readPhysical(segmentBase(segment) + offset);
 }
 uint16_t Cpu::rwS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 2, false);
     auto base = segmentBase(segment);
-    if (model == CpuModel::I386) return readLinear(base + offset) | (uint16_t(readLinear(base + offset + 1)) << 8);
+    if (supports386()) {
+        auto low = translate(base + offset, false, false), high = translate(base + offset + 1, false, false);
+        checkAlignment(base + offset, 2);
+        return readPhysical(low) | (uint16_t(readPhysical(high)) << 8);
+    }
     return readPhysical(base + offset) | (uint16_t(readPhysical(base + uint16_t(offset + 1))) << 8);
 }
 void Cpu::wbS(int segment, uint32_t offset, uint8_t value) {
     checkSegment(segment, offset, 1, true);
-    if (model == CpuModel::I386) writeLinear(segmentBase(segment) + offset, value);
+    if (supports386()) writeLinear(segmentBase(segment) + offset, value);
     else writePhysical(segmentBase(segment) + offset, value);
 }
 void Cpu::wwS(int segment, uint32_t offset, uint16_t value) {
     checkSegment(segment, offset, 2, true); auto base = segmentBase(segment);
-    if (model == CpuModel::I386) {
+    if (supports386()) {
         auto low = translate(base + offset, true, false), high = translate(base + offset + 1, true, false);
+        checkAlignment(base + offset, 2);
         writePhysical(low, uint8_t(value)); writePhysical(high, uint8_t(value >> 8)); return;
     }
     writePhysical(base + offset, uint8_t(value)); writePhysical(base + uint16_t(offset + 1), uint8_t(value >> 8));
@@ -65,7 +70,7 @@ Cpu::Descriptor Cpu::descriptor(uint16_t selector, uint8_t vector) {
     d.limit = word(d.address); d.base = word(d.address + 2) | (uint32_t(byte(d.address + 4)) << 16);
     d.access = byte(d.address + 5);
     d.gateOffset = uint16_t(d.limit); d.gateSelector = word(d.address + 2); d.parameters = byte(d.address + 4) & 31;
-    if (model == CpuModel::I386) {
+    if (supports386()) {
         d.gateOffset |= uint32_t(word(d.address + 6)) << 16;
         d.attributes = byte(d.address + 6) & 0xf0;
         d.limit |= uint32_t(byte(d.address + 6) & 15) << 16;
@@ -95,7 +100,7 @@ void Cpu::loadSegment(int segment, uint16_t selector) {
     if (virtual8086()) { loadVirtualSegment(segment, selector); return; }
     if (!protectedMode()) {
         s[segment] = selector; segments[segment].base = uint32_t(selector) << 4;
-        if (model == CpuModel::I386 && segment == CS) {
+        if (supports386() && segment == CS) {
             segments[CS].attributes = 0; segments[CS].limit = 0xffff; segments[CS].access = 0x9b; segments[CS].null = false;
         }
         hiddenSegments &= uint8_t(~(1 << segment)); return;
@@ -125,7 +130,7 @@ void Cpu::loadLdt(uint16_t selector, uint8_t vector) {
     ldtr = {selector, d.base, d.limit};
 }
 void Cpu::switchStack(unsigned level) {
-    bool wide = model == CpuModel::I386 && (tr.access & 8);
+    bool wide = supports386() && (tr.access & 8);
     unsigned size = wide ? 4 : 2, off = wide ? 4 + level * 8 : 2 + level * 4;
     // LOADALL can install a valid hidden TSS cache with a zero visible selector.
     if (off + size + 1 > tr.limit) fault(10, tr.selector & 0xfffc);
@@ -135,7 +140,7 @@ void Cpu::switchStack(unsigned level) {
     if ((ss & 3) != level || unsigned((d.access >> 5) & 3) != level || (d.access & 0x1a) != 0x12) fault(10, ss & 0xfffc);
     if (!(d.access & 0x80)) fault(12, ss & 0xfffc);
     cache(SS, ss, d);
-    if (model == CpuModel::I386) { r32(SP, sp); cpl = level; }
+    if (supports386()) { r32(SP, sp); cpl = level; }
     else r[SP] = uint16_t(sp);
 }
 void Cpu::nullifyData() {
@@ -145,9 +150,9 @@ void Cpu::nullifyData() {
         }
 }
 void Cpu::farJump(uint16_t selector, uint32_t offset, bool call) {
-    auto width = model == CpuModel::I386 && operand32 ? 4u : 2u;
+    auto width = supports386() && operand32 ? 4u : 2u;
     if (!protectedMode() || virtual8086()) {
-        if (model == CpuModel::I386 && offset > 0xffff) fault(13, 0);
+        if (supports386() && offset > 0xffff) fault(13, 0);
         if (call) { validateStackPush(2, width); pushValue(s[CS], width); pushValue(ip, width); }
         loadSegment(CS, selector); ip = offset; return;
     }
@@ -163,8 +168,8 @@ void Cpu::farJump(uint16_t selector, uint32_t offset, bool call) {
     if (std::max(cpl, unsigned(selector & 3)) > dpl) fault(13, selector & 0xfffc);
     if (!(d.access & 0x80)) fault(11, selector & 0xfffc);
     auto type = d.access & 31;
-    if (type == 1 || type == 5 || (model == CpuModel::I386 && type == 9)) { taskSwitch(type == 5 ? d.gateSelector : selector, call); return; }
-    if (type != 4 && !(model == CpuModel::I386 && type == 12)) fault(13, selector & 0xfffc);
+    if (type == 1 || type == 5 || (supports386() && type == 9)) { taskSwitch(type == 5 ? d.gateSelector : selector, call); return; }
+    if (type != 4 && !(supports386() && type == 12)) fault(13, selector & 0xfffc);
     width = type == 12 ? 4 : 2;
     auto gateOffset = width == 4 ? d.gateOffset : uint16_t(d.gateOffset);
     auto target = codeDescriptor(d.gateSelector); unsigned level = (target.access >> 5) & 3;
@@ -196,7 +201,7 @@ void Cpu::popFlags(uint16_t value, unsigned oldLevel) {
     setFlags(value);
 }
 void Cpu::farReturn(uint16_t adjustment, bool interruptReturn) {
-    if (model == CpuModel::I386) { farReturn386(adjustment, interruptReturn); return; }
+    if (supports386()) { farReturn386(adjustment, interruptReturn); return; }
     if (protectedMode() && interruptReturn && (flags & 0x4000)) { taskSwitch(readWord(tr.base), false, true); return; }
     auto sp = r[SP], offset = rwS(SS, sp), selector = rwS(SS, uint16_t(sp + 2));
     uint16_t value = interruptReturn ? rwS(SS, uint16_t(sp + 4)) : flags;
@@ -226,7 +231,7 @@ void Cpu::protectedInterrupt(uint8_t number, int code, bool software, bool exter
     if (unsigned(number) * 8 + 7 > idtr.limit) fault(13, int(error));
     auto a = idtr.base + number * 8; auto access = readSystem(a + 5, 1); auto selector = uint16_t(readSystem(a + 2, 2));
     auto offset = readSystem(a, 2); unsigned type = access & 31;
-    bool wide = model == CpuModel::I386 && (type == 14 || type == 15);
+    bool wide = supports386() && (type == 14 || type == 15);
     if (type != 5 && type != 6 && type != 7 && !wide) fault(13, int(error));
     if (software && unsigned((access >> 5) & 3) < cpl) fault(13, int(number * 8 + 2));
     if (!(access & 0x80)) fault(11, int(error));
@@ -255,11 +260,11 @@ void Cpu::protectedInterrupt(uint8_t number, int code, bool software, bool exter
     pushValue(oldFlags, width); pushValue(oldCs, width); pushValue(oldIp, width);
     if (code >= 0) pushValue(uint32_t(code), width);
     loadCode(selector, d, level); ip = offset; flags &= ~(TF | 0x4000);
-    if (model == CpuModel::I386) upperFlags &= ~0x10000u;
+    if (supports386()) upperFlags &= ~0x10000u;
     if (type == 6 || type == 14) flags &= ~IF;
 }
 void Cpu::taskSwitch(uint16_t selector, bool nested, bool returning) {
-    if (model == CpuModel::I386) { taskSwitch386(selector, nested, returning); return; }
+    if (supports386()) { taskSwitch386(selector, nested, returning); return; }
     if (!(selector & 0xfffc) || (selector & 4)) fault(returning ? 10 : 13, selector & 0xfffc);
     auto d = descriptor(selector, returning ? 10 : 13);
     if ((d.access & 31) != (returning ? 3 : 1)) fault(returning ? 10 : 13, selector & 0xfffc);
@@ -340,7 +345,7 @@ void Cpu::execSystem() {
             requireRing0(); auto selector = uint16_t(getRM(2));
             if (!(selector & 0xfffc) || (selector & 4)) fault(13, selector & 0xfffc);
             auto d = descriptor(selector);
-            if ((d.access & 31) != 1 && !(model == CpuModel::I386 && (d.access & 31) == 9)) fault(13, selector & 0xfffc);
+            if ((d.access & 31) != 1 && !(supports386() && (d.access & 31) == 9)) fault(13, selector & 0xfffc);
             if (!(d.access & 0x80)) fault(11, selector & 0xfffc);
             writeSystem(d.address + 5, d.access | 2, 1); tr = {selector, d.base, d.limit, uint8_t(d.access | 2)}; return;
         }
@@ -357,11 +362,11 @@ void Cpu::execSystem() {
     } else {
         if (!(d.access & 0x10)) {
             bool valid = type == 1 || type == 2 || type == 3 || (op == 2 && (type == 4 || type == 5));
-            if (model == CpuModel::I386) valid = valid || type == 9 || type == 11 || (op == 2 && type == 12);
+            if (supports386()) valid = valid || type == 9 || type == 11 || (op == 2 && type == 12);
             if (!valid) return;
         }
         auto value = op == 2 ? (uint32_t(d.attributes) << 16) | (uint32_t(d.access) << 8) : d.limit;
-        setReg(model == CpuModel::I386 && operand32 ? 4 : 2, reg, value);
+        setReg(supports386() && operand32 ? 4 : 2, reg, value);
     }
     flags |= ZF;
 }
@@ -422,7 +427,7 @@ void Cpu::step() {
         auto contributory = [](uint8_t v) { return v == 0 || (v >= 9 && v <= 13); };
         for (;;) {
             auto deliveryState = save(); taskCommitted = false;
-            if (model == CpuModel::I386 && pending.vector != 1 && pending.vector != 8) upperFlags |= 0x10000;
+            if (supports386() && pending.vector != 1 && pending.vector != 8) upperFlags |= 0x10000;
             try { interrupt(pending.vector, pending.code); return; }
             catch (const CpuFault& delivery) {
                 if (!taskCommitted) restore(deliveryState);
@@ -439,7 +444,7 @@ void Cpu::step() {
                         + " GDT=" + std::to_string(gdtr.base) + ":" + std::to_string(gdtr.limit)
                         + " IDT=" + std::to_string(idtr.base) + ":" + std::to_string(idtr.limit) + " bytes:" + bytes);
                 }
-                bool doubleFault = model != CpuModel::I386
+                bool doubleFault = !supports386()
                     || (contributory(pending.vector) && contributory(delivery.vector))
                     || (pending.vector == 14 && (delivery.vector == 14 || contributory(delivery.vector)));
                 pending = doubleFault ? CpuFault{8, 0} : delivery;

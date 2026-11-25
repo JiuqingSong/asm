@@ -10,7 +10,8 @@ public:
     using HostClock = std::chrono::steady_clock;
     static constexpr double PitHz = 1193182.0;
     static double normalRate(CpuModel model) {
-        return model == CpuModel::I386 ? 4000000.0 : model == CpuModel::I286 ? 2000000.0 : PitHz / 3.6;
+        return model == CpuModel::I486 ? 8000000.0 : model == CpuModel::I386 ? 4000000.0
+            : model == CpuModel::I286 ? 2000000.0 : PitHz / 3.6;
     }
     void reset(const Pc& pc, HostClock::time_point now = HostClock::now()) {
         hostOrigin = now; guestOrigin = pc.clock; fraction = 0;

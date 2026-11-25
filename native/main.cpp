@@ -14,7 +14,7 @@
 
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, CtrlAltDel };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
@@ -38,11 +38,13 @@ std::wstring wide(const std::string& value) {
     std::wstring result(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, value.data(), int(value.size()), result.data(), n); return result;
 }
 void title(HWND hwnd) {
-    std::wstring value = pc->cpu.model == CpuModel::I386 ? L"Asm86 native - 80386 / AT (experimental)"
+    std::wstring value = pc->cpu.model == CpuModel::I486 ? L"Asm86 native - 80486SX / AT (experimental)"
+        : pc->cpu.model == CpuModel::I386 ? L"Asm86 native - 80386 / AT (experimental)"
         : pc->at() ? L"Asm86 native - 80286 / AT" : L"Asm86 native - 8088";
     value += L" | A: " + (pc->floppy ? pc->floppy->path.filename().wstring() : L"(empty)");
     value += L" | C: " + (pc->hard ? pc->hard->path.filename().wstring() : L"(empty)");
-    value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
+    value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
+        : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
         : pc->at() ? L" | Normal speed (286 ~2 MIPS)" : L" | Normal speed (8088 ~0.33 MIPS)";
     if (mouseCaptured) value += L" | Mouse captured (Right Ctrl releases)";
     if (!running) value += L" | stopped";
@@ -171,10 +173,10 @@ void command(HWND hwnd, int id) {
         executionTiming.reset(*pc);
         running = true; break;
     case Reset: releaseMouse(hwnd); releaseKeyboard(); running = false; if (pc->hard) pc->hard->flush(); break;
-    case Cpu8088: case Cpu286: case Cpu386:
+    case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
         if (running) { MessageBoxW(hwnd, L"Stop the machine before changing the CPU (Machine > Stop).", L"CPU", MB_OK); break; }
-        pc->setModel(id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088);
-        if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu386, id, MF_BYCOMMAND))
+        pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088);
+        if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu486, id, MF_BYCOMMAND))
             throw std::runtime_error("Cannot update CPU menu");
         if (preferences) preferences->cpu(pc->cpu.model);
         break;
@@ -357,14 +359,14 @@ int headless(const std::filesystem::path& script) {
             std::cout << " code:";
             auto cr2 = pc->cpu.cr2;
             for (int i = 0; i < 24; ++i) {
-                auto off = pc->cpu.model == CpuModel::I386 ? pc->cpu.ip + i : uint16_t(pc->cpu.ip + i);
+                auto off = pc->cpu.supports386() ? pc->cpu.ip + i : uint16_t(pc->cpu.ip + i);
                 try { std::cout << ' ' << unsigned(pc->cpu.rbS(CS, off)); }
                 catch (const CpuFault& fault) { std::cout << " [memory fault " << unsigned(fault.vector) << ']'; break; }
             }
             pc->cpu.cr2 = cr2;
             std::cout << std::dec << " steps=" << pc->instructions << " video=" << unsigned(pc->vga.mode)
                 << " COM1-mouse=" << pc->serialMouse.active() << '\n';
-            if (pc->cpu.model == CpuModel::I386) {
+            if (pc->cpu.supports386()) {
                 std::cout << std::hex << "386 EFLAGS=" << pc->cpu.eflags() << " CR2=" << pc->cpu.cr2 << " CR3=" << pc->cpu.cr3;
                 for (int i = 0; i < 8; ++i) std::cout << ' ' << pc->cpu.r32(i);
                 std::cout << " GDT=" << pc->cpu.gdtr.base << ':' << pc->cpu.gdtr.limit
@@ -439,8 +441,9 @@ int application(int argc, wchar_t** argv) {
         else if (option == L"--hard") pc->hard = std::make_unique<Disk>(value, false, false);
         else if (option == L"--create-hard") { Disk::create(value); pc->hard = std::make_unique<Disk>(value, false, false); }
         else if (option == L"--cpu") {
-            if (value != L"8088" && value != L"286" && value != L"386") throw std::runtime_error("--cpu must be 8088, 286 or 386");
-            pc->setModel(value == L"386" ? CpuModel::I386 : value == L"286" ? CpuModel::I286 : CpuModel::I8088);
+            if (value != L"8088" && value != L"286" && value != L"386" && value != L"486")
+                throw std::runtime_error("--cpu must be 8088, 286, 386 or 486");
+            pc->setModel(value == L"486" ? CpuModel::I486 : value == L"386" ? CpuModel::I386 : value == L"286" ? CpuModel::I286 : CpuModel::I8088);
             cpuSpecified = true;
         }
         else if (option == L"--boot") {
@@ -516,6 +519,7 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I8088 ? MF_CHECKED : MF_UNCHECKED), Cpu8088, L"CPU: 8088");
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I286 ? MF_CHECKED : MF_UNCHECKED), Cpu286, L"CPU: 80286 / AT");
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I386 ? MF_CHECKED : MF_UNCHECKED), Cpu386, L"CPU: 80386 / AT (experimental)");
+    AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I486 ? MF_CHECKED : MF_UNCHECKED), Cpu486, L"CPU: 80486SX / AT (experimental)");
     AppendMenuW(view, MF_STRING, Original, L"Original size");
     AppendMenuW(view, MF_STRING, Maximize, L"Maximize");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(disks), L"Disks");
@@ -750,12 +754,12 @@ int application(int argc, wchar_t** argv) {
         SendMessageW(hwnd, WM_COMMAND, FullSpeed, 0);
         std::cout << "Execution speed (steps/s): normal=" << normalRate << " full=" << fullRate
             << " restored=" << restoredRate << "\nFull-speed toggle / input / paint / stop checks passed\n";
-        for (auto selection : {Cpu286, Cpu386}) {
+        for (auto selection : {Cpu286, Cpu386, Cpu486}) {
             SendMessageW(hwnd, WM_COMMAND, selection, 0);
             GetWindowTextW(hwnd, caption, int(std::size(caption)));
-            if (pc->cpu.model != (selection == Cpu386 ? CpuModel::I386 : CpuModel::I286)
+            if (pc->cpu.model != (selection == Cpu486 ? CpuModel::I486 : selection == Cpu386 ? CpuModel::I386 : CpuModel::I286)
                 || !(GetMenuState(menu, selection, MF_BYCOMMAND) & MF_CHECKED)
-                || !std::wcsstr(caption, selection == Cpu386 ? L"80386" : L"80286"))
+                || !std::wcsstr(caption, selection == Cpu486 ? L"80486SX" : selection == Cpu386 ? L"80386" : L"80286"))
                 throw std::runtime_error("AT CPU selection did not update the machine, title and menu");
             running = true;
             SendMessageW(hwnd, WM_KEYDOWN, VK_SHIFT, LPARAM(0x2a << 16));
@@ -804,10 +808,10 @@ int application(int argc, wchar_t** argv) {
             }
             pc->hard = std::make_unique<Disk>(resetImages[0], false, false);
             auto savedSpeed = fullSpeed;
-            for (auto model : {Cpu8088, Cpu286, Cpu386}) {
+            for (auto model : {Cpu8088, Cpu286, Cpu386, Cpu486}) {
                 SendMessageW(hwnd, WM_COMMAND, Reset, 0);
                 SendMessageW(hwnd, WM_COMMAND, model, 0);
-                auto expectedModel = model == Cpu386 ? CpuModel::I386 : model == Cpu286 ? CpuModel::I286 : CpuModel::I8088;
+                auto expectedModel = model == Cpu486 ? CpuModel::I486 : model == Cpu386 ? CpuModel::I386 : model == Cpu286 ? CpuModel::I286 : CpuModel::I8088;
                 pc->floppy = std::make_unique<Disk>(resetImages[1], true, true);
                 SendMessageW(hwnd, WM_COMMAND, CtrlAltDel, 0);
                 if (!running || pc->bootDrive != 0 || pc->cpu.rb(0, 0x7c02) != 'D'

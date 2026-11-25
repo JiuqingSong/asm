@@ -36,6 +36,7 @@ public:
         if (value == 8088) return CpuModel::I8088;
         if (value == 286) return CpuModel::I286;
         if (value == 386) return CpuModel::I386;
+        if (value == 486) return CpuModel::I486;
         throw std::runtime_error("Invalid CPU in native preferences");
     }
     void cpu(CpuModel value) {
@@ -43,6 +44,7 @@ public:
         case CpuModel::I8088: number(L"Cpu", 8088); return;
         case CpuModel::I286: number(L"Cpu", 286); return;
         case CpuModel::I386: number(L"Cpu", 386); return;
+        case CpuModel::I486: number(L"Cpu", 486); return;
         }
         throw std::runtime_error("Invalid CPU in native preferences");
     }

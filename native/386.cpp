@@ -6,12 +6,15 @@ namespace asm86 {
 uint32_t Cpu::r32(int i) const { return r[i] | (uint32_t(upperR[i]) << 16); }
 void Cpu::r32(int i, uint32_t value) { r[i] = uint16_t(value); upperR[i] = uint16_t(value >> 16); }
 uint32_t Cpu::eflags() const { return flags | upperFlags; }
-void Cpu::setEflags(uint32_t value) { setFlags(uint16_t(value)); upperFlags = model == CpuModel::I386 ? value & 0x30000 : 0; }
+void Cpu::setEflags(uint32_t value) {
+    setFlags(uint16_t(value));
+    upperFlags = value & (model == CpuModel::I486 ? 0x270000u : supports386() ? 0x30000u : 0);
+}
 uint32_t Cpu::fetch32() { auto low = fetch16(); return low | (uint32_t(fetch16()) << 16); }
 uint32_t Cpu::readDword(uint32_t address) const { return readWord(address) | (uint32_t(readWord(address + 2)) << 16); }
 void Cpu::writeDword(uint32_t address, uint32_t value) { writeWord(address, uint16_t(value)); writeWord(address + 2, uint16_t(value >> 16)); }
 uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
-    if (model != CpuModel::I386 || !(msw & 0x80000000u)) return address;
+    if (!supports386() || !(msw & 0x80000000u)) return address;
     const bool user = !supervisor && (cpl == 3 || virtual8086());
     auto missing = [&](bool present) {
         cr2 = address; fault(14, (present ? 1 : 0) | (write ? 2 : 0) | (user ? 4 : 0));
@@ -23,6 +26,7 @@ uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
     auto pte = readDword(table);
     if (!(pte & 1)) missing(false);
     if (user && (!(pde & pte & 4) || (write && !(pde & pte & 2)))) missing(true);
+    if (write && !user && model == CpuModel::I486 && (msw & 0x10000) && !(pde & pte & 2)) missing(true);
     if (!(pde & 0x20)) writeDword(directory, pde | 0x20);
     auto updated = pte | 0x20 | (write ? 0x40 : 0);
     if (updated != pte) writeDword(table, updated);
@@ -30,6 +34,10 @@ uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
 }
 uint8_t Cpu::readLinear(uint32_t address, bool supervisor) { return readPhysical(translate(address, false, supervisor)); }
 void Cpu::writeLinear(uint32_t address, uint8_t value, bool supervisor) { writePhysical(translate(address, true, supervisor), value); }
+void Cpu::checkAlignment(uint32_t address, unsigned size) const {
+    if (model == CpuModel::I486 && protectedMode() && cpl == 3 && (msw & 0x40000)
+        && (upperFlags & 0x40000) && (address & (size - 1))) fault(17, 0);
+}
 uint8_t Cpu::rbF(uint16_t seg, uint16_t off) { return readLinear((uint32_t(seg) << 4) + off); }
 uint16_t Cpu::rwF(uint16_t seg, uint16_t off) { return rbF(seg, off) | (uint16_t(rbF(seg, uint16_t(off + 1))) << 8); }
 void Cpu::wbF(uint16_t seg, uint16_t off, uint8_t value) { writeLinear((uint32_t(seg) << 4) + off, value); }
@@ -39,7 +47,7 @@ void Cpu::wwF(uint16_t seg, uint16_t off, uint16_t value) {
     writePhysical(low, uint8_t(value)); writePhysical(high, uint8_t(value >> 8));
 }
 uint32_t Cpu::offsetPlus(uint32_t offset, unsigned delta) const {
-    return model == CpuModel::I386 ? offset + delta : uint16_t(offset + delta);
+    return supports386() ? offset + delta : uint16_t(offset + delta);
 }
 uint32_t Cpu::readSegment(int segment, uint32_t offset, unsigned size) {
     if (size == 1) return rbS(segment, offset);
@@ -47,7 +55,10 @@ uint32_t Cpu::readSegment(int segment, uint32_t offset, unsigned size) {
     if (size != 4) throw std::runtime_error("Invalid CPU memory operand size");
     checkSegment(segment, offset, size, false);
     auto base = segmentBase(segment); uint32_t value = 0;
-    for (unsigned i = 0; i < size; ++i) value |= uint32_t(readLinear(base + offset + i)) << (i * 8);
+    std::array<uint32_t, 4> physical{};
+    for (unsigned i = 0; i < size; ++i) physical[i] = translate(base + offset + i, false, false);
+    checkAlignment(base + offset, size);
+    for (unsigned i = 0; i < size; ++i) value |= uint32_t(readPhysical(physical[i])) << (i * 8);
     return value;
 }
 void Cpu::writeSegment(int segment, uint32_t offset, uint32_t value, unsigned size) {
@@ -57,18 +68,19 @@ void Cpu::writeSegment(int segment, uint32_t offset, uint32_t value, unsigned si
     checkSegment(segment, offset, size, true);
     std::array<uint32_t, 4> physical{};
     for (unsigned i = 0; i < size; ++i) physical[i] = translate(segmentBase(segment) + offset + i, true, false);
+    checkAlignment(segmentBase(segment) + offset, size);
     for (unsigned i = 0; i < size; ++i) writePhysical(physical[i], uint8_t(value >> (i * 8)));
 }
 uint32_t Cpu::stackPointer() const {
-    return model == CpuModel::I386 && (segments[SS].attributes & 0x40) ? r32(SP) : r[SP];
+    return supports386() && (segments[SS].attributes & 0x40) ? r32(SP) : r[SP];
 }
 void Cpu::stackPointer(uint32_t value) {
-    if (model == CpuModel::I386 && (segments[SS].attributes & 0x40)) r32(SP, value);
+    if (supports386() && (segments[SS].attributes & 0x40)) r32(SP, value);
     else r[SP] = uint16_t(value);
 }
 void Cpu::pushValue(uint32_t value, unsigned size) {
     auto sp = stackPointer() - size;
-    if (model != CpuModel::I386 || !(segments[SS].attributes & 0x40)) sp = uint16_t(sp);
+    if (!supports386() || !(segments[SS].attributes & 0x40)) sp = uint16_t(sp);
     writeSegment(SS, sp, value, size); stackPointer(sp);
 }
 uint32_t Cpu::popValue(unsigned size) {
@@ -88,14 +100,14 @@ void Cpu::writeSystem(uint32_t address, uint32_t value, unsigned size) {
 void Cpu::checkIo(uint16_t port, unsigned size) {
     if (!protectedMode()) return;
     if (!virtual8086() && cpl <= unsigned((flags >> 12) & 3)) return;
-    if (model != CpuModel::I386 || !(tr.access & 8) || tr.limit < 103) fault(13, 0);
+    if (!supports386() || !(tr.access & 8) || tr.limit < 103) fault(13, 0);
     auto base = readSystem(tr.base + 102, 2), offset = base + (unsigned(port) >> 3);
     if (offset + 1 > tr.limit) fault(13, 0);
     auto bits = readSystem(tr.base + offset, 2);
     if (bits & (((1u << size) - 1) << (port & 7))) fault(13, 0);
 }
 void Cpu::validateStackPush(unsigned count, unsigned size) {
-    if (model != CpuModel::I386) return;
+    if (!supports386()) return;
     auto sp = stackPointer();
     for (unsigned n = 0; n < count; ++n) {
         sp -= size; if (!(segments[SS].attributes & 0x40)) sp = uint16_t(sp);
@@ -124,7 +136,7 @@ void Cpu::farReturn386(uint16_t adjustment, bool interruptReturn) {
         stackPointer(sp + consumed + adjustment); loadSegment(CS, selector); ip = offset;
         if (interruptReturn) {
             if (vm) popFlags(uint16_t(value), cpl); else setFlags(uint16_t(value));
-            if (size == 4) upperFlags = (upperFlags & 0x20000) | (value & 0x10000);
+            if (size == 4) upperFlags = (upperFlags & 0x20000) | (value & (model == CpuModel::I486 ? 0x250000u : 0x10000u));
         }
         return;
     }
@@ -160,7 +172,8 @@ void Cpu::farReturn386(uint16_t adjustment, bool interruptReturn) {
     ip = offset;
     if (interruptReturn) {
         popFlags(uint16_t(value), oldLevel);
-        if (size == 4) upperFlags = (upperFlags & ~0x10000u) | (value & 0x10000);
+        auto mask = model == CpuModel::I486 ? 0x250000u : 0x10000u;
+        if (size == 4) upperFlags = (upperFlags & ~mask) | (value & mask);
     }
 }
 void Cpu::taskSwitch386(uint16_t selector, bool nested, bool returning) {
@@ -321,6 +334,42 @@ void Cpu::string386(uint8_t op) {
 }
 void Cpu::system386() {
     auto op = fetch8(); int size = operand32 ? 4 : 2;
+    if (op == 8 || op == 9) {
+        if (model != CpuModel::I486 || lockPrefix) fault(6);
+        requireRing0(); return; // No emulated data cache needs writeback or invalidation.
+    }
+    if (op == 0xa2) {
+        if (model != CpuModel::I486 || lockPrefix) fault(6);
+        auto leaf = r32(AX);
+        r32(AX, leaf == 0 ? 1 : leaf == 1 ? 0x450 : 0);
+        r32(BX, leaf == 0 ? 0x756e6547 : 0);
+        r32(DX, leaf == 0 ? 0x49656e69 : 0);
+        r32(CX, leaf == 0 ? 0x6c65746e : 0);
+        return;
+    }
+    if (op >= 0xc8 && op <= 0xcf) {
+        if (model != CpuModel::I486 || lockPrefix) fault(6);
+        auto value = r32(op & 7);
+        r32(op & 7, (value << 24) | ((value & 0xff00) << 8) | ((value >> 8) & 0xff00) | (value >> 24));
+        return;
+    }
+    if (op == 0xb0 || op == 0xb1 || op == 0xc0 || op == 0xc1) {
+        if (model != CpuModel::I486) fault(6);
+        modrm(); int width = op & 1 ? size : 1;
+        if (lockPrefix && mod == 3) fault(6);
+        auto destination = getRM(width), source = getReg(width, reg);
+        if (op < 0xc0) {
+            auto accumulator = getReg(width, AX);
+            if (width == 4) alu32(7, accumulator, destination);
+            else alu(7, uint16_t(accumulator), uint16_t(destination), width);
+            setRM(width, flags & ZF ? source : destination);
+            if (!(flags & ZF)) setReg(width, AX, destination);
+        } else {
+            auto sum = width == 4 ? alu32(0, destination, source) : alu(0, uint16_t(destination), uint16_t(source), width);
+            setReg(width, reg, destination); setRM(width, sum);
+        }
+        return;
+    }
     if (op == 0x21 || op == 0x23) {
         requireRing0(); modrm(); if (mod != 3 || reg == 4 || reg == 5) fault(6);
         if (debugRegisters[7] & 0x2000) { debugRegisters[6] |= 0x2000; fault(1); }
@@ -340,7 +389,7 @@ void Cpu::system386() {
         else {
             auto value = r32(rm);
             if (reg == 2) cr2 = value;
-            else if (reg == 3) cr3 = value & 0xfffff000u;
+            else if (reg == 3) cr3 = value & (model == CpuModel::I486 ? 0xfffff018u : 0xfffff000u);
             else {
                 setControl0(value);
             }
@@ -351,6 +400,10 @@ void Cpu::system386() {
     if (op == 6) { requireRing0(); msw &= ~8u; return; }
     if (op == 1) {
         modrm();
+        if (reg == 7 && model == CpuModel::I486 && mod != 3) {
+            if (lockPrefix) fault(6);
+            requireRing0(); return;
+        }
         if (reg == 4) { setRM(mod == 3 ? size : 2, msw & 0xffff); return; }
         if (reg == 6) { requireRing0(); auto value = getRM(2); setControl0((msw & ~15u) | (value & 15) | (msw & 1)); return; }
         if (mod == 3 || reg > 3) fault(6);
@@ -442,7 +495,10 @@ bool Cpu::exec386(uint8_t op) {
         if (virtual8086()) requireIo();
         unsigned size = operand32 ? 4 : 2;
         if (op == 0x9c) pushValue(eflags() & ~0x30000u, size);
-        else popFlags(uint16_t(popValue(size)), cpl);
+        else {
+            auto value = popValue(size); popFlags(uint16_t(value), cpl);
+            if (size == 4 && model == CpuModel::I486) upperFlags = (upperFlags & ~0x240000u) | (value & 0x240000);
+        }
         return true;
     }
     if ((op >= 0x70 && op <= 0x7f) || op == 0xeb) {
@@ -604,11 +660,12 @@ bool Cpu::exec386(uint8_t op) {
 }
 void Cpu::setControl0(uint32_t value) {
     if ((value & 0x80000001u) == 0x80000000u) fault(13, 0);
+    if (model == CpuModel::I486 && (value & 0x60000000u) == 0x20000000u) fault(13, 0);
     if (!(msw & 1) && (value & 1)) {
         for (unsigned i = 0; i < segments.size(); ++i)
             if (!(hiddenSegments & (1 << i))) segments[i].base = uint32_t(s[i]) << 4;
         hiddenSegments = 0; cpl = 0;
     } else if ((msw & 1) && !(value & 1)) { hiddenSegments = 63; cpl = 0; }
-    msw = (value & 0x8000000fu) | 0x10;
+    msw = (value & (model == CpuModel::I486 ? 0xe005002fu : 0x8000000fu)) | 0x10;
 }
 }

@@ -7,7 +7,7 @@ uint8_t Cpu::rb(uint16_t seg, uint16_t off) const {
 }
 uint8_t Cpu::readPhysical(uint32_t address) const {
     auto a = address & (model == CpuModel::I8088 ? 0xfffff : model == CpuModel::I286 ? (a20 ? 0xffffff : 0xefffff) : (a20 ? 0xffffffffu : 0xffefffffu));
-    if (model == CpuModel::I386 && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
+    if (supports386() && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
     return a >= mmioStart && a < mmioEnd && mmioRead ? mmioRead(a) : a < mem.size() ? mem[a] : 0xff;
 }
 uint16_t Cpu::rw(uint16_t seg, uint16_t off) const { return rb(seg, off) | (uint16_t(rb(seg, uint16_t(off + 1))) << 8); }
@@ -18,7 +18,7 @@ uint16_t Cpu::readWord(uint32_t address) const { return readPhysical(address) | 
 void Cpu::writeWord(uint32_t address, uint16_t value) { writePhysical(address, uint8_t(value)); writePhysical(address + 1, uint8_t(value >> 8)); }
 void Cpu::writePhysical(uint32_t address, uint8_t v) {
     auto a = address & (model == CpuModel::I8088 ? 0xfffff : model == CpuModel::I286 ? (a20 ? 0xffffff : 0xefffff) : (a20 ? 0xffffffffu : 0xffefffffu));
-    if (model == CpuModel::I386 && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
+    if (supports386() && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
     if (onWrite) onWrite(a);
     if (a >= mmioStart && a < mmioEnd && mmioWrite) mmioWrite(a, v);
     else if (a < mem.size()) mem[a] = v;
@@ -33,33 +33,34 @@ uint32_t Cpu::getReg(int size, int i) const { return size == 1 ? reg8(i) : size 
 void Cpu::setReg(int size, int i, uint32_t v) { if (size == 1) reg8(i, uint8_t(v)); else if (size == 4) r32(i, v); else r[i] = uint16_t(v); }
 void Cpu::reset() {
     r.fill(0); s.fill(0); s[CS] = 0xffff; ip = 0;
-    msw = model == CpuModel::I386 ? 0x10 : 0xfff0; cr2 = cr3 = upperFlags = 0;
+    msw = supports386() ? 0x10 : 0xfff0; cr2 = cr3 = upperFlags = 0;
     upperR.fill(0); cpl = 0; hiddenSegments = 0;
+    if (model == CpuModel::I486) { msw = 0x60000010; r[DX] = 0x450; }
     debugRegisters.fill(0); debugRegisters[6] = 0xffff0ff0; debugRegisters[7] = 0x400;
     gdtr = {0, 0xffff}; idtr = {0, 0x3ff}; ldtr = {}; tr = {};
     for (auto& segment : segments) segment = {};
     segments[CS].access = 0x9b;
     setFlags(2);
     if (model != CpuModel::I8088) {
-        s[CS] = 0xf000; ip = 0xfff0; segments[CS].base = model == CpuModel::I386 ? 0xffff0000 : 0xff0000; hiddenSegments = 1 << CS;
+        s[CS] = 0xf000; ip = 0xfff0; segments[CS].base = supports386() ? 0xffff0000 : 0xff0000; hiddenSegments = 1 << CS;
     }
     halted = waiting = repContinue = inhibit = false;
     eaOff = 0; eaSeg = DS;
 }
 uint8_t Cpu::fetch8() {
-    if (model == CpuModel::I386 && ip - startIp >= 15) fault(13, 0);
-    if (protectedMode() || model == CpuModel::I386) checkSegment(CS, ip, 1, false, true);
-    auto v = model == CpuModel::I386 ? readLinear(segmentBase(CS) + ip) : readPhysical(segmentBase(CS) + ip);
-    ++ip; if (model != CpuModel::I386) ip = uint16_t(ip); return v;
+    if (supports386() && ip - startIp >= 15) fault(13, 0);
+    if (protectedMode() || supports386()) checkSegment(CS, ip, 1, false, true);
+    auto v = supports386() ? readLinear(segmentBase(CS) + ip) : readPhysical(segmentBase(CS) + ip);
+    ++ip; if (!supports386()) ip = uint16_t(ip); return v;
 }
 uint16_t Cpu::fetch16() { auto lo = fetch8(); return lo | (uint16_t(fetch8()) << 8); }
 uint32_t Cpu::fetch(int size) { return size == 1 ? fetch8() : size == 4 ? fetch32() : fetch16(); }
 void Cpu::push(uint16_t v) {
-    if (model == CpuModel::I386) { pushValue(v, 2); return; }
+    if (supports386()) { pushValue(v, 2); return; }
     auto sp = uint16_t(r[SP] - 2); wwS(SS, sp, v); r[SP] = sp;
 }
 uint16_t Cpu::pop() {
-    if (model == CpuModel::I386) return uint16_t(popValue(2));
+    if (supports386()) return uint16_t(popValue(2));
     auto value = rwS(SS, r[SP]); r[SP] += 2; return value;
 }
 void Cpu::flag(uint16_t mask, bool v) { flags = v ? flags | mask : flags & ~mask; }
@@ -68,7 +69,7 @@ void Cpu::stackedFlag(uint16_t mask, bool v) {
     wwS(SS, off, v ? f | mask : f & ~mask);
 }
 void Cpu::interrupt(uint8_t n, int code, bool software, bool external) {
-    if (model == CpuModel::I386 && n == 1 && !software) debugRegisters[7] &= ~0x2000u;
+    if (supports386() && n == 1 && !software) debugRegisters[7] &= ~0x2000u;
     if (protectedMode()) {
         try { protectedInterrupt(n, code, software, external); }
         catch (CpuFault& f) { if (external && f.vector >= 10 && f.vector <= 13 && f.code >= 0) f.code |= 1; throw; }
@@ -254,12 +255,12 @@ void Cpu::stepInstruction() {
     inhibit = false;
     if (halted) return;
     bool trace = flags & TF;
-    startIp = ip; overrideSeg = -1; rep = 0;
-    const bool bigCode = model == CpuModel::I386 && !virtual8086() && (segments[CS].attributes & 0x40);
+    startIp = ip; overrideSeg = -1; rep = 0; lockPrefix = false;
+    const bool bigCode = supports386() && !virtual8086() && (segments[CS].attributes & 0x40);
     operand32 = address32 = bigCode;
     for (int prefixes = 0; prefixes < 65536; ++prefixes) {
         auto op = fetch8();
-        if (model == CpuModel::I386) {
+        if (supports386()) {
             if (op == 0x66) { operand32 = !bigCode; continue; }
             if (op == 0x67) { address32 = !bigCode; continue; }
             if (op == 0x64 || op == 0x65) { overrideSeg = op == 0x64 ? FS : GS; continue; }
@@ -267,18 +268,19 @@ void Cpu::stepInstruction() {
         if (op == 0x26 || op == 0x2e || op == 0x36 || op == 0x3e) { overrideSeg = (op >> 3) & 3; continue; }
         if (op == 0xf2 || op == 0xf3) { rep = op; continue; }
         if (op == 0xf0 || op == 0xf1) {
+            if (op == 0xf0) lockPrefix = true;
             if (op == 0xf1 && (segmentBase(CS) + startIp) >= 0xf0000 && (segmentBase(CS) + startIp) < 0xf2000 && trap) {
                 auto n = fetch8(); waiting = !trap(n); if (waiting) ip = startIp;
                 return;
             }
             continue;
         }
-        bool interruptInstruction = model == CpuModel::I386 && (op == 0xcc || op == 0xcd || (op == 0xce && (flags & OF)));
+        bool interruptInstruction = supports386() && (op == 0xcc || op == 0xcd || (op == 0xce && (flags & OF)));
         execute(op);
-        if (model == CpuModel::I386 && op != 0xcf && op != 0x9d && !taskCommitted) upperFlags &= ~0x10000u;
-        if (model != CpuModel::I386) ip = uint16_t(ip);
-        if (trace && !repContinue && !interruptInstruction && !(model == CpuModel::I386 && taskCommitted)) {
-            if (model == CpuModel::I386) debugRegisters[6] |= 0x4000;
+        if (supports386() && op != 0xcf && op != 0x9d && !taskCommitted) upperFlags &= ~0x10000u;
+        if (!supports386()) ip = uint16_t(ip);
+        if (trace && !repContinue && !interruptInstruction && !(supports386() && taskCommitted)) {
+            if (supports386()) debugRegisters[6] |= 0x4000;
             interrupt(1);
         }
         return;
@@ -286,7 +288,7 @@ void Cpu::stepInstruction() {
     throw std::runtime_error("8088 prefix stream exceeds a complete code segment");
 }
 void Cpu::execute(uint8_t op) {
-    if (model == CpuModel::I386 && exec386(op)) return;
+    if (supports386() && exec386(op)) return;
     int size = (op & 1) ? 2 : 1;
     if (model != CpuModel::I8088) {
         if (op == 0x0f) { execSystem(); return; }

@@ -8,7 +8,7 @@ namespace asm86 {
 enum { AX, CX, DX, BX, SP, BP, SI, DI };
 enum { ES, CS, SS, DS, FS, GS };
 enum : uint16_t { CF=1, PF=4, AF=16, ZF=64, SF=128, TF=256, IF=512, DF=1024, OF=2048 };
-enum class CpuModel { I8088, I286, I386 };
+enum class CpuModel { I8088, I286, I386, I486 };
 struct CpuFault { uint8_t vector; int code; };
 
 class Cpu {
@@ -63,6 +63,7 @@ public:
     uint16_t pop();
     void interrupt(uint8_t number, int code = -1, bool software = false, bool external = false);
     void setModel(CpuModel value);
+    bool supports386() const { return model >= CpuModel::I386; }
     void setFlags(uint16_t value);
     bool protectedMode() const { return msw & 1; }
     uint8_t readPhysical(uint32_t address) const;
@@ -91,7 +92,7 @@ private:
     uint8_t rep = 0;
     bool inhibit = false;
     bool taskCommitted = false;
-    bool operand32 = false, address32 = false;
+    bool operand32 = false, address32 = false, lockPrefix = false;
     bool eaUsesSp = false;
     uint8_t fetch8();
     uint16_t fetch16();
@@ -120,7 +121,7 @@ private:
     void requireRing0() const;
     void requireIo() const;
     void checkIo(uint16_t port, unsigned size);
-    bool virtual8086() const { return model == CpuModel::I386 && (upperFlags & 0x20000); }
+    bool virtual8086() const { return supports386() && (upperFlags & 0x20000); }
     void loadVirtualSegment(int segment, uint16_t selector);
     Descriptor descriptor(uint16_t selector, uint8_t vector = 13);
     Descriptor codeDescriptor(uint16_t selector);
@@ -151,6 +152,7 @@ private:
     uint32_t readSystem(uint32_t address, unsigned size);
     void writeSystem(uint32_t address, uint32_t value, unsigned size);
     uint32_t translate(uint32_t address, bool write, bool supervisor);
+    void checkAlignment(uint32_t address, unsigned size) const;
     uint32_t offsetPlus(uint32_t offset, unsigned delta) const;
     [[noreturn]] static void fault(uint8_t vector, int code = -1);
 };
