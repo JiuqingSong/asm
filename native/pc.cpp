@@ -221,6 +221,8 @@ void Pc::boot(uint8_t drive) {
             cpu.wb(0xf000, off + 2, uint8_t(n)); cpu.wb(0xf000, off + 3, 0xcf);
         }
     }
+    // A nonzero INT 4Fh makes Windows probe a resident CAM SCSI provider.
+    cpu.ww(0, 0x4f * 4, 0); cpu.ww(0, 0x4f * 4 + 2, 0);
     installVideoFirmware(cpu);
     cpu.ww(0, 0x1c * 4, 0x0700); cpu.ww(0, 0x1c * 4 + 2, 0xf000); cpu.wb(0xf000, 0x700, 0xcf);
     // Windows calls this optional debugger hook even without a resident debugger.

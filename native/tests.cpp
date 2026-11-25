@@ -1192,6 +1192,13 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
     p.hard = std::make_unique<Disk>(disk, false, false);
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         p.setModel(model); p.boot(0x80); observed->setMode(3);
+        const uint8_t camProbe[] = {0xa1,0x3c,1,0x0b,0x06,0x3e,1,0x74,5,0xb8,0,0x81,0xcd,0x4f,0xf4};
+        c.halted = false; c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.loadSegment(DS, 0);
+        c.ip = 0x500; c.r[SP] = 0x9000;
+        std::copy(std::begin(camProbe), std::end(camProbe), c.mem.begin() + 0x500);
+        p.runCpu(100);
+        check(c.halted && c.r[AX] == 0,
+            "A guest CAM probe must see no resident SCSI provider and skip sending a CCB through INT 4Fh");
         c.halted = false; c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.ip = 0x500;
         c.mem[0x500] = 0xcd; c.mem[0x501] = 0x68; c.mem[0x502] = 0xf4;
         c.r[SP] = 0x9000; c.r[AX] = 0x4f79; c.setFlags(CF | DF | 2);
