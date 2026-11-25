@@ -222,6 +222,8 @@ DOS 的 AUTOEXEC 命令回显也包含提示符；加载 HIMEM/SMARTDRV 后，�
 宿主文件错误和未实现的 BIOS 功能会显式报错或通知，不伪装成磁盘成功。
 对未安装的 MSHERC、EGA RIL、倚天中文键盘扩展和 QBASIC TSR，
 按其探测约定返回“未安装”，不会伪装设备存在，也不会吞掉其他未知 BIOS 调用。
+Windows 95 Setup 的 `INT 67h / AX=DE00h` VCPI 探测返回非零 AH，明确报告没有驻留 VCPI；
+不会把该安装检查当成未实现中断而停机，也不宣告提供 EMS/VCPI 服务。
 
 ## IDE 硬盘控制器（AT）
 

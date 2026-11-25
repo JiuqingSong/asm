@@ -1082,6 +1082,9 @@ void atTests(CpuModel model) {
     }
     c.r[AX] = 0x4340;
     check(c.trap(0x68) && c.r[AX] == 0x4340, "The resident-extender probe must report absence without claiming F386h");
+    c.r[AX] = 0xde00; c.r[BX] = 0x1338;
+    check(c.trap(0x67) && c.reg8(4) == 0x84 && c.r[BX] == 0x1338,
+        "VCPI installation checks must report no provider instead of stopping Windows Setup or advertising a version");
     c.r[BX] = 0x510; c.mem[0x510] = 0x7f; c.r[AX] = 0;
     check(c.trap(0x5c) && c.r[AX] == 0, "An absent NetBIOS provider must not answer its presence probe");
     c.r[AX] = 0x8700; c.r[SI] = 0x600; c.r[CX] = 2;

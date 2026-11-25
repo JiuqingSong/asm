@@ -596,6 +596,7 @@ bool Pc::bios(uint8_t n) {
     // HP-HIL installation probes leave BX unchanged on a standard PC/AT.
     if (r[AX] == 0x6f00 && (n == 0x14 || n == 0x16 || n == 0x17)) return true;
     if (n == 0x68 && ah == 0x43) return true; // No resident extender with the F386h signature.
+    if (n == 0x67 && r[AX] == 0xde00) { c.reg8(4, 0x84); return true; } // No resident VCPI provider.
     if (n == 0x5c && c.rbF(c.s[ES], r[BX]) == 0x7f) return true; // NetBIOS presence probe; no provider installed.
     switch (n) {
     case 8: {
