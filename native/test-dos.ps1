@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$MediaDirectory,
     [Parameter(Mandatory = $true)][string]$HardDisk,
-    [ValidateSet('8088', '286')][string]$Cpu = '8088'
+    [ValidateSet('8088', '286')][string]$Cpu = '8088',
+    [ValidateSet('31.5', '126', '504')][string]$HardDiskMiB = '31.5'
 )
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'build\asm86-native.exe'
@@ -16,7 +17,7 @@ $utf8 = New-Object System.Text.UTF8Encoding($false)
 function Invoke-Guest([string]$Commands, [bool]$Install) {
     [System.IO.File]::WriteAllText($script, $Commands, $utf8)
     if ($Install) {
-        $arguments = @('--floppy', ('"{0}"' -f $media[0].FullName), '--create-hard', ('"{0}"' -f $target), '--boot', 'a', '--headless', ('"{0}"' -f $script))
+        $arguments = @('--floppy', ('"{0}"' -f $media[0].FullName), '--create-hard', ('"{0}"' -f $target), $HardDiskMiB, '--boot', 'a', '--headless', ('"{0}"' -f $script))
     } else {
         $arguments = @('--hard', ('"{0}"' -f $target), '--boot', 'c', '--headless', ('"{0}"' -f $script))
     }

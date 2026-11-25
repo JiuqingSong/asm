@@ -89,10 +89,11 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro),
     }
 }
 Disk::~Disk() { if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
-void Disk::create(const std::filesystem::path& p) {
+void Disk::create(const std::filesystem::path& p, unsigned cylinders) {
+    if (cylinders < 1 || cylinders > 1024) throw std::runtime_error("Hard disk creation requires 1..1024 cylinders");
     auto h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw osError("Cannot create new hard disk image (existing files are never overwritten)");
-    LARGE_INTEGER size{}; size.QuadPart = 64LL * 16 * 63 * 512;
+    LARGE_INTEGER size{}; size.QuadPart = int64_t(cylinders) * 16 * 63 * 512;
     if (!SetFilePointerEx(h, size, nullptr, FILE_BEGIN) || !SetEndOfFile(h) || !FlushFileBuffers(h)) {
         auto e = osError("Cannot allocate hard disk image"); CloseHandle(h); throw e;
     }

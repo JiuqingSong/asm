@@ -1669,6 +1669,54 @@ void atapiTests(const std::filesystem::path& path) {
         "ATAPI software reset must restore its signature even without media");
     std::cout << "ATAPI / IRQ15 / packet phases / ISO streaming / host limits / sense / TOC / media-lock checks passed\n";
 }
+void diskSizingTests(const std::filesystem::path& base) {
+    auto path = std::filesystem::path(base.native() + L".sizing");
+    check(!std::filesystem::exists(path), "Disk sizing fixture already exists");
+    try {
+        for (auto invalid : {0u, 1025u}) {
+            bool rejected = false;
+            try { Disk::create(path, invalid); } catch (const std::runtime_error&) { rejected = true; }
+            check(rejected && !std::filesystem::exists(path), "Invalid disk geometry must be rejected before creating a file");
+        }
+        for (auto cylinders : {256u, 1024u}) {
+            {
+                Disk::create(path, cylinders);
+                Pc p; p.setModel(CpuModel::I486); p.hard = std::make_unique<Disk>(path, false, false);
+                auto& disk = *p.hard;
+                check(disk.cylinders == int(cylinders) && disk.sectors == cylinders * 1008
+                    && std::filesystem::file_size(path) == uint64_t(cylinders) * 1008 * 512,
+                    "Larger disks must retain exact complete-cylinder capacity when reopened");
+                std::array<uint8_t, 512> sector{}; sector[0] = 0xf4; sector[510] = 0x55; sector[511] = 0xaa;
+                check(disk.write(0, sector.data()), "Cannot prepare sizing fixture boot sector");
+                sector[0] = 0x5a;
+                check(disk.write(disk.sectors - 1, sector.data()) && !disk.write(disk.sectors, sector.data()),
+                    "The final sector must be writable and the first out-of-range sector rejected");
+                disk.flush(); p.boot(0x80);
+                auto& c = p.cpu; c.loadSegment(CS, 0); c.ip = 0x500;
+                const uint8_t code[] = {0xb8,0,8,0xb2,0x80,0xcd,0x13,0xf4};
+                std::copy(std::begin(code), std::end(code), c.mem.begin() + c.ip); p.run(100);
+                auto maximum = cylinders - 1;
+                check(!(c.flags & CF) && c.r[CX] == uint16_t(((maximum & 255) << 8) | ((maximum >> 2) & 0xc0) | 63)
+                    && c.reg8(6) == 15, "INT 13h must report every cylinder of a 126/504 MiB disk without CHS truncation");
+                c.out(0x3f6, 2); c.out(0x1f6, 0xe0); c.out(0x1f7, 0xec); p.advanceClock(p.clock + 120);
+                std::array<uint16_t, 256> identify{};
+                for (auto& word : identify) word = uint16_t(c.inputPort(0x1f0, 2));
+                check(identify[1] == cylinders && (identify[60] | (uint32_t(identify[61]) << 16)) == disk.sectors,
+                    "ATA IDENTIFY must agree with BIOS and the larger image's actual capacity");
+            }
+            {
+                Disk disk(path, false, true); std::array<uint8_t, 512> sector{};
+                check(disk.read(disk.sectors - 1, sector.data()) && sector[0] == 0x5a,
+                    "Writes at the end of a larger disk must persist after closing and reopening");
+            }
+            std::filesystem::remove(path);
+        }
+    } catch (...) {
+        std::filesystem::remove(path);
+        throw;
+    }
+    std::cout << "126/504 MiB disk creation / BIOS-ATA geometry / final-sector persistence checks passed\n";
+}
 void unit() {
     videoTests(); serialTests(); keyboardProbeTests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
@@ -1714,7 +1762,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

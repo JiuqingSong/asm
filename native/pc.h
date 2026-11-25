@@ -22,7 +22,7 @@ public:
     ~Disk();
     Disk(const Disk&) = delete;
     Disk& operator=(const Disk&) = delete;
-    static void create(const std::filesystem::path& path);
+    static void create(const std::filesystem::path& path, unsigned cylinders = 64);
     bool read(uint32_t lba, uint8_t* data);
     bool write(uint32_t lba, const uint8_t* data);
     void flush();

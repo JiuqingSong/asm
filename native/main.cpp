@@ -14,7 +14,7 @@
 
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504 };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
@@ -171,10 +171,14 @@ void command(HWND hwnd, int id) {
         break;
     }
     case EjectCdrom: pc->cdrom.eject(); break;
-    case NewHard: case LoadHard: {
+    case NewHard: case NewHard126: case NewHard504: case LoadHard: {
         if (running) { MessageBoxW(hwnd, L"Stop the machine before replacing the hard disk (Machine > Stop).", L"Hard disk", MB_OK); break; }
-        auto p = choose(hwnd, id == NewHard);
-        if (!p.empty()) { if (id == NewHard) Disk::create(p); pc->hard = std::make_unique<Disk>(p, false, false); } break;
+        auto p = choose(hwnd, id != LoadHard);
+        if (!p.empty()) {
+            if (id != LoadHard) Disk::create(p, id == NewHard504 ? 1024 : id == NewHard126 ? 256 : 64);
+            pc->hard = std::make_unique<Disk>(p, false, false);
+        }
+        break;
     }
     case BootA: case BootC: case CtrlAltDel:
         releaseMouse(hwnd); releaseKeyboard();
@@ -451,7 +455,16 @@ int application(int argc, wchar_t** argv) {
         if (option == L"--floppy") { pc->floppy = std::make_unique<Disk>(value, true, true); floppySpecified = true; }
         else if (option == L"--hard") pc->hard = std::make_unique<Disk>(value, false, false);
         else if (option == L"--cdrom") pc->cdrom.insert(value);
-        else if (option == L"--create-hard") { Disk::create(value); pc->hard = std::make_unique<Disk>(value, false, false); }
+        else if (option == L"--create-hard") {
+            unsigned cylinders = 64;
+            if (i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) {
+                std::wstring size = argv[++i];
+                if (size != L"31.5" && size != L"126" && size != L"504")
+                    throw std::runtime_error("Optional --create-hard size must be 31.5, 126 or 504 MiB");
+                cylinders = size == L"504" ? 1024 : size == L"126" ? 256 : 64;
+            }
+            Disk::create(value, cylinders); pc->hard = std::make_unique<Disk>(value, false, false);
+        }
         else if (option == L"--cpu") {
             if (value != L"8088" && value != L"286" && value != L"386" && value != L"486")
                 throw std::runtime_error("--cpu must be 8088, 286, 386 or 486");
@@ -518,7 +531,11 @@ int application(int argc, wchar_t** argv) {
     auto menu = CreateMenu(), disks = CreatePopupMenu(), machine = CreatePopupMenu(), view = CreatePopupMenu();
     AppendMenuW(disks, MF_STRING, LoadFloppy, L"Insert A: floppy (read-only)...");
     AppendMenuW(disks, MF_STRING, EjectFloppy, L"Eject A:");
-    AppendMenuW(disks, MF_STRING, NewHard, L"Create C: hard disk (31.5 MiB)...");
+    auto sizes = CreatePopupMenu();
+    AppendMenuW(sizes, MF_STRING, NewHard, L"31.5 MiB...");
+    AppendMenuW(sizes, MF_STRING, NewHard126, L"126 MiB...");
+    AppendMenuW(sizes, MF_STRING, NewHard504, L"504 MiB...");
+    AppendMenuW(disks, MF_POPUP, UINT_PTR(sizes), L"Create C: hard disk");
     AppendMenuW(disks, MF_STRING, LoadHard, L"Open C: hard disk...");
     AppendMenuW(disks, MF_STRING, LoadCdrom, L"Insert ATAPI CD-ROM (.iso)...");
     AppendMenuW(disks, MF_STRING, EjectCdrom, L"Eject ATAPI CD-ROM");

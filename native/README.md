@@ -59,11 +59,14 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\run.ps1 -Cpu 486 -Cdrom 'D:\images\install.iso'
 # 或直接指定映像：
 .\native\build\asm86-native.exe --hard 'D:\images\dos622.img' --boot c
+# 创建后续 Windows 安装用的 504 MiB 硬盘（目标必须不存在）：
+.\native\build\asm86-native.exe --create-hard 'D:\images\win95.img' 504 --cpu 486
 ```
 
 直接打开 EXE 时恢复上次的软盘、CPU 和速度设置，机器保持停机，用菜单选择启动设备：
 
-- **Disks > Create C: hard disk**：新建 31.5 MiB 空白硬盘，绝不覆盖已有文件。
+- **Disks > Create C: hard disk > 31.5 / 126 / 504 MiB**：按容量新建空白硬盘，绝不覆盖已有文件。
+  命令行 `--create-hard <路径> [31.5|126|504]` 也支持容量选择，省略时仍为 31.5 MiB。
 - **Disks > Open C: hard disk**：打开已有硬盘；替换硬盘前先用 **Machine > Stop** 停机。
 - **Disks > Insert A: floppy**：插入或切换安装盘，可在安装过程中换盘，不会重启机器。
 - **Disks > Eject A:**：取出软盘。
@@ -149,6 +152,8 @@ BIOS 写请求结束时刷新；同一映像不允许另一个进程同时写入
 支持 160/180/320/360/720KB、1.2/1.44MB 原始软盘映像。硬盘采用
 16 磁头、63 扇区/磁道的 CHS 布局，必须包含完整柱面，最大 1024 柱面（504 MiB）。
 其他几何布局的已有硬盘映像不在本版支持范围内。
+三种创建容量分别为 64/256/1024 柱面；BIOS 与 ATA IDENTIFY 报告一致的实际容量。
+504 MiB 新盘已通过真实 DOS 6.22 的自动分区、格式化、完整安装及独立冷启动文件读回验证。
 
 ## 安装和运行 Windows 3.1 标准模式
 
@@ -185,6 +190,8 @@ if ($p.ExitCode -ne 0) { throw 'UI check failed' }
 .\native\test-dos.ps1 -MediaDirectory 'D:\MS-DOS 6.22' -HardDisk 'D:\images\new-dos622.img'
 # 同样验证 286 / AT：
 .\native\test-dos.ps1 -Cpu 286 -MediaDirectory 'D:\MS-DOS 6.22' -HardDisk 'D:\images\new-dos286.img'
+# 验证最大容量，原有默认仍为 31.5 MiB：
+.\native\test-dos.ps1 -Cpu 286 -MediaDirectory 'D:\MS-DOS 6.22' -HardDisk 'D:\images\new-dos504.img' -HardDiskMiB 504
 ```
 
 DOS 验证在同一个 C++ 执行核心上无窗口运行，向真实 Setup 发送键盘输入，
