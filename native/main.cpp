@@ -14,7 +14,7 @@
 
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
@@ -43,6 +43,7 @@ void title(HWND hwnd) {
         : pc->at() ? L"Asm86 native - 80286 / AT" : L"Asm86 native - 8088";
     value += L" | A: " + (pc->floppy ? pc->floppy->path.filename().wstring() : L"(empty)");
     value += L" | C: " + (pc->hard ? pc->hard->path.filename().wstring() : L"(empty)");
+    if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
     value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
         : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
         : pc->at() ? L" | Normal speed (286 ~2 MIPS)" : L" | Normal speed (8088 ~0.33 MIPS)";
@@ -70,11 +71,11 @@ void centerMouse(HWND hwnd) {
     if (!ClientToScreen(hwnd, &center) || !SetCursorPos(center.x, center.y))
         throw std::runtime_error("Cannot center captured mouse pointer");
 }
-std::filesystem::path choose(HWND hwnd, bool save) {
+std::filesystem::path choose(HWND hwnd, bool save, bool optical = false) {
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = hwnd;
-    dialog.lpstrFilter = L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
-    dialog.lpstrFile = path; dialog.nMaxFile = DWORD(std::size(path)); dialog.lpstrDefExt = L"img";
+    dialog.lpstrFilter = optical ? L"Optical images (*.iso)\0*.iso\0All files\0*.*\0" : L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
+    dialog.lpstrFile = path; dialog.nMaxFile = DWORD(std::size(path)); dialog.lpstrDefExt = optical ? L"iso" : L"img";
     dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
     if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) return path;
     if (CommDlgExtendedError()) throw std::runtime_error("File selection dialog failed");
@@ -137,7 +138,9 @@ void render(HDC target, int width, int height) {
     }
 }
 void execute(HWND hwnd) {
+    bool hadDisc = pc->cdrom.medium() != nullptr;
     executionTiming.run(*pc, fullSpeed);
+    if (hadDisc != (pc->cdrom.medium() != nullptr)) title(hwnd);
     if (pc->rebootRequested) {
         if (pc->hard) pc->hard->flush();
         pc->boot(pc->floppy ? 0 : 0x80);
@@ -162,6 +165,12 @@ void command(HWND hwnd, int id) {
         pc->floppy.reset();
         if (preferences) preferences->floppy({});
         break;
+    case LoadCdrom: {
+        auto p = choose(hwnd, false, true);
+        if (!p.empty()) pc->cdrom.insert(p);
+        break;
+    }
+    case EjectCdrom: pc->cdrom.eject(); break;
     case NewHard: case LoadHard: {
         if (running) { MessageBoxW(hwnd, L"Stop the machine before replacing the hard disk (Machine > Stop).", L"Hard disk", MB_OK); break; }
         auto p = choose(hwnd, id == NewHard);
@@ -399,6 +408,8 @@ int headless(const std::filesystem::path& script) {
             pc->serialMouse.motion(dx, dy, uint8_t(buttons), pc->clock);
         } else if (op == "mount") pc->floppy = std::make_unique<Disk>(std::filesystem::u8path(arg), true, true);
         else if (op == "eject") pc->floppy.reset();
+        else if (op == "mount-cd") pc->cdrom.insert(std::filesystem::u8path(arg));
+        else if (op == "eject-cd") pc->cdrom.eject();
         else if (op == "boot") pc->boot(arg == "c" ? 0x80 : 0);
         else if (op == "screen") {
             std::ofstream out(std::filesystem::u8path(arg)); out << pc->text();
@@ -439,6 +450,7 @@ int application(int argc, wchar_t** argv) {
         std::filesystem::path value = argv[++i];
         if (option == L"--floppy") { pc->floppy = std::make_unique<Disk>(value, true, true); floppySpecified = true; }
         else if (option == L"--hard") pc->hard = std::make_unique<Disk>(value, false, false);
+        else if (option == L"--cdrom") pc->cdrom.insert(value);
         else if (option == L"--create-hard") { Disk::create(value); pc->hard = std::make_unique<Disk>(value, false, false); }
         else if (option == L"--cpu") {
             if (value != L"8088" && value != L"286" && value != L"386" && value != L"486")
@@ -508,6 +520,8 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(disks, MF_STRING, EjectFloppy, L"Eject A:");
     AppendMenuW(disks, MF_STRING, NewHard, L"Create C: hard disk (31.5 MiB)...");
     AppendMenuW(disks, MF_STRING, LoadHard, L"Open C: hard disk...");
+    AppendMenuW(disks, MF_STRING, LoadCdrom, L"Insert ATAPI CD-ROM (.iso)...");
+    AppendMenuW(disks, MF_STRING, EjectCdrom, L"Eject ATAPI CD-ROM");
     AppendMenuW(disks, MF_SEPARATOR, 0, nullptr); AppendMenuW(disks, MF_STRING, Quit, L"Exit");
     AppendMenuW(machine, MF_STRING, BootA, L"Boot / restart from A:");
     AppendMenuW(machine, MF_STRING, BootC, L"Boot / restart from C:");

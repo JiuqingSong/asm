@@ -116,14 +116,17 @@ Pc::Pc() {
     cpu.out = [this](uint16_t p, uint8_t v) { output(p, v); };
     cpu.inWide = [this](uint16_t port, unsigned size) {
         uint32_t value = 0;
-        if (at() && port == 0x1f0)
-            for (unsigned i = 0; i < size; i += 2) value |= uint32_t(ide.readWord(clock)) << (i * 8);
+        if (at() && (port == 0x1f0 || port == 0x170))
+            for (unsigned i = 0; i < size; i += 2) value |= uint32_t(port == 0x1f0 ? ide.readWord(clock) : cdrom.readWord(clock)) << (i * 8);
         else for (unsigned i = 0; i < size; ++i) value |= uint32_t(cpu.in(uint16_t(port + i))) << (i * 8);
         return value;
     };
     cpu.outWide = [this](uint16_t port, uint32_t value, unsigned size) {
-        if (at() && port == 0x1f0)
-            for (unsigned i = 0; i < size; i += 2) ide.writeWord(uint16_t(value >> (i * 8)), clock);
+        if (at() && (port == 0x1f0 || port == 0x170))
+            for (unsigned i = 0; i < size; i += 2) {
+                if (port == 0x1f0) ide.writeWord(uint16_t(value >> (i * 8)), clock);
+                else cdrom.writeWord(uint16_t(value >> (i * 8)), clock);
+            }
         else for (unsigned i = 0; i < size; ++i) cpu.out(uint16_t(port + i), uint8_t(value >> (i * 8)));
     };
     cpu.irq = [this]() { return acknowledge(); };
@@ -136,6 +139,10 @@ Pc::Pc() {
     ide.interrupt = [this](bool raised) {
         if (raised) pic[1].raise(6);
         else pic[1].pending &= uint8_t(~0x40);
+    };
+    cdrom.interrupt = [this](bool raised) {
+        if (raised) pic[1].raise(7);
+        else pic[1].pending &= uint8_t(~0x80);
     };
     cpu.resetSignal = [this] { pendingReset = true; };
 }
@@ -235,6 +242,7 @@ void Pc::advanceClock(double target) {
     }
     if (clock >= nextRtc) rtcAdvance();
     if (at() && clock >= ide.nextEvent) ide.advance(clock);
+    if (at() && clock >= cdrom.nextEvent) cdrom.advance(clock);
 }
 int Pc::acknowledge() {
     if (at() && pic[1].next() >= 0) pic[0].raise(2);
@@ -249,6 +257,7 @@ int Pc::acknowledge() {
 }
 uint8_t Pc::input(uint16_t p) {
     if (at() && IdeChannel::owns(p)) return ide.input(p, clock);
+    if (at() && AtapiCdrom::owns(p)) return cdrom.input(p, clock);
     if (p >= 0x3f8 && p <= 0x3ff) return serialMouse.input(p - 0x3f8, clock);
     if (p == 0x20 || (at() && p == 0xa0)) return pic[p == 0x20 ? 0 : 1].command();
     if (p == 0x21 || (at() && p == 0xa1)) return pic[p == 0x21 ? 0 : 1].mask;
@@ -284,6 +293,7 @@ uint8_t Pc::input(uint16_t p) {
 }
 void Pc::output(uint16_t p, uint8_t v) {
     if (at() && IdeChannel::owns(p)) { ide.output(p, v, clock); return; }
+    if (at() && AtapiCdrom::owns(p)) { cdrom.output(p, v, clock); return; }
     if (p >= 0x3f8 && p <= 0x3ff) { serialMouse.output(p - 0x3f8, v, clock); return; }
     if (vga.output(p, v) && p != 0x3d4 && p != 0x3b4 && p != 0x3d5 && p != 0x3b5) return;
     if (p == 0x20 || (at() && p == 0xa0)) { pic[p == 0x20 ? 0 : 1].command(v); }

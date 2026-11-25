@@ -157,6 +157,27 @@ void cpu386Tests(CpuModel model) {
         check(c.eflags() == (model == CpuModel::I486 ? 0x240002u : 2u),
             "Real-mode IRETD must restore supported AC/ID flags without exposing them on a 386");
     }
+    for (auto op : {0xb2, 0xb4, 0xb5}) {
+        auto c = real(); c.writeWord(0x4000, 0x1234); c.writeWord(0x4002, 0x2000);
+        run(c, {0x0f, uint8_t(op), 0x06,0,0x40,0xf4});
+        check(c.r[AX] == 0x1234 && c.s[op == 0xb2 ? SS : op == 0xb4 ? FS : GS] == 0x2000,
+            "LSS/LFS/LGS must load the offset and segment of a real-mode far pointer");
+    }
+    {
+        auto c = real(); c.writeDword(0x4000, 0x12345678); c.writeWord(0x4004, 0x2000);
+        const uint8_t code[] = {0x66,0x0f,0xb2,0x26,0,0x40,0x90};
+        std::copy(std::begin(code), std::end(code), c.mem.begin() + c.ip);
+        c.setFlags(IF | 2); c.step();
+        check(c.r32(SP) == 0x12345678 && c.s[SS] == 0x2000, "Dword LSS must load the full ESP and stack segment");
+        c.writeWord(0x80, 0x700); c.writeWord(0x82, 0); c.irq = []() { return 0x20; };
+        c.step(); check(c.ip == 0x507, "LSS must suppress a pending interrupt for the following instruction");
+        c.step(); check(c.ip == 0x700, "LSS must allow the pending interrupt after the following instruction");
+        auto invalid = real(); invalid.r[AX] = 0x5678; invalid.onFault = [](CpuFault f, uint32_t) { throw f; };
+        bool rejected = false;
+        try { run(invalid, {0x0f,0xb2,0xc0}); } catch (const CpuFault& fault) { rejected = fault.vector == 6; }
+        check(rejected && invalid.r[AX] == 0x5678 && invalid.s[SS] == 0,
+            "LSS with a register source must fault without changing its destination or stack segment");
+    }
     if (model == CpuModel::I486) {
         auto c = real(); c.r32(AX, 0x12345678);
         run(c, {0x0f,0xc8,0xf4});
@@ -1551,6 +1572,103 @@ void ideTests(const std::filesystem::path& path) {
     }
     std::cout << "ATA PIO / CHS-LBA / IRQ14 / word-dword I/O / multi-sector / reset / disk-persistence checks passed\n";
 }
+void atapiTests(const std::filesystem::path& path) {
+    std::vector<uint8_t> expected(4096);
+    for (unsigned i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i * 19 + i / 2048);
+    {
+        Disk fixture(path, false, false);
+        for (unsigned i = 0; i < expected.size() / 512; ++i)
+            check(fixture.write(64 + i, expected.data() + i * 512), "Cannot prepare synthetic optical sectors");
+        fixture.flush();
+    }
+    Pc p; p.setModel(CpuModel::I486); auto& c = p.cpu; p.cdrom.insert(path);
+    auto tick = [&]() { p.advanceClock(p.clock + 120); };
+    auto acknowledge = [&]() { c.in(0x177); c.out(0xa0, 0x20); c.out(0x20, 0x20); };
+    c.out(0x21, 0xfb); c.out(0xa1, 0x7f);
+    check(c.in(0x174) == 0x14 && c.in(0x175) == 0xeb && c.in(0x1f7) == 0,
+        "The secondary ATAPI master must expose its signature independently of the primary ATA channel");
+    c.out(0x177, 0xec); tick();
+    check(c.in(0x376) == 0x41 && c.in(0x171) == 4 && c.irq() == 0x77,
+        "ATA IDENTIFY must abort on an ATAPI device and deliver IRQ15, not IRQ14");
+    acknowledge(); c.out(0x177, 0xa1); tick();
+    check(c.irq() == 0x77 && c.in(0x172) == 2, "IDENTIFY PACKET DEVICE must report a device-to-host data phase");
+    acknowledge();
+    auto config = c.inputPort(0x170, 2);
+    for (unsigned i = 1; i < 256; ++i) c.inputPort(0x170, 2);
+    check(config == 0x8580 && c.in(0x376) == 0x50, "ATAPI IDENTIFY must describe a removable CD-ROM using polled 12-byte packets");
+    c.out(0x21, 0xff); c.out(0xa1, 0xff);
+    auto send = [&](std::array<uint8_t, 12> packet, unsigned limit = 2048) {
+        c.out(0x171, 0); c.out(0x174, uint8_t(limit)); c.out(0x175, uint8_t(limit >> 8)); c.out(0x177, 0xa0);
+        check(c.in(0x376) == 0x80, "ATAPI PACKET must defer its DRQ phase");
+        tick();
+        check(c.in(0x376) == 0x48 && c.in(0x172) == 1, "ATAPI PACKET must request a command packet, not data");
+        for (unsigned i = 0; i < packet.size(); i += 2)
+            c.outputPort(0x170, packet[i] | (uint32_t(packet[i + 1]) << 8), 2);
+        tick();
+    };
+    auto receive = [&]() {
+        std::vector<uint8_t> data;
+        for (unsigned block = 0; block < 4096; ++block) {
+            auto status = c.in(0x376);
+            if (status & 0x80) { tick(); continue; }
+            c.in(0x177);
+            if (!(status & 8)) return data;
+            auto count = unsigned(c.in(0x174)) | (unsigned(c.in(0x175)) << 8);
+            check(count && c.in(0x172) == 2, "ATAPI data phases must report their actual payload byte count and direction");
+            for (unsigned i = 0; i < count;) {
+                unsigned width = count - i >= 4 ? 4 : 2;
+                auto value = c.inputPort(0x170, width);
+                for (unsigned k = 0; k < width && i + k < count; ++k) data.push_back(uint8_t(value >> (k * 8)));
+                i += width;
+            }
+        }
+        throw std::runtime_error("ATAPI test transfer did not complete");
+    };
+    send({0}); receive();
+    check(c.in(0x376) == 0x41 && c.in(0x172) == 3, "A newly inserted disc must report unit attention before ordinary commands");
+    send({3,0,0,0,18});
+    auto data = receive();
+    check(data.size() == 18 && data[2] == 6 && data[12] == 0x28, "REQUEST SENSE must preserve and report media-change attention");
+    send({0}); receive();
+    check(c.in(0x376) == 0x50, "TEST UNIT READY must succeed after acknowledging media change");
+    send({0x25}); data = receive();
+    auto last = p.cdrom.medium()->sectors - 1;
+    check(data.size() == 8 && ((uint32_t(data[0]) << 24) | (uint32_t(data[1]) << 16) | (uint32_t(data[2]) << 8) | data[3]) == last
+        && data[6] == 8 && data[7] == 0, "READ CAPACITY must report the mounted image's 2048-byte blocks in big-endian order");
+    send({0x28,0,0,0,0,16,0,0,2}, 510); data = receive();
+    check(data == expected && c.in(0x172) == 3, "READ(10) must reconstruct complete ISO data across host-limited transfer phases");
+    send({0xa8,0,0,0,0,16,0,0,0,2}, 127); data = receive();
+    check(data == expected, "READ(12) must preserve every byte across odd-sized transfer chunks and padded data words");
+    send({0x12,0,0,0,35}, 7); data = receive();
+    check(data.size() == 35 && data[0] == 5 && std::string(data.begin() + 8, data.begin() + 13) == "ASM86",
+        "INQUIRY must obey odd allocation lengths and short host transfer limits");
+    send({3,0,0,0,0}); data = receive();
+    check(data.empty() && c.in(0x376) == 0x50, "A zero SCSI allocation length must not accidentally transfer an entire response");
+    std::array<uint8_t, 12> invalid{0x28};
+    auto outside = p.cdrom.medium()->sectors;
+    for (unsigned i = 0; i < 4; ++i) invalid[2 + i] = uint8_t(outside >> ((3 - i) * 8));
+    invalid[8] = 1; send(invalid); receive();
+    send({3,0,0,0,18}); data = receive();
+    check(data.size() == 18 && data[2] == 5 && data[12] == 0x21, "Out-of-range optical reads must return illegal-request sense, not padded success data");
+    send({0x43,0,0,0,0,0,0xaa,0,12}); data = receive();
+    check(data.size() == 12 && data[6] == 0xaa, "READ TOC starting at lead-out must not return track one in its place");
+    send({0x1e,0,0,0,1}); receive();
+    bool denied = false;
+    try { p.cdrom.eject(); } catch (const std::runtime_error&) { denied = true; }
+    check(denied && p.cdrom.medium(), "Host media changes must respect a guest's medium-removal lock");
+    send({0x1b,0,0,0,2}); receive();
+    send({3,0,0,0,18}); data = receive();
+    check(data.size() == 18 && data[2] == 5 && data[12] == 0x53 && data[13] == 2,
+        "Guest eject must report medium-removal-prevented sense while locked");
+    send({0x1e,0,0,0,0}); receive(); send({0x1b,0,0,0,2}); receive();
+    check(!p.cdrom.medium(), "Unlocking and guest eject must actually release the mounted ISO");
+    send({0}); receive(); send({3,0,0,0,18}); data = receive();
+    check(data.size() == 18 && data[2] == 2 && data[12] == 0x3a, "An empty optical drive must report no-medium sense");
+    c.out(0x376, 4); c.out(0x376, 0); tick();
+    check(c.in(0x174) == 0x14 && c.in(0x175) == 0xeb && c.in(0x171) == 1,
+        "ATAPI software reset must restore its signature even without media");
+    std::cout << "ATAPI / IRQ15 / packet phases / ISO streaming / host limits / sense / TOC / media-lock checks passed\n";
+}
 void unit() {
     videoTests(); serialTests(); keyboardProbeTests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
@@ -1596,7 +1714,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        ideTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

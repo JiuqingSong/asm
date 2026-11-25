@@ -55,6 +55,8 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\run.ps1 -Cpu 386 -HardDisk '.\native\win31-386.img' -FullSpeed
 # 使用实验性 486 整数核心（暂不带 x87）：
 .\native\run.ps1 -Cpu 486 -HardDisk '.\native\win31-386.img' -FullSpeed
+# 挂载 ISO（需在客体中加载 ATAPI 光驱驱动和 MSCDEX）：
+.\native\run.ps1 -Cpu 486 -Cdrom 'D:\images\install.iso'
 # 或直接指定映像：
 .\native\build\asm86-native.exe --hard 'D:\images\dos622.img' --boot c
 ```
@@ -65,6 +67,8 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 - **Disks > Open C: hard disk**：打开已有硬盘；替换硬盘前先用 **Machine > Stop** 停机。
 - **Disks > Insert A: floppy**：插入或切换安装盘，可在安装过程中换盘，不会重启机器。
 - **Disks > Eject A:**：取出软盘。
+- **Disks > Insert ATAPI CD-ROM / Eject ATAPI CD-ROM**：在 AT 平台挂载或取出只读 ISO；
+  不重启机器，尊重客体的锁盘状态，正在传输时拒绝换盘。光盘路径暂不保存。
 - **Machine > Boot / restart from A: / C:**：从指定设备启动或重启。
 - **Machine > Ctrl+Alt+Del**：与现有组合键相同，释放输入并重启客体；
   有软盘时从 A: 启动，否则从 C: 启动，保留 CPU 型号和速度设置，不触发宿主安全界面。
@@ -189,7 +193,7 @@ DOS 验证在同一个 C++ 执行核心上无窗口运行，向真实 Setup 发�
 
 `--headless <UTF-8 脚本>` 可用于复现问题。脚本每行一条指令：
 `run <指令预算>`、`wait <屏幕文字>`、`expect <屏幕文字>`、`key ENTER/TAB/F1/...`、
-`type <文字>`、`mount <软盘路径>`、`eject`、`boot a/c`。
+`type <文字>`、`mount <软盘路径>`、`eject`、`mount-cd <ISO 路径>`、`eject-cd`、`boot a/c`。
 `key ALT_DOWN` / `key ALT_UP` 可配合 `type f` 等操作测试 DOS 的 Alt 菜单；
 按下、字母输入、释放之间用 `run` 留出键盘中断处理时间。
 普通 `key` 和 `type` 均发送按下、释放扫描码；只有显式的 `ALT_DOWN` 会保持按下状态。
@@ -229,6 +233,25 @@ PIO 传输模式、写缓存开关、FLUSH CACHE、软件复位、nIEN 及设备
 经 ATA PIO 读取的整个 512 字节扇区与 BIOS 读取结果逐字比较，286/486 均通过。
 Windows 3.1/3.2 增强模式与 DOS 窗口流程也已回归，但不以这些测试代替 Windows 95 安装验证。
 
+## ATAPI 光驱（AT）
+
+286/386/486 提供第二 IDE 通道主设备，端口为 `170h–177h` / `376h`，使用 IRQ15。
+菜单、`--cdrom <ISO 路径>` 或 `run.ps1 -Cdrom` 可挂载只读的 2048 字节扇区映像；
+ISO 按需读取，不整体装入内存。光驱与第一通道硬盘互不占用设备或中断。
+
+已实现 IDENTIFY PACKET DEVICE、12 字节 PIO 命令包、16/32 位数据端口、
+主/备用状态、中断屏蔽、复位、主机限定字节数的分段传输及奇数字节尾部填充。
+SCSI/MMC 子集包含 INQUIRY、TEST UNIT READY、REQUEST SENSE、READ CAPACITY、
+READ(10/12)、SEEK、READ TOC、MODE SENSE 和锁盘/退盘；换盘、无介质、越界和
+不支持的命令返回相应错误或 sense，不用空数据伪装读取成功。不提供 DMA、音轨或刻录。
+
+已使用 Windows 98 启动软盘中的真实 OAKCDROM.SYS / MSCDEX 挂载光驱，
+列出原始安装 ISO 的文件，并将 PRECOPY1.CAB 的 1,331,200 字节复制到独立硬盘副本；
+退出虚拟机后解析 FAT16，确认持久化文件与 ISO 原文件逐字节一致。
+Windows 95 OSR2 启动软盘中的 NEC IDE 驱动及 MSCDEX 也已识别光驱。
+这些只证明 DOS 启动环境和光驱读取，不代表 Windows 95/98 已安装或进入桌面。
+当前仍从 A:/C: 启动；未实现 El Torito 光盘启动，请使用启动软盘加载光驱驱动。
+
 ## 386 增强模式开发状态
 
 8088 和 286 保持原有使用方式；386 现以 **experimental** 标记加入菜单、CPU 记忆设置、
@@ -249,6 +272,8 @@ FS/GS、SIB 寻址、主要 32 位整数/串操作、32 位代码/数据/栈段�
 两级 4KB 分页。测试覆盖从实模式进入平坦 32 位代码、超过 64KB 的 EIP、超过 1MB 的
 数据与栈访问、页权限和访问/脏位、缺页错误码与跨页写入，以及已有 8088/286 回归。
 这不等于完整的 386 指令与系统支持；未完成的路径会报错，不会宣称启动成功。
+另已补齐 Windows 95/98 DOS 启动所需的 LSS/LFS/LGS 远指针加载，
+包含 16/32 位目的操作数和 LSS 后一条指令的中断屏蔽。
 
 内部系统层已加入 16/32 位中断门、陷阱门和调用门，386 TSS 的 LTR、特权栈、
 调用门参数复制、RETF/IRETD，以及保护模式任务切换和嵌套任务返回。
@@ -289,9 +314,9 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 ## 边界
 
 - 不是周期精确的 XT：不模拟预取队列、总线争用或 8086/8088 总线宽度差异。
-- 暂不包含 CGA/单色模式、Mode X、完整 CRTC 时序/平滑卷动、可编程字形、声音、光驱、调试或快照。
+- 暂不包含 CGA/单色模式、Mode X、完整 CRTC 时序/平滑卷动、可编程字形、声音、调试或快照。
 - COM1 目前专用于鼠标，不是宿主串口转发；COM2 未连接设备。
-- 硬盘同时提供 BIOS INT 13h 与 AT IDE PIO；FDC、IDE DMA、ATAPI 光驱和第二块硬盘尚未接入。
+- 硬盘同时提供 BIOS INT 13h 与 AT IDE PIO，另提供 ATAPI PIO 光驱；FDC、IDE DMA 和第二块硬盘尚未接入。
 - 显示使用宿主固定宽度字体绘制 CP437 字符，不模拟可编程 VGA 字形和全部扩展功能。
   图形模式 ROM 的 8×16 点阵由现有内置 8×8 字库纵向扩展，包含可见 ASCII、制表符和方块；
   不是完整的 IBM VGA 字库，缺少的扩展字形不会借用浏览器字体填充。
@@ -305,6 +330,7 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 - `386.cpp`：实验性的 386/486 整数执行、32 位寻址、分页、VM86、I/O 权限、返回和任务切换。
 - `at.h/cpp`：8259 PIC、8042、A20、CMOS/RTC 和 AT 暖复位。
 - `ide.h/cpp`：第一通道 ATA PIO 硬盘、任务寄存器、延迟完成和 IRQ14。
+- `atapi.h/cpp`：第二通道 ATAPI PIO 光驱、ISO 按需读取、命令包、sense 和 IRQ15。
 - `pc.h/cpp`：设备、BIOS、启动和磁盘映像；磁盘 I/O 使用 Windows API。
 - `video.h/cpp`：VGA 显存、寄存器、调色板和图形像素。
 - `font8x8.h`：从 `src/machine/font8x8.ts` 的 `builtinFont()` 导出的原生 ROM 字形数据。

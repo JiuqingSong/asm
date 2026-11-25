@@ -23,7 +23,9 @@ npm run build      # 生成静态网页到 dist/
 中文版 Windows 3.2 已在用户安装好的硬盘副本中验证冷启动进入桌面，仍属实验支持；
 Windows 3.1 / 3.2 的 DOS 会话已验证全屏/窗口切换、命令输入、文件写入及退出返回桌面；
 实验性 486 整数核心也已通过上述增强模式回归，但尚未包含 x87 或 Windows 95/98 安装支持。
-AT 平台的硬盘另提供第一通道 IDE PIO / IRQ14，与 BIOS 共享映像；光驱和 FDC 仍待接入。
+AT 平台的硬盘另提供第一通道 IDE PIO / IRQ14，与 BIOS 共享映像；
+第二通道 ATAPI PIO / IRQ15 光驱已用真实 OAKCDROM/MSCDEX 验证读取 ISO、复制文件及逐字节持久化校验，
+但尚无光盘启动、Windows 95/98 安装或 FDC 支持。
 不包含网页版的汇编器和调试器。
 构建、安装、启动和验证方法见 [原生版说明](native/README.md)。
 

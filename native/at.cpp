@@ -7,6 +7,7 @@ namespace asm86 {
 void Pc::resetAt() {
     pic[0].reset(8, !at()); pic[1].reset(0x70, false);
     ide.reset();
+    cdrom.reset();
     controller.clear(); kbdCommand = 0x45; kbdOutput = 1; kbdWrite = fastA20 = cmosIndex = 0;
     keyboardLatch = 0; keyboardRead = false;
     pendingReset = false; cpu.a20 = false;

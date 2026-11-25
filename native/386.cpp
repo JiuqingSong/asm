@@ -434,6 +434,16 @@ void Cpu::system386() {
     if (op >= 0x90 && op <= 0x9f) { modrm(); setRM(1, cond(op & 15)); return; }
     if (op == 0xa0 || op == 0xa8) { pushValue(s[op == 0xa0 ? FS : GS], unsigned(size)); return; }
     if (op == 0xa1 || op == 0xa9) { auto value = popValue(unsigned(size)); loadSegment(op == 0xa1 ? FS : GS, uint16_t(value)); return; }
+    if (op == 0xb2 || op == 0xb4 || op == 0xb5) {
+        if (lockPrefix) fault(6);
+        modrm(); if (mod == 3) fault(6);
+        auto value = readSegment(eaSeg, eaOff, size);
+        auto selector = uint16_t(readSegment(eaSeg, offsetPlus(eaOff, size), 2));
+        int segment = op == 0xb2 ? SS : op == 0xb4 ? FS : GS;
+        loadSegment(segment, selector); setReg(size, reg, value);
+        if (segment == SS) inhibit = true;
+        return;
+    }
     if (op == 0xb6 || op == 0xb7 || op == 0xbe || op == 0xbf) {
         modrm(); auto value = getRM(op & 1 ? 2 : 1);
         if (op & 8) value = op & 1 ? uint32_t(int32_t(int16_t(value))) : uint32_t(int32_t(int8_t(value)));

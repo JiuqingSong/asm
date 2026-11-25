@@ -4,6 +4,7 @@
 #include "serial.h"
 #include "at.h"
 #include "ide.h"
+#include "atapi.h"
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -40,6 +41,7 @@ public:
     Vga vga;
     SerialMouse serialMouse;
     IdeChannel ide;
+    AtapiCdrom cdrom;
     std::unique_ptr<Disk> floppy, hard;
     uint64_t instructions = 0;
     double clock = 0;

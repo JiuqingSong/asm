@@ -3,7 +3,8 @@ param(
     [string]$Floppy,
     [switch]$FullSpeed,
     [ValidateSet('8088', '286', '386', '486')][string]$Cpu,
-    [switch]$NormalSpeed
+    [switch]$NormalSpeed,
+    [string]$Cdrom
 )
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'build\asm86-native.exe'
@@ -18,6 +19,9 @@ if ($Floppy) {
     $arguments += @('--floppy', ('"{0}"' -f (Resolve-Path -LiteralPath $Floppy).Path), '--boot', 'a')
 } elseif (Test-Path -LiteralPath $HardDisk) {
     $arguments += @('--boot', 'c')
+}
+if ($Cdrom) {
+    $arguments += @('--cdrom', ('"{0}"' -f (Resolve-Path -LiteralPath $Cdrom).Path))
 }
 if ($FullSpeed) { $arguments += '--full-speed' }
 if ($NormalSpeed) { $arguments += '--normal-speed' }
