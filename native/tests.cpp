@@ -1192,6 +1192,13 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
     p.hard = std::make_unique<Disk>(disk, false, false);
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         p.setModel(model); p.boot(0x80); observed->setMode(3);
+        c.halted = false; c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.ip = 0x500;
+        c.mem[0x500] = 0xcd; c.mem[0x501] = 0x68; c.mem[0x502] = 0xf4;
+        c.r[SP] = 0x9000; c.r[AX] = 0x4f79; c.setFlags(CF | DF | 2);
+        auto debugRegisters = c.r; auto debugFlags = c.flags;
+        p.runCpu(100);
+        check(c.halted && c.r == debugRegisters && c.flags == debugFlags,
+            "An absent INT 68h debugger must preserve registers and flags through the firmware's empty IRET hook");
         for (uint16_t mode : {0x12, 0x93, 3}) {
             c.halted = false;
             c.loadSegment(CS, 0); c.loadSegment(SS, 0);
@@ -1235,6 +1242,19 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
         for (unsigned row = 0; row < 16; ++row)
             check(c.rb(0xa000, uint16_t('A' * 32 + row)) == c.readPhysical(font + 'A' * 16 + row),
                 "Text-mode planar reads must expose VGA font plane 2 to DOS-window grabbers");
+        for (uint16_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
+            c.r[AX] = mode; c.trap(0x10);
+            c.r[BX] = 0; c.r[DX] = 0; c.r[AX] = 0x0200; c.trap(0x10);
+            c.r[BX] = 14; c.r[CX] = 1; c.r[AX] = 0x0941; c.trap(0x10);
+            auto offset = c.rw(0, 0x10c), segment = c.rw(0, 0x10e);
+            unsigned height = c.rw(0x40, 0x85); bool visible = false;
+            for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < 8; ++x) {
+                bool ink = c.rb(segment, uint16_t(offset + 'A' * height + y)) & (0x80 >> x);
+                visible |= ink;
+                check(p.vga.pixel(x, y) == (ink ? 14 : 0), "Graphics BIOS must use the mode's actual ROM font layout");
+            }
+            check(visible, "The selected graphics ROM font must contain visible glyphs");
+        }
     }
 }
 void pagedBiosTests(const std::filesystem::path& disk) {
@@ -1274,6 +1294,13 @@ void pagedBiosTests(const std::filesystem::path& disk) {
     check(c.trap(0x10) && c.readWord(0x20010c) == 0x8000 && c.readWord(0x20010e) == 0xf000
         && c.mem[0x200484] == 29 && c.readWord(0x200485) == 16 && c.readDword(0x10c) == 0 && c.mem[0x484] == 0,
         "VM86 graphics font selection must update the mapped font vector and BDA, not physical page zero");
+    p.vga.setMode(0x13);
+    c.writeWord(0x20044a, 40); c.mem[0x200484] = 24; c.writeWord(0x200485, 8);
+    c.writeWord(0x200450, 0); c.writeWord(0x20010c, 0x100); c.writeWord(0x20010e, 0x3000);
+    for (unsigned row = 0; row < 8; ++row) c.mem[0x230100 + 'A' * 8 + row] = 0x80;
+    c.r[BX] = 5; c.r[CX] = 1; c.r[AX] = 0x0941;
+    check(c.trap(0x10) && p.vga.pixel(0, 0) == 5 && p.vga.pixel(1, 0) == 0,
+        "VM86 graphics characters must read the mapped BDA, font vector and guest glyph bytes");
     c.loadSegment(ES, 0x100); c.r[BX] = 0xfff; c.r[AX] = 0x0201; c.r[CX] = 1; c.r[DX] = 0x80;
     c.mem[0x474] = 0xcc;
     std::array<uint8_t, 512> sector{}; p.hard->read(0, sector.data());
@@ -1293,6 +1320,77 @@ void pagedBiosTests(const std::filesystem::path& disk) {
     check(rejected && c.mem[0x201fff] == 0x55 && c.mem[0x202000] == 0x66,
         "Firmware word stores must prevalidate both guest pages before modifying memory");
     std::cout << "386 AT / paged VM86 BIOS / keyboard / timer / video / disk-buffer checks passed\n";
+}
+void graphicsBiosTests() {
+    Pc p; auto& c = p.cpu;
+    auto bios = [&](uint16_t ax) { c.r[AX] = ax; check(c.trap(0x10), "Graphics BIOS call was not handled"); };
+    for (uint16_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
+        bios(mode);
+        unsigned height = c.rw(0x40, 0x85), columns = c.rw(0x40, 0x4a), rows = c.rb(0x40, 0x84) + 1;
+        c.ww(0, 0x10c, 0x100); c.ww(0, 0x10e, 0x2000);
+        for (unsigned y = 0; y < height; ++y) {
+            c.wb(0x2000, uint16_t(0x100 + 'A' * height + y), uint8_t(y & 1 ? 0x24 : 0x81));
+            c.wb(0x2000, uint16_t(0x100 + 'B' * height + y), 0x42);
+        }
+        c.r[BX] = 0; c.r[DX] = 0x0101; bios(0x0200);
+        c.r[BX] = 0xa5; c.r[CX] = 2; bios(0x0941);
+        uint8_t color = mode == 0x13 ? 0xa5 : 5;
+        for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < 16; ++x) {
+            bool ink = (y & 1 ? 0x24 : 0x81) & (0x80 >> (x & 7));
+            check(p.vga.pixel(8 + x, height + y) == (ink ? color : 0),
+                "Repeated graphics characters must use guest font bytes, clear background, and preserve 8-bit colors");
+        }
+        check(c.rw(0x40, 0x50) == 0x0101, "AH=09 must not advance the graphics cursor");
+        c.r[BX] = 0; bios(0x0800);
+        check(c.reg8(0) == 'A', "Graphics character readback must recognize the current font");
+        p.vga.pixel(9, height, 2); bios(0x0800);
+        check(c.reg8(0) == 0, "Graphics readback must not invent a character for unmatched pixels");
+        c.r[BX] = 5; c.r[CX] = 1; bios(0x0a41);
+        c.r[BX] = 0x83; bios(0x0941); bios(0x0941);
+        check(p.vga.pixel(8, height) == (mode == 0x13 ? 0x83 : 5) && p.vga.pixel(9, height) == 0,
+            "Planar XOR must restore the original glyph after two draws; 256-color mode must not XOR");
+        c.r[BX] = 0; bios(0x0e41);
+        for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < 8; ++x)
+            check(p.vga.pixel(8 + x, height + y) == 0, "Graphics teletype must allow black foreground");
+        auto stripes = [&]() {
+            for (unsigned y = 0; y < 4 * height; ++y) for (unsigned x = 0; x < 24; ++x)
+                p.vga.pixel(x, y, x >= 16 ? 9 : uint8_t(1 + y / height));
+            c.r[CX] = 0; c.r[DX] = 0x0201; c.r[BX] = 0x0700;
+        };
+        stripes(); bios(0x0601);
+        for (unsigned y = 0; y < 4 * height; ++y) for (unsigned x = 0; x < 24; ++x)
+            check(p.vga.pixel(x, y) == (x >= 16 ? 9 : y >= 3 * height ? 4 : y >= 2 * height ? 7 : 2 + y / height),
+                "Graphics upward scroll must copy overlapping rows and preserve pixels outside the window");
+        stripes(); bios(0x0701);
+        for (unsigned y = 0; y < 3 * height; ++y) for (unsigned x = 0; x < 16; ++x)
+            check(p.vga.pixel(x, y) == (y < height ? 7 : y / height),
+                "Graphics downward scroll must copy bottom-up and fill the exposed row");
+        bios(0x0600);
+        check(p.vga.pixel(0, 0) == 7 && p.vga.pixel(15, 3 * height - 1) == 7 && p.vga.pixel(16, 0) == 9,
+            "Zero-line graphics scroll must clear only the selected window");
+        c.r[BX] = 0; c.r[DX] = uint16_t(((rows - 1) << 8) | (columns - 1)); bios(0x0200);
+        c.r[BX] = 5; bios(0x0e41);
+        check(c.rw(0x40, 0x50) == (rows - 1) << 8
+            && p.vga.pixel((columns - 1) * 8, (rows - 2) * height) == 5
+            && p.vga.pixel((columns - 1) * 8, (rows - 1) * height) == 0,
+            "Graphics teletype must wrap, scroll the glyph upward, and clear the bottom row");
+        c.loadSegment(ES, 0x3000); c.r[BP] = 0xfffe;
+        c.wb(0x3000, 0xfffe, 'A'); c.wb(0x3000, 0xffff, 3); c.wb(0x3000, 0, 'B'); c.wb(0x3000, 1, 4);
+        c.ww(0x40, 0x50, 5); c.r[BX] = 0; c.r[CX] = 2; c.r[DX] = 0x0201; bios(0x1302);
+        check(c.rw(0x40, 0x50) == 5 && p.vga.pixel(8, 2 * height) == 3 && p.vga.pixel(17, 2 * height) == 4,
+            "Graphics strings must use embedded attributes, wrap the input offset, and restore the cursor");
+        bios(0x1303);
+        check(c.rw(0x40, 0x50) == 0x0203, "Graphics string cursor-update flag must be honored");
+        c.r[BX] = 0x100; bool rejected = false;
+        try { bios(0x0e41); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "Unsupported nonzero graphics pages must still report an error");
+    }
+    bios(3); c.r[BX] = 0x200; c.r[DX] = 0; c.r[CX] = 2;
+    c.ww(0x40, 0x54, 9); bios(0x1302);
+    check(c.rw(0xb800, 8192) == 0x0341 && c.rw(0xb800, 8194) == 0x0442
+        && c.rw(0x40, 0x54) == 9 && c.rw(0x40, 0x50) == 0 && p.activePage() == 0,
+        "Text strings must write attributes on the requested page without changing the active page or its cursor");
+    std::cout << "Graphics BIOS / guest fonts / XOR / scroll / teletype / character readback / strings checks passed\n";
 }
 void videoTests() {
     Pc p; auto& c = p.cpu;
@@ -2052,7 +2150,7 @@ void mbrBootstrapTests(const std::filesystem::path& base) {
     std::cout << "Generated MBR / VBR chainload / high-cylinder LBA / fourth slot / DL / invalid metadata checks passed\n";
 }
 void unit() {
-    videoTests(); serialTests(); keyboardProbeTests();
+    videoTests(); graphicsBiosTests(); serialTests(); keyboardProbeTests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
     c.mem[0x100] = 0x54; c.r[SP] = 0x200; c.step();
     check(c.r[SP] == 0x1fe && c.rw(0, 0x1fe) == 0x1fe, "8088 PUSH SP");

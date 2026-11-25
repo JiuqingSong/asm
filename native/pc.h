@@ -92,8 +92,13 @@ private:
     unsigned biosColumns();
     unsigned biosPage();
     unsigned biosCursor();
-    void put(uint8_t ch, uint8_t attr = 7);
-    void scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, unsigned lines, uint8_t attr, bool down);
+    unsigned biosCharacterHeight();
+    unsigned biosRows();
+    uint8_t glyphByte(uint8_t ch, unsigned row);
+    void drawGlyph(unsigned column, unsigned row, uint8_t ch, uint8_t color);
+    uint8_t readGlyph(unsigned column, unsigned row);
+    void put(uint8_t ch, uint8_t attr = 7, unsigned page = 8, bool writeAttribute = false);
+    void scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, unsigned lines, uint8_t attr, bool down, unsigned page = 8);
     void keyboard();
     void resetAt();
     void resetCpu();

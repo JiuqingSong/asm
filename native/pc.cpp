@@ -11,6 +11,8 @@
 namespace asm86 {
 static std::atomic<uint64_t> nextDiskIdentity{0};
 static constexpr uint16_t font16Offset = 0x8000;
+static constexpr uint16_t font8Offset = 0x9000;
+static constexpr uint16_t font14Offset = 0x9800;
 static std::runtime_error osError(const char* operation) {
     return std::runtime_error(std::string(operation) + " (Windows error " + std::to_string(GetLastError()) + ")");
 }
@@ -86,6 +88,12 @@ static void installVideoFirmware(Cpu& cpu) {
     for (unsigned ch = 0; ch < 256; ++ch)
         for (unsigned row = 0; row < 16; ++row)
             cpu.wb(0xf000, uint16_t(font16Offset + ch * 16 + row), biosFont8x8[ch * 8 + row / 2]);
+    for (unsigned ch = 0; ch < 256; ++ch) {
+        for (unsigned row = 0; row < 8; ++row)
+            cpu.wb(0xf000, uint16_t(font8Offset + ch * 8 + row), biosFont8x8[ch * 8 + row]);
+        for (unsigned row = 0; row < 14; ++row)
+            cpu.wb(0xf000, uint16_t(font14Offset + ch * 14 + row), biosFont8x8[ch * 8 + row * 8 / 14]);
+    }
     cpu.ww(0, 0x43 * 4, font16Offset); cpu.ww(0, 0x43 * 4 + 2, 0xf000);
 }
 Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro), path(p), identity(++nextDiskIdentity) {
@@ -215,6 +223,8 @@ void Pc::boot(uint8_t drive) {
     }
     installVideoFirmware(cpu);
     cpu.ww(0, 0x1c * 4, 0x0700); cpu.ww(0, 0x1c * 4 + 2, 0xf000); cpu.wb(0xf000, 0x700, 0xcf);
+    // Windows calls this optional debugger hook even without a resident debugger.
+    cpu.ww(0, 0x68 * 4, 0x0700); cpu.ww(0, 0x68 * 4 + 2, 0xf000);
     const uint8_t timer[] = {0x50, 0xf1, 0x08, 0xcd, 0x1c, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf};
     std::copy(std::begin(timer), std::end(timer), cpu.mem.begin() + 0xf0800);
     cpu.ww(0, 8 * 4, 0x800);
@@ -435,12 +445,80 @@ std::string Pc::text() const {
     }
     return result;
 }
-void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, unsigned lines, uint8_t attr, bool down) {
-    unsigned cols = std::min(biosColumns(), 80u); if (!cols) return;
-    top = std::min(top, 24u); bottom = std::min(bottom, 24u); left = std::min(left, cols - 1); right = std::min(right, cols - 1);
+unsigned Pc::biosCharacterHeight() {
+    unsigned height = cpu.rwF(0x40, 0x85);
+    if (!height || height > 32) throw std::runtime_error("Invalid graphics BIOS character height");
+    return height;
+}
+unsigned Pc::biosRows() {
+    if (!vga.graphics()) return 25;
+    unsigned rows = std::min(unsigned(cpu.rbF(0x40, 0x84)) + 1, vga.height() / biosCharacterHeight());
+    if (!rows) throw std::runtime_error("Graphics BIOS character height exceeds the display");
+    return rows;
+}
+uint8_t Pc::glyphByte(uint8_t ch, unsigned row) {
+    auto offset = cpu.rwF(0, 0x43 * 4), segment = cpu.rwF(0, 0x43 * 4 + 2);
+    return cpu.rbF(segment, uint16_t(offset + ch * biosCharacterHeight() + row));
+}
+void Pc::drawGlyph(unsigned column, unsigned row, uint8_t ch, uint8_t color) {
+    unsigned height = biosCharacterHeight(), left = column * 8, top = row * height;
+    if (left + 8 > vga.width() || top + height > vga.height())
+        throw std::runtime_error("Graphics BIOS character is outside the display");
+    bool exclusiveOr = !vga.indexed256() && (color & 0x80);
+    for (unsigned y = 0; y < height; ++y) {
+        auto bits = glyphByte(ch, y);
+        for (unsigned x = 0; x < 8; ++x) {
+            bool ink = bits & (0x80 >> x);
+            if (!exclusiveOr || ink) vga.pixel(left + x, top + y, ink ? color : 0, exclusiveOr);
+        }
+    }
+}
+uint8_t Pc::readGlyph(unsigned column, unsigned row) {
+    unsigned height = biosCharacterHeight(), left = column * 8, top = row * height;
+    if (left + 8 > vga.width() || top + height > vga.height())
+        throw std::runtime_error("Graphics BIOS character is outside the display");
+    std::array<uint8_t, 256> pixels{};
+    bool uniform = true;
+    for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < 8; ++x) {
+        auto value = vga.pixel(left + x, top + y);
+        pixels[y * 8 + x] = value; uniform &= value == pixels[0];
+    }
+    if (uniform) return ' ';
+    for (unsigned ch = 0; ch < 256; ++ch) {
+        int ink = -1, background = -1; bool matches = true;
+        for (unsigned y = 0; y < height && matches; ++y) {
+            auto bits = glyphByte(uint8_t(ch), y);
+            for (unsigned x = 0; x < 8; ++x) {
+                auto& color = bits & (0x80 >> x) ? ink : background;
+                auto value = pixels[y * 8 + x];
+                if (color < 0) color = value;
+                else if (color != value) { matches = false; break; }
+            }
+        }
+        if (matches && ink >= 0 && background >= 0 && ink != background) return uint8_t(ch);
+    }
+    return 0; // Pixels not matching any current font glyph have no BIOS character.
+}
+void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, unsigned lines, uint8_t attr, bool down, unsigned page) {
+    unsigned cols = std::min(biosColumns(), vga.graphics() ? vga.width() / 8 : 80u); if (!cols) return;
+    unsigned rows = biosRows();
+    top = std::min(top, rows - 1); bottom = std::min(bottom, rows - 1); left = std::min(left, cols - 1); right = std::min(right, cols - 1);
     if (top > bottom || left > right) return;
     if (!lines || lines > bottom - top + 1) lines = bottom - top + 1;
-    unsigned page = biosPage() * 4096;
+    if (page == 8) page = biosPage();
+    if (vga.graphics()) {
+        if (page) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
+        unsigned height = biosCharacterHeight(), first = top * height, last = (bottom + 1) * height, shift = lines * height;
+        uint8_t fill = vga.indexed256() ? attr : attr & 15;
+        for (unsigned i = 0; i < last - first; ++i) {
+            unsigned y = down ? last - 1 - i : first + i;
+            int source = int(y) + (down ? -int(shift) : int(shift));
+            for (unsigned x = left * 8; x < (right + 1) * 8; ++x)
+                vga.pixel(x, y, source < int(first) || source >= int(last) ? fill : vga.pixel(x, unsigned(source)));
+        }
+        return;
+    }
+    page *= 4096;
     for (unsigned i = 0; i <= bottom - top; ++i) {
         unsigned y = down ? bottom - i : top + i;
         for (unsigned x = left; x <= right; ++x) {
@@ -451,23 +529,33 @@ void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, un
         }
     }
 }
-void Pc::put(uint8_t ch, uint8_t attr) {
-    unsigned cols = std::max(1u, std::min(biosColumns(), 80u)), pos = biosCursor(), x = pos & 255, y = pos >> 8;
+void Pc::put(uint8_t ch, uint8_t attr, unsigned page, bool writeAttribute) {
+    if (page == 8) page = biosPage();
+    if (vga.graphics() && page) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
+    unsigned cols = std::max(1u, std::min(biosColumns(), vga.graphics() ? vga.width() / 8 : 80u));
+    unsigned rows = biosRows(), pos = cpu.rwF(0x40, uint16_t(0x50 + page * 2)), x = pos & 255, y = pos >> 8;
     if (ch == 13) x = 0;
     else if (ch == 10) ++y;
     else if (ch == 8) { if (x) --x; }
     else if (ch != 7) {
-        if (x < cols && y < 25) cpu.wbF(0xb800, uint16_t(biosPage() * 4096 + (y * cols + x) * 2), ch);
+        if (x < cols && y < rows) {
+            if (vga.graphics()) drawGlyph(x, y, ch, attr);
+            else {
+                auto off = uint16_t(page * 4096 + (y * cols + x) * 2);
+                cpu.wbF(0xb800, off, ch);
+                if (writeAttribute) cpu.wbF(0xb800, uint16_t(off + 1), attr);
+            }
+        }
         if (++x >= cols) { x = 0; ++y; }
     }
-    if (y >= 25) { scroll(0, 0, 24, cols - 1, 1, attr, false); y = 24; }
-    cpu.wwF(0x40, uint16_t(0x50 + biosPage() * 2), uint16_t((y << 8) | x));
+    if (y >= rows) { scroll(0, 0, rows - 1, cols - 1, 1, vga.graphics() ? 0 : attr, false, page); y = rows - 1; }
+    cpu.wwF(0x40, uint16_t(0x50 + page * 2), uint16_t((y << 8) | x));
 }
 bool Pc::video() {
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4), al = c.reg8(0), bh = c.reg8(7), bl = c.reg8(3);
     unsigned page = bh & 7, cols = biosColumns();
-    if (vga.graphics() && (ah == 6 || ah == 7 || ah == 8 || ah == 9 || ah == 10 || ah == 0x0e || ah == 0x13))
-        throw std::runtime_error("Graphics-mode BIOS character and scrolling services are not implemented yet");
+    if (vga.graphics() && bh && (ah == 8 || ah == 9 || ah == 10 || ah == 0x0e || ah == 0x13))
+        throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
     switch (ah) {
     case 0:
         vga.setMode(al & 0x7f, !(al & 0x80));
@@ -478,6 +566,10 @@ bool Pc::video() {
             : vga.mode == 0x10 ? 0x8000 : vga.mode == 0x0e ? 0x4000 : vga.mode == 0x0d ? 0x2000 : 4096);
         c.wbF(0x40, 0x84, vga.graphics() ? uint8_t(vga.height() / vga.charHeight() - 1) : 24);
         c.wwF(0x40, 0x85, uint16_t(vga.charHeight()));
+        if (vga.graphics()) {
+            c.wwF(0, 0x43 * 4, vga.charHeight() == 8 ? font8Offset : vga.charHeight() == 14 ? font14Offset : font16Offset);
+            c.wwF(0, 0x43 * 4 + 2, 0xf000);
+        }
         for (unsigned p = 0; p < 8; ++p) c.wwF(0x40, uint16_t(0x50 + p * 2), 0);
         if (!(al & 0x80) && !vga.graphics())
             for (unsigned i = 0; i < 0x8000; i += 2) c.wwF(0xb800, uint16_t(i), 0x0720);
@@ -492,11 +584,17 @@ bool Pc::video() {
     case 6: case 7: scroll(c.reg8(5), c.reg8(1), c.reg8(6), c.reg8(2), al, bh, ah == 7); return true;
     case 8: {
         auto pos = c.rwF(0x40, uint16_t(0x50 + page * 2));
+        if (vga.graphics()) { r[AX] = readGlyph(pos & 255, pos >> 8); return true; }
         r[AX] = c.rwF(0xb800, uint16_t(page * 4096 + ((pos >> 8) * cols + (pos & 255)) * 2)); return true;
     }
     case 9: case 10: {
         auto pos = c.rwF(0x40, uint16_t(0x50 + page * 2)); unsigned cell = (pos >> 8) * cols + (pos & 255);
-        for (unsigned i = 0; i < r[CX] && cell + i < cols * 25; ++i) {
+        unsigned rows = biosRows();
+        if (vga.graphics()) cols = std::min(cols, vga.width() / 8);
+        if (!cols) throw std::runtime_error("Invalid BIOS text column count");
+        cell = (pos >> 8) * cols + (pos & 255);
+        for (unsigned i = 0; i < r[CX] && cell + i < cols * rows; ++i) {
+            if (vga.graphics()) { drawGlyph((cell + i) % cols, (cell + i) / cols, al, bl); continue; }
             auto off = uint16_t(page * 4096 + (cell + i) * 2); c.wbF(0xb800, off, al); if (ah == 9) c.wbF(0xb800, off + 1, bl);
         }
         return true;
@@ -507,7 +605,7 @@ bool Pc::video() {
         if (ah == 0x0c) vga.pixel(r[CX], r[DX], al, vga.mode != 0x13 && (al & 0x80));
         else c.reg8(0, vga.pixel(r[CX], r[DX]));
         return true;
-    case 0x0e: put(al, bl ? bl : 7); return true;
+    case 0x0e: put(al, vga.graphics() ? bl : bl ? bl : 7, page); return true;
     case 0x0f: c.reg8(4, uint8_t(cols)); c.reg8(0, c.rbF(0x40, 0x49)); c.reg8(7, uint8_t(biosPage())); return true;
     case 0x10:
         if (al == 0 && bl < 16) { vga.attr[bl] = bh & 63; return true; }
@@ -574,10 +672,14 @@ bool Pc::video() {
         break;
     case 0x12: if (bl == 0x10) { r[BX] = 3; r[CX] = 0; } return true;
     case 0x13: {
-        auto saved = biosCursor(); c.wwF(0x40, uint16_t(0x50 + biosPage() * 2), r[DX]);
+        auto cursorOffset = uint16_t(0x50 + page * 2);
+        auto saved = c.rwF(0x40, cursorOffset); c.wwF(0x40, cursorOffset, r[DX]);
         uint16_t off = r[BP];
-        for (unsigned i = 0; i < r[CX]; ++i) { auto ch = c.rbF(c.s[ES], off++); put(ch, bl); if (al & 2) ++off; }
-        if (!(al & 1)) c.wwF(0x40, uint16_t(0x50 + biosPage() * 2), uint16_t(saved)); return true;
+        for (unsigned i = 0; i < r[CX]; ++i) {
+            auto ch = c.rbF(c.s[ES], off++), attr = al & 2 ? c.rbF(c.s[ES], off++) : bl;
+            put(ch, attr, page, true);
+        }
+        if (!(al & 1)) c.wwF(0x40, cursorOffset, saved); return true;
     }
     case 0x1a: c.reg8(0, 0x1a); r[BX] = 8; return true;
     case 0x1b: c.reg8(0, 0); return true;
