@@ -40,6 +40,9 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 
 输出为 `native\build\asm86-native.exe`，可独立运行。`native-tests.exe` 是测试程序。
 构建使用 C++17，开启 `-Wall -Wextra -Werror`；`-Debug` 可关闭优化。
+构建也将仓库现有 Berkeley SoftFloat C 源码及共享数值内核编译成原生静态库，
+不需要 WASM 运行时或额外下载。分发程序时请同时附带输出目录中的
+`softfloat-license.txt`，保留其第三方许可声明。
 
 ## 启动
 
@@ -366,6 +369,19 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 - RTC 目前只实现周期中断，不包含完整的闹钟、更新中断和日期时间设置。
 - 支持 DOS 安装和普通命令行程序，不等同于兼容全部 DOS 游戏、驱动或磁盘工具。
 
+## x87 数值底座（尚未接入指令）
+
+已原生编译复用 `vendor/softfloat` 的 8086 特化和 `tools/softfloat/kernel.c`，
+保留与网页版共用的 80 位格式、64 位有效数、24/53/64 位精度控制、
+四种舍入、整数/IEEE 浮点转换及异常标志，包括未屏蔽寄存器上溢/下溢的指数回绕。
+不以宿主 `double` 近似扩展精度，数值入口串行保护共享内核状态。
+测试覆盖超出 binary64 的精度、舍入中点、64 位整数边界、NaN/无穷、
+异常标志及独立 binary64 运算比对。
+
+此阶段仅完成原生数值运算层；x87 寄存器栈、D8h–DFh 指令、
+环境保存恢复和异常投递尚未接入。CPU 菜单与 CPUID 仍不宣告 FPU，
+不能据此运行需要数学协处理器的程序。
+
 ## 文件
 
 - `cpu.h/cpp`、`protected.cpp`：不依赖 Windows 的解释器、保护模式、描述符和系统门。
@@ -375,6 +391,7 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 - `atapi.h/cpp`：第二通道 ATAPI PIO 光驱、ISO 按需读取、命令包、sense 和 IRQ15。
 - `dma.h/cpp`：8237 DMA 寄存器、8/16 位外设传输、物理总线和终点计数。
 - `fdc.h/cpp`：A: 软驱控制器、命令 FIFO、IRQ6、DMA/PIO、换盘和格式化。
+- `softfloat.h/cpp`、`build-softfloat.ps1`：共享 SoftFloat C 数值内核的原生构建与类型化入口。
 - `pc.h/cpp`：设备、BIOS、启动和磁盘映像；磁盘 I/O 使用 Windows API。
 - `video.h/cpp`：VGA 显存、寄存器、调色板和图形像素。
 - `font8x8.h`：从 `src/machine/font8x8.ts` 的 `builtinFont()` 导出的原生 ROM 字形数据。

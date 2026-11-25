@@ -2,6 +2,9 @@
 #include "display.h"
 #include "preferences.h"
 #include "timing.h"
+#include "softfloat.h"
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -1672,6 +1675,76 @@ void atapiTests(const std::filesystem::path& path) {
         "ATAPI software reset must restore its signature even without media");
     std::cout << "ATAPI / IRQ15 / packet phases / ISO streaming / host limits / sense / TOC / media-lock checks passed\n";
 }
+void softfloatTests() {
+    using Op = FloatOperation;
+    const Float80 one{0x8000000000000000ull,0x3fff}, tiny{0x8000000000000000ull,0x3fc0};
+    auto sum = calculateFloat(Op::Add, one, tiny);
+    check(sum.value == Float80{0x8000000000000001ull,0x3fff} && !sum.flags
+        && calculateFloat(Op::Subtract, sum.value, one).value == tiny,
+        "Native arithmetic must preserve all 64 extended significand bits rather than narrowing to host double");
+    const Float80 halfUlp{0x8000000000000000ull,0x3fe7};
+    auto nearest = calculateFloat(Op::Add, one, halfUlp, 0x007f);
+    auto upward = calculateFloat(Op::Add, one, halfUlp, 0x087f);
+    check(nearest.value == one && nearest.flags == 0x20 && upward.value == Float80{0x8000010000000000ull,0x3fff}
+        && upward.flags == 0x220, "Single-precision x87 control must round ties to even and expose C1 when directed rounding increases magnitude");
+    check(calculateFloat(Op::Add, one, tiny, 0x027f).value == one
+        && calculateFloat(Op::Subtract, one, one, 0x077f).value == Float80{0,0x8000},
+        "Precision and rounding control must also preserve the architectural sign of an exact zero");
+    const Float80 fraction{0xc000000000000000ull,0x3fff};
+    for (auto control : {0x037f,0x077f,0x0b7f,0x0f7f}) {
+        auto value = calculateFloat(Op::ToInteger64, fraction, {}, uint16_t(control));
+        check(value.value.significand == uint64_t(control == 0x037f || control == 0x0b7f ? 2 : 1)
+            && (value.flags & 0x20), "Integer conversions must obey all four x87 rounding directions and signal precision loss");
+    }
+    auto integer = calculateFloat(Op::FromInteger64, {9007199254740993ull,0});
+    check(integer.value == Float80{0x8000000000000400ull,0x4034}
+        && calculateFloat(Op::ToInteger64, integer.value).value.significand == 9007199254740993ull,
+        "Signed integer conversions must round-trip values beyond binary64's exact integer range");
+    auto minimum = calculateFloat(Op::FromInteger64, {0x8000000000000000ull,0});
+    auto overflow = calculateFloat(Op::ToInteger64, {0x8000000000000000ull,0x403e});
+    check(minimum.value == Float80{0x8000000000000000ull,0xc03e}
+        && calculateFloat(Op::ToInteger64, minimum.value).flags == 0
+        && overflow.value.significand == 0x8000000000000000ull && (overflow.flags & 1),
+        "The signed 64-bit minimum must remain exact while positive overflow reports integer indefinite and invalid operation");
+    auto divide = calculateFloat(Op::Divide, one, {});
+    auto invalid = calculateFloat(Op::SquareRoot, {0x8000000000000000ull,0xbfff});
+    auto unordered = calculateFloat(Op::Compare, {0xc000000000000000ull,0x7fff}, one);
+    check(divide.value == Float80{0x8000000000000000ull,0x7fff} && (divide.flags & 4)
+        && invalid.value == Float80{0xc000000000000000ull,0xffff} && (invalid.flags & 1)
+        && unordered.value.significand == 0x4500,
+        "Native SoftFloat must preserve division-by-zero, invalid-operation and unordered comparison results");
+    const Float80 huge{0x8000000000000000ull,0x7ffe}, smallest{0x8000000000000000ull,1};
+    auto masked = calculateFloat(Op::Multiply, huge, huge);
+    auto wrapped = calculateFloat(Op::Multiply, huge, huge, 0x0377);
+    auto underflow = calculateFloat(Op::Multiply, smallest, smallest, 0x036f);
+    check(masked.value == Float80{0x8000000000000000ull,0x7fff} && (masked.flags & 0x28) == 0x28
+        && wrapped.value == Float80{0x8000000000000000ull,0x5ffd} && (wrapped.flags & 8)
+        && underflow.value == Float80{0x8000000000000000ull,0x2003} && (underflow.flags & 0x10),
+        "Unmasked register range exceptions must preserve x87 exponent-wrapped results, unlike masked infinity/zero results");
+    auto tie = calculateFloat(Op::FromFloat64, {0x3ff0000010000000ull,0}).value;
+    check(calculateFloat(Op::ToFloat32, tie).value.significand == 0x3f800000
+        && calculateFloat(Op::ToFloat32, tie, {}, 0x0b7f).value.significand == 0x3f800001,
+        "Binary32 stores must obey rounding control at an exact halfway value");
+    auto extended = [](double value) {
+        uint64_t bits = 0; std::memcpy(&bits, &value, sizeof(bits));
+        return calculateFloat(Op::FromFloat64, {bits,0}).value;
+    };
+    auto numeric = [](Float80 value) {
+        auto bits = calculateFloat(Op::ToFloat64, value).value.significand;
+        double result = 0; std::memcpy(&result, &bits, sizeof(result)); return result;
+    };
+    uint32_t seed = 0x387486;
+    auto sample = [&]() { seed = seed * 1664525u + 1013904223u; return (double(seed) / 4294967296.0 - 0.5) * 1e6; };
+    for (unsigned i = 0; i < 32; ++i) {
+        double a = sample(), b = sample();
+        const double expected[] = {a + b,a - b,a * b,a / b,std::sqrt(std::abs(a))};
+        for (unsigned operation = 0; operation < std::size(expected); ++operation) {
+            auto result = calculateFloat(FloatOperation(operation), extended(operation == 4 ? std::abs(a) : a), extended(b), 0x027f);
+            check(numeric(result.value) == expected[operation], "Native 53-bit arithmetic must match independently rounded binary64 calculations");
+        }
+    }
+    std::cout << "Native SoftFloat / 80-bit precision / rounding / conversions / exception flags / wrapped exponents checks passed\n";
+}
 void fdcTests(const std::filesystem::path& base) {
     auto path = std::filesystem::path(base.native() + L".floppy");
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -1942,7 +2015,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        dmaTests(); fdcTests(path); diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }
