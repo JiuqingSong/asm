@@ -92,6 +92,7 @@ private:
     unsigned biosColumns();
     unsigned biosPage();
     unsigned biosCursor();
+    bool biosGraphics();
     unsigned biosCharacterHeight();
     unsigned biosRows();
     uint8_t glyphByte(uint8_t ch, unsigned row);

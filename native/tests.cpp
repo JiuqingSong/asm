@@ -1302,12 +1302,38 @@ void pagedBiosTests(const std::filesystem::path& disk) {
         && c.mem[0x200484] == 29 && c.readWord(0x200485) == 16 && c.readDword(0x10c) == 0 && c.mem[0x484] == 0,
         "VM86 graphics font selection must update the mapped font vector and BDA, not physical page zero");
     p.vga.setMode(0x13);
-    c.writeWord(0x20044a, 40); c.mem[0x200484] = 24; c.writeWord(0x200485, 8);
+    c.mem[0x200449] = 0x13; c.writeWord(0x20044a, 40); c.mem[0x200484] = 24; c.writeWord(0x200485, 8);
     c.writeWord(0x200450, 0); c.writeWord(0x20010c, 0x100); c.writeWord(0x20010e, 0x3000);
     for (unsigned row = 0; row < 8; ++row) c.mem[0x230100 + 'A' * 8 + row] = 0x80;
     c.r[BX] = 5; c.r[CX] = 1; c.r[AX] = 0x0941;
     check(c.trap(0x10) && p.vga.pixel(0, 0) == 5 && p.vga.pixel(1, 0) == 0,
         "VM86 graphics characters must read the mapped BDA, font vector and guest glyph bytes");
+    c.mem[0x449] = 0x13; c.mem[0x200449] = 3; c.writeWord(0x20044a, 80); c.writeWord(0x200485, 16);
+    c.mem[0x200462] = 0; c.writeWord(0x200450, 0);
+    p.vga.pixel(0, 0, 9); p.vga.pixel(1, 0, 6);
+    c.writeWord(0x2b8000, 0x0720); c.writeWord(0x2b8002, 0x0720);
+    c.r[BX] = 2; c.r[CX] = 2; c.r[AX] = 0x0941;
+    check(c.trap(0x10) && c.readWord(0x2b8000) == 0x0241 && c.readWord(0x2b8002) == 0x0241
+        && p.vga.pixel(0, 0) == 9 && p.vga.pixel(1, 0) == 6,
+        "A logical text VM must write mapped text cells instead of drawing over the physical graphics display");
+    c.r[BX] = 0; c.r[AX] = 0x0800;
+    check(c.trap(0x10) && c.r[AX] == 0x0241, "Logical text character reads must return the mapped text word");
+    c.r[AX] = 0x0e42;
+    check(c.trap(0x10) && c.readWord(0x2b8000) == 0x0242 && c.readWord(0x200450) == 1,
+        "Logical text teletype must preserve attributes and update the VM cursor");
+    c.r[BX] = 0x0700; c.r[CX] = 0; c.r[DX] = 1; c.r[AX] = 0x0600;
+    check(c.trap(0x10) && c.readWord(0x2b8000) == 0x0720 && c.readWord(0x2b8002) == 0x0720
+        && p.vga.pixel(0, 0) == 9 && p.vga.pixel(1, 0) == 6,
+        "Logical text scrolling must not clear pixels on the physical graphics display");
+    c.r[AX] = 0x0501;
+    check(c.trap(0x10) && c.mem[0x200462] == 1 && p.vga.pixel(0, 0) == 9,
+        "Logical text VMs must allow nonzero text pages while the physical VGA remains graphical");
+    c.loadSegment(ES, 0x3000); c.r[BP] = 0x100;
+    c.mem[0x230100] = 'C'; c.mem[0x230101] = 4; c.mem[0x230102] = 'D'; c.mem[0x230103] = 5;
+    c.r[BX] = 0x100; c.r[CX] = 2; c.r[DX] = 0; c.r[AX] = 0x1303;
+    check(c.trap(0x10) && c.readWord(0x2b9000) == 0x0443 && c.readWord(0x2b9002) == 0x0544
+        && c.readWord(0x200452) == 2 && p.vga.pixel(0, 0) == 9,
+        "Logical text strings must use mapped buffers and text pages rather than the physical graphics font");
     c.loadSegment(ES, 0x100); c.r[BX] = 0xfff; c.r[AX] = 0x0201; c.r[CX] = 1; c.r[DX] = 0x80;
     c.mem[0x474] = 0xcc;
     std::array<uint8_t, 512> sector{}; p.hard->read(0, sector.data());

@@ -447,13 +447,14 @@ std::string Pc::text() const {
     }
     return result;
 }
+bool Pc::biosGraphics() { return cpu.rbF(0x40, 0x49) >= 0x0d; }
 unsigned Pc::biosCharacterHeight() {
     unsigned height = cpu.rwF(0x40, 0x85);
     if (!height || height > 32) throw std::runtime_error("Invalid graphics BIOS character height");
     return height;
 }
 unsigned Pc::biosRows() {
-    if (!vga.graphics()) return 25;
+    if (!biosGraphics()) return 25;
     unsigned rows = std::min(unsigned(cpu.rbF(0x40, 0x84)) + 1, vga.height() / biosCharacterHeight());
     if (!rows) throw std::runtime_error("Graphics BIOS character height exceeds the display");
     return rows;
@@ -502,13 +503,14 @@ uint8_t Pc::readGlyph(unsigned column, unsigned row) {
     return 0; // Pixels not matching any current font glyph have no BIOS character.
 }
 void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, unsigned lines, uint8_t attr, bool down, unsigned page) {
-    unsigned cols = std::min(biosColumns(), vga.graphics() ? vga.width() / 8 : 80u); if (!cols) return;
+    bool graphics = biosGraphics();
+    unsigned cols = std::min(biosColumns(), graphics ? vga.width() / 8 : 80u); if (!cols) return;
     unsigned rows = biosRows();
     top = std::min(top, rows - 1); bottom = std::min(bottom, rows - 1); left = std::min(left, cols - 1); right = std::min(right, cols - 1);
     if (top > bottom || left > right) return;
     if (!lines || lines > bottom - top + 1) lines = bottom - top + 1;
     if (page == 8) page = biosPage();
-    if (vga.graphics()) {
+    if (graphics) {
         if (page) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
         unsigned height = biosCharacterHeight(), first = top * height, last = (bottom + 1) * height, shift = lines * height;
         uint8_t fill = vga.indexed256() ? attr : attr & 15;
@@ -532,16 +534,17 @@ void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, un
     }
 }
 void Pc::put(uint8_t ch, uint8_t attr, unsigned page, bool writeAttribute) {
+    bool graphics = biosGraphics();
     if (page == 8) page = biosPage();
-    if (vga.graphics() && page) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
-    unsigned cols = std::max(1u, std::min(biosColumns(), vga.graphics() ? vga.width() / 8 : 80u));
+    if (graphics && page) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
+    unsigned cols = std::max(1u, std::min(biosColumns(), graphics ? vga.width() / 8 : 80u));
     unsigned rows = biosRows(), pos = cpu.rwF(0x40, uint16_t(0x50 + page * 2)), x = pos & 255, y = pos >> 8;
     if (ch == 13) x = 0;
     else if (ch == 10) ++y;
     else if (ch == 8) { if (x) --x; }
     else if (ch != 7) {
         if (x < cols && y < rows) {
-            if (vga.graphics()) drawGlyph(x, y, ch, attr);
+            if (graphics) drawGlyph(x, y, ch, attr);
             else {
                 auto off = uint16_t(page * 4096 + (y * cols + x) * 2);
                 cpu.wbF(0xb800, off, ch);
@@ -550,13 +553,14 @@ void Pc::put(uint8_t ch, uint8_t attr, unsigned page, bool writeAttribute) {
         }
         if (++x >= cols) { x = 0; ++y; }
     }
-    if (y >= rows) { scroll(0, 0, rows - 1, cols - 1, 1, vga.graphics() ? 0 : attr, false, page); y = rows - 1; }
+    if (y >= rows) { scroll(0, 0, rows - 1, cols - 1, 1, graphics ? 0 : attr, false, page); y = rows - 1; }
     cpu.wwF(0x40, uint16_t(0x50 + page * 2), uint16_t((y << 8) | x));
 }
 bool Pc::video() {
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4), al = c.reg8(0), bh = c.reg8(7), bl = c.reg8(3);
     unsigned page = bh & 7, cols = biosColumns();
-    if (vga.graphics() && bh && (ah == 8 || ah == 9 || ah == 10 || ah == 0x0e || ah == 0x13))
+    bool graphics = biosGraphics();
+    if (graphics && bh && (ah == 8 || ah == 9 || ah == 10 || ah == 0x0e || ah == 0x13))
         throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
     switch (ah) {
     case 0:
@@ -581,33 +585,33 @@ bool Pc::video() {
     case 3: r[DX] = c.rwF(0x40, uint16_t(0x50 + page * 2)); r[CX] = c.rwF(0x40, 0x60); return true;
     case 4: c.reg8(4, 0); return true;
     case 5:
-        if (vga.graphics() && al) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
+        if (graphics && al) throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
         c.wbF(0x40, 0x62, al & 7); c.wwF(0x40, 0x4e, uint16_t((al & 7) * 4096)); return true;
     case 6: case 7: scroll(c.reg8(5), c.reg8(1), c.reg8(6), c.reg8(2), al, bh, ah == 7); return true;
     case 8: {
         auto pos = c.rwF(0x40, uint16_t(0x50 + page * 2));
-        if (vga.graphics()) { r[AX] = readGlyph(pos & 255, pos >> 8); return true; }
+        if (graphics) { r[AX] = readGlyph(pos & 255, pos >> 8); return true; }
         r[AX] = c.rwF(0xb800, uint16_t(page * 4096 + ((pos >> 8) * cols + (pos & 255)) * 2)); return true;
     }
     case 9: case 10: {
         auto pos = c.rwF(0x40, uint16_t(0x50 + page * 2)); unsigned cell = (pos >> 8) * cols + (pos & 255);
         unsigned rows = biosRows();
-        if (vga.graphics()) cols = std::min(cols, vga.width() / 8);
+        if (graphics) cols = std::min(cols, vga.width() / 8);
         if (!cols) throw std::runtime_error("Invalid BIOS text column count");
         cell = (pos >> 8) * cols + (pos & 255);
         for (unsigned i = 0; i < r[CX] && cell + i < cols * rows; ++i) {
-            if (vga.graphics()) { drawGlyph((cell + i) % cols, (cell + i) / cols, al, bl); continue; }
+            if (graphics) { drawGlyph((cell + i) % cols, (cell + i) / cols, al, bl); continue; }
             auto off = uint16_t(page * 4096 + (cell + i) * 2); c.wbF(0xb800, off, al); if (ah == 9) c.wbF(0xb800, off + 1, bl);
         }
         return true;
     }
     case 0x0b: return true;
     case 0x0c: case 0x0d:
-        if (!vga.graphics() || bh) throw std::runtime_error("BIOS pixel access requires graphics page 0");
+        if (!graphics || !vga.graphics() || bh) throw std::runtime_error("BIOS pixel access requires graphics page 0");
         if (ah == 0x0c) vga.pixel(r[CX], r[DX], al, vga.mode != 0x13 && (al & 0x80));
         else c.reg8(0, vga.pixel(r[CX], r[DX]));
         return true;
-    case 0x0e: put(al, vga.graphics() ? bl : bl ? bl : 7, page); return true;
+    case 0x0e: put(al, graphics ? bl : bl ? bl : 7, page); return true;
     case 0x0f: c.reg8(4, uint8_t(cols)); c.reg8(0, c.rbF(0x40, 0x49)); c.reg8(7, uint8_t(biosPage())); return true;
     case 0x10:
         if (al == 0 && bl < 16) { vga.attr[bl] = bh & 63; return true; }
