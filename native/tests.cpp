@@ -1214,7 +1214,7 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
             for (unsigned i = 0; i < c.r.size(); ++i) c.r[i] = uint16_t(0x1000 + i * 0x101);
             c.r[AX] = mode; c.r[SP] = 0x9000; c.setFlags(DF | CF | 2);
             auto registers = c.r; auto segments = c.s; auto flags = c.flags;
-            p.runCpu(20000);
+            p.runCpu(60000);
             check(c.halted && c.r == registers && c.s == segments && c.flags == flags,
                 "Video firmware port programming must preserve registers, segments and caller flags");
             check(observed->seq == p.vga.seq && observed->gc == p.vga.gc && observed->crtc == p.vga.crtc
@@ -1263,6 +1263,54 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
             check(visible, "The selected graphics ROM font must contain visible glyphs");
         }
     }
+}
+void virtualVideoFirmwareTests(const std::filesystem::path& disk) {
+    for (auto model : {CpuModel::I386, CpuModel::I486}) {
+        Pc p; p.setModel(model); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
+        auto& c = p.cpu; c.a20 = true;
+        std::copy(c.mem.begin(), c.mem.begin() + 0x100000, c.mem.begin() + 0x200000);
+        c.cr3 = 0x10000; c.writeDword(0x10000, 0x11007);
+        for (unsigned i = 0; i < 256; ++i) c.writeDword(0x11000 + i * 4, (0x200000 + i * 4096) | 7);
+        c.msw = 0x80000011; c.setEflags(0x23407); c.cpl = 3;
+        for (auto seg : {ES, CS, SS, DS, FS, GS}) c.loadSegment(seg, 0);
+        c.tr = {0x28, 0x12000, 0x2068, 0x89}; c.writeWord(0x212066, 0x68);
+        p.vga.setMode(0x12); p.vga.pixel(0, 0, 9);
+        auto observer = std::make_unique<Vga>(); observer->setMode(0x12);
+        c.in = [&](uint16_t port) { return observer->input(port); };
+        c.out = [&](uint16_t port, uint8_t value) { observer->output(port, value); };
+        auto runMode = [&](uint16_t mode) {
+            c.halted = false; c.waiting = false;
+            c.loadSegment(CS, 0xf000); c.loadSegment(SS, 0);
+            c.loadSegment(DS, 0x1234); c.loadSegment(ES, 0x4321);
+            c.ip = 0x900; c.r[SP] = 0x9000; c.r[AX] = mode; c.setEflags(0x23407);
+            auto registers = c.r; auto flags = c.flags;
+            c.push(flags); c.push(0); c.push(0x500);
+            unsigned steps = 0;
+            while ((c.s[CS] != 0 || c.ip != 0x500) && steps++ < 60000) p.runCpu(1);
+            check(c.s[CS] == 0 && c.ip == 0x500 && c.r == registers && c.flags == flags
+                && c.s[DS] == 0x1234 && c.s[ES] == 0x4321,
+                "VM86 mode firmware must return with caller registers, segments and flags intact");
+            check(p.vga.graphics() && p.vga.width() == 640 && p.vga.height() == 480 && p.vga.pixel(0, 0) == 9,
+                "A monitor-virtualized BIOS mode change must never reset or clear the physical desktop VGA");
+        };
+        c.writeWord(0x2b8000, 0x5a58); runMode(3);
+        check(!observer->graphics() && c.mem[0x200449] == 3 && c.readWord(0x20044a) == 80
+            && c.readWord(0x2b8000) == 0x0720 && c.readWord(0x2bfffe) == 0x0720,
+            "Virtual text mode must program monitored ports and clear every guest text page");
+        for (unsigned row = 0; row < 16; ++row)
+            check(c.mem[0x2a0000 + 'A' * 32 + row] == c.mem[0x2f8000 + 'A' * 16 + row],
+                "Virtual text mode must upload the ROM font through guest memory writes");
+        c.writeWord(0x2b8000, 0x5a58); c.mem[0x2a0000 + 'A' * 32] = 0xff; runMode(0x83);
+        check(c.readWord(0x2b8000) == 0x5a58 && c.mem[0x2a0000 + 'A' * 32] == c.mem[0x2f8000 + 'A' * 16],
+            "No-clear text mode must preserve guest screen contents while still restoring the font");
+        c.mem[0x2a0000] = c.mem[0x2affff] = 0x5a; runMode(0x13);
+        check(observer->graphics() && observer->indexed256() && c.readWord(0x20044a) == 40
+            && c.mem[0x2a0000] == 0 && c.mem[0x2affff] == 0,
+            "Virtual graphics mode must use its own geometry and clear mapped guest VRAM");
+        c.mem[0x2a0000] = 0x6c; runMode(0x93);
+        check(c.mem[0x2a0000] == 0x6c, "No-clear virtual graphics mode must preserve guest VRAM");
+    }
+    std::cout << "VM86 virtual VGA mode / guest font upload / text-graphics clears / physical desktop isolation checks passed\n";
 }
 void pagedBiosTests(const std::filesystem::path& disk) {
     Pc p; p.setModel(CpuModel::I386); auto& c = p.cpu; c.a20 = true;
@@ -2227,7 +2275,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }
