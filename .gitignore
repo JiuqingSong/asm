@@ -9,3 +9,5 @@ release.bat
 release.ps1
 .dockerignore
 tmp/
+native/build/
+native/*.img
