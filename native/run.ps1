@@ -1,5 +1,5 @@
 param(
-    [string]$HardDisk = (Join-Path $PSScriptRoot 'dos622.img'),
+    [string]$HardDisk,
     [string]$Floppy,
     [switch]$FullSpeed,
     [ValidateSet('8088', '286', '386', '486')][string]$Cpu,
@@ -12,8 +12,8 @@ if (-not (Test-Path -LiteralPath $exe)) { throw 'Build the native application wi
 if ($FullSpeed -and $NormalSpeed) { throw 'Choose either -FullSpeed or -NormalSpeed, not both' }
 $arguments = @()
 if ($Cpu) { $arguments += @('--cpu', $Cpu) }
-if (Test-Path -LiteralPath $HardDisk) {
-    $arguments += @('--hard', ('"{0}"' -f [System.IO.Path]::GetFullPath($HardDisk)))
+if ($HardDisk) {
+    $arguments += @('--hard', ('"{0}"' -f (Resolve-Path -LiteralPath $HardDisk).Path))
 }
 if ($Floppy) {
     $arguments += @('--floppy', ('"{0}"' -f (Resolve-Path -LiteralPath $Floppy).Path))

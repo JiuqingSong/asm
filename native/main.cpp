@@ -195,6 +195,7 @@ void command(HWND hwnd, int id) {
         if (!p.empty()) {
             if (id != LoadHard) Disk::create(p, id == NewHard504 ? 1024 : id == NewHard126 ? 256 : 64);
             pc->hard = std::make_unique<Disk>(p, false, false);
+            if (preferences) preferences->hard(pc->hard->path);
         }
         break;
     }
@@ -471,7 +472,7 @@ int headless(const std::filesystem::path& script) {
 int application(int argc, wchar_t** argv) {
     pc = std::make_unique<Pc>();
     std::filesystem::path script; bool start = false, uiTest = false;
-    bool cpuSpecified = false, speedSpecified = false, floppySpecified = false, experimental386 = false;
+    bool cpuSpecified = false, speedSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring option = argv[i];
         if (option == L"--ui-test") { uiTest = true; continue; }
@@ -482,7 +483,7 @@ int application(int argc, wchar_t** argv) {
         if (i + 1 >= argc) throw std::runtime_error("Missing command-line option value");
         std::filesystem::path value = argv[++i];
         if (option == L"--floppy") { pc->floppy = std::make_unique<Disk>(value, true, true); floppySpecified = true; }
-        else if (option == L"--hard") pc->hard = std::make_unique<Disk>(value, false, false);
+        else if (option == L"--hard") { pc->hard = std::make_unique<Disk>(value, false, false); hardSpecified = true; }
         else if (option == L"--cdrom") pc->cdrom.insert(value);
         else if (option == L"--create-hard") {
             unsigned cylinders = 64;
@@ -493,6 +494,7 @@ int application(int argc, wchar_t** argv) {
                 cylinders = size == L"504" ? 1024 : size == L"126" ? 256 : 64;
             }
             Disk::create(value, cylinders); pc->hard = std::make_unique<Disk>(value, false, false);
+            hardSpecified = true;
         }
         else if (option == L"--cpu") {
             if (value != L"8088" && value != L"286" && value != L"386" && value != L"486")
@@ -535,6 +537,17 @@ int application(int argc, wchar_t** argv) {
         preferences = std::make_unique<Preferences>();
         if (!cpuSpecified) pc->setModel(preferences->cpu());
         if (!speedSpecified) fullSpeed = preferences->fullSpeed();
+        if (!hardSpecified) {
+            auto path = preferences->hard();
+            if (!path.empty()) {
+                try { pc->hard = std::make_unique<Disk>(path, false, false); }
+                catch (const std::exception& e) {
+                    auto message = L"Could not restore the remembered hard disk:\n" + path.wstring() + L"\n\n" + wide(e.what())
+                        + L"\n\nC: will remain empty. Open another hard disk to replace the remembered path.";
+                    MessageBoxW(nullptr, message.c_str(), L"Asm86 - remembered hard disk unavailable", MB_OK | MB_ICONWARNING);
+                }
+            }
+        }
         if (!floppySpecified) {
             auto path = preferences->floppy();
             if (!path.empty()) {
@@ -549,6 +562,7 @@ int application(int argc, wchar_t** argv) {
         if (cpuSpecified) preferences->cpu(pc->cpu.model);
         if (speedSpecified) preferences->fullSpeed(fullSpeed);
         if (floppySpecified) preferences->floppy(pc->floppy->path);
+        if (hardSpecified) preferences->hard(pc->hard->path);
     }
     if (!script.empty()) {
         if (start) pc->boot(pc->bootDrive);

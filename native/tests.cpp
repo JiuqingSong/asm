@@ -25,22 +25,29 @@ void preferenceTests() {
     };
     try {
         auto path = std::filesystem::path(L"Disk \u4e00 with spaces.img");
+        auto hardPath = std::filesystem::path(L"Windows 95 \u4e00 with spaces.img");
         {
             Preferences prefs(key.c_str());
-            check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && prefs.floppy().empty(),
-                "First launch must retain the default CPU, speed and empty floppy");
+            check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && prefs.floppy().empty() && prefs.hard().empty(),
+                "First launch must retain the default CPU, speed and empty disk preferences");
             prefs.cpu(CpuModel::I286); prefs.fullSpeed(true); prefs.floppy(path);
+            prefs.hard(hardPath);
         }
         {
             Preferences prefs(key.c_str());
             check(prefs.cpu() == CpuModel::I286 && prefs.fullSpeed() && prefs.floppy() == std::filesystem::absolute(path),
                 "CPU, speed and Unicode floppy path must survive reopening preferences");
+            check(prefs.hard() == std::filesystem::absolute(hardPath),
+                "Selected Windows hard disk with spaces and Unicode must survive reopening preferences");
+            prefs.hard(path);
             prefs.cpu(CpuModel::I386);
         }
         {
             Preferences prefs(key.c_str());
             check(prefs.cpu() == CpuModel::I386 && prefs.fullSpeed() && prefs.floppy() == std::filesystem::absolute(path),
                 "Experimental 386 selection must persist without changing speed or floppy preferences");
+            check(prefs.hard() == std::filesystem::absolute(path),
+                "Replacing the remembered hard disk must persist independently of other preferences");
             prefs.cpu(CpuModel::I486);
         }
         {
@@ -66,6 +73,11 @@ void preferenceTests() {
             rejected = false;
             try { prefs.fullSpeed(); } catch (const std::runtime_error&) { rejected = true; }
             check(rejected, "Malformed saved speed must report an error");
+            check(RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"HardDisk", REG_DWORD, &invalidCpu, sizeof(invalidCpu)) == ERROR_SUCCESS,
+                "Cannot prepare malformed hard disk preference test");
+            rejected = false;
+            try { prefs.hard(); } catch (const std::runtime_error&) { rejected = true; }
+            check(rejected, "Malformed saved hard disk must report an error instead of loading a default DOS disk");
         }
     } catch (...) {
         try { cleanup(); } catch (const std::exception& e) { std::cerr << e.what() << '\n'; }

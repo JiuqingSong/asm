@@ -55,10 +55,12 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 
 ## 启动
 
-已安装的硬盘映像默认放在 `native\dos622.img`：
+启动时恢复上次选择的硬盘；首次使用可显式加载 `native\dos622.img`：
 
 ```powershell
 .\native\run.ps1
+# 首次选择 DOS 硬盘（以后无需重复指定）：
+.\native\run.ps1 -HardDisk '.\native\dos622.img'
 # 不限速启动：
 .\native\run.ps1 -FullSpeed
 # 运行另行安装了 Windows 3.1 的硬盘：
@@ -114,12 +116,14 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
 宿主文件对话框和菜单保持 Windows 原生行为。因执行错误而停止时保留错误画面供排查，
 这与明确选择 **Power off** 的黑屏关机状态不同。
 
-软盘路径（包括换盘和取出）、CPU 型号和速度模式在选择成功后立即保存到当前 Windows
+硬盘路径、软盘路径（包括换盘和取出）、CPU 型号和速度模式在选择成功后立即保存到当前 Windows
 用户的注册表 `HKEY_CURRENT_USER\Software\Asm86\Native`，不依赖启动目录，也不需要管理员权限。
 软盘保存为绝对路径；下次启动自动以只读方式重新插入。若文件已移动或不可读取，会明确提示，
-让 A: 保持空盘；可重新插盘或选择 **Eject A:** 清除旧路径。硬盘路径和启动设备暂不保存。
-命令行的 `--floppy`、`--cpu`、`--full-speed` / `--normal-speed` 优先于已保存的对应设置，
-并成为新的记忆值；`run.ps1` 未指定 CPU 或速度时也沿用已保存的选择，
+让 A: 保持空盘；可重新插盘或选择 **Eject A:** 清除旧路径。
+硬盘同样保存为绝对路径；下次启动自动加载。创建或打开另一硬盘成功后会更新记忆；
+文件不可用时明确提示并让 C: 保持空盘，不偷偷改用 DOS 硬盘。启动设备仍不保存，程序仍以关机状态启动。
+命令行的 `--hard`、`--create-hard`、`--floppy`、`--cpu`、`--full-speed` / `--normal-speed` 优先于已保存的对应设置，
+并成为新的记忆值；`run.ps1` 未指定硬盘、CPU 或速度时也沿用已保存的选择，不再强制加载 `dos622.img`，
 可用 `-Cpu 8088` / `-Cpu 286`、`-FullSpeed` / `-NormalSpeed` 显式覆盖。
 `--headless` 和 `--ui-test` 不读取或修改这些用户设置，保证脚本和测试相互独立。
 
