@@ -26,7 +26,8 @@ Windows 3.1 / 3.2 的 DOS 会话已验证全屏/窗口切换、命令输入、�
 AT 平台的硬盘另提供第一通道 IDE PIO / IRQ14，与 BIOS 共享映像；
 第二通道 ATAPI PIO / IRQ15 光驱已用真实 OAKCDROM/MSCDEX 验证读取 ISO、复制文件及逐字节持久化校验，
 可创建 31.5/126/504 MiB 硬盘，504 MiB 已通过真实 DOS 6.22 完整安装；
-但尚无光盘启动、Windows 95/98 安装或 FDC 支持。
+另已接入 8237 DMA 和 IRQ6 软驱控制器，真实 DOS 中控制器读取结果与 BIOS 逐字节一致。
+尚无光盘启动和 Windows 95/98 完整安装验证。
 不包含网页版的汇编器和调试器。
 构建、安装、启动和验证方法见 [原生版说明](native/README.md)。
 

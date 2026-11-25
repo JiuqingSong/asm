@@ -2,12 +2,14 @@
 #include "font8x8.h"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <ctime>
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
 
 namespace asm86 {
+static std::atomic<uint64_t> nextDiskIdentity{0};
 static constexpr uint16_t font16Offset = 0x8000;
 static std::runtime_error osError(const char* operation) {
     return std::runtime_error(std::string(operation) + " (Windows error " + std::to_string(GetLastError()) + ")");
@@ -61,7 +63,7 @@ static void installVideoFirmware(Cpu& cpu) {
             cpu.wb(0xf000, uint16_t(font16Offset + ch * 16 + row), biosFont8x8[ch * 8 + row / 2]);
     cpu.ww(0, 0x43 * 4, font16Offset); cpu.ww(0, 0x43 * 4 + 2, 0xf000);
 }
-Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro), path(p) {
+Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro), path(p), identity(++nextDiskIdentity) {
     file = CreateFileW(p.c_str(), GENERIC_READ | (ro ? 0 : GENERIC_WRITE), FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) throw osError("Cannot open disk image");
@@ -113,6 +115,12 @@ bool Disk::write(uint32_t lba, const uint8_t* p) { return transfer(lba, const_ca
 void Disk::flush() { if (!readOnly && !FlushFileBuffers(file)) throw osError("Disk flush failed"); }
 
 Pc::Pc() {
+    fdc.disk = [this]() { return floppy.get(); };
+    fdc.interrupt = [this](bool raised) {
+        if (raised) pic[0].raise(6);
+        else pic[0].pending &= uint8_t(~0x40);
+    };
+    fdc.dma = [this](uint8_t* data, unsigned length, DmaDirection direction) { return dma.transfer(2, data, length, direction); };
     dma.read = [this](uint32_t address) { return cpu.readBus(address & (at() ? 0xffffffu : 0xfffffu)); };
     dma.write = [this](uint32_t address, uint8_t value) { cpu.writeBus(address & (at() ? 0xffffffu : 0xfffffu), value); };
     cpu.in = [this](uint16_t p) { return input(p); };
@@ -246,6 +254,7 @@ void Pc::advanceClock(double target) {
     if (clock >= nextRtc) rtcAdvance();
     if (at() && clock >= ide.nextEvent) ide.advance(clock);
     if (at() && clock >= cdrom.nextEvent) cdrom.advance(clock);
+    if (clock >= fdc.nextEvent) fdc.advance(clock);
 }
 int Pc::acknowledge() {
     if (at() && pic[1].next() >= 0) pic[0].raise(2);
@@ -259,6 +268,7 @@ int Pc::acknowledge() {
     return pic[0].base + line;
 }
 uint8_t Pc::input(uint16_t p) {
+    if (FloppyController::owns(p)) return fdc.input(p, clock);
     if ((at() || p < 0xc0) && DmaController::owns(p)) return dma.input(p);
     if (at() && IdeChannel::owns(p)) return ide.input(p, clock);
     if (at() && AtapiCdrom::owns(p)) return cdrom.input(p, clock);
@@ -296,6 +306,7 @@ uint8_t Pc::input(uint16_t p) {
     return 255; // Unpopulated ISA bus reads high.
 }
 void Pc::output(uint16_t p, uint8_t v) {
+    if (FloppyController::owns(p)) { fdc.output(p, v, clock); return; }
     if ((at() || p < 0xc0) && DmaController::owns(p)) { dma.output(p, v); return; }
     if (at() && IdeChannel::owns(p)) { ide.output(p, v, clock); return; }
     if (at() && AtapiCdrom::owns(p)) { cdrom.output(p, v, clock); return; }

@@ -6,6 +6,7 @@
 #include "ide.h"
 #include "atapi.h"
 #include "dma.h"
+#include "fdc.h"
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -31,6 +32,7 @@ public:
     int cylinders = 0, heads = 0, spt = 0, floppyType = 0;
     bool readOnly = false, changed = true;
     std::filesystem::path path;
+    const uint64_t identity;
 private:
     HANDLE file = INVALID_HANDLE_VALUE;
     bool transfer(uint32_t lba, uint8_t* data, bool writing);
@@ -44,6 +46,7 @@ public:
     IdeChannel ide;
     AtapiCdrom cdrom;
     DmaController dma;
+    FloppyController fdc;
     std::unique_ptr<Disk> floppy, hard;
     uint64_t instructions = 0;
     double clock = 0;

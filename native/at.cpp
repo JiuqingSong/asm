@@ -10,6 +10,7 @@ void Pc::resetAt() {
     cdrom.reset();
     dma.reset(at());
     if (at()) { dma.output(0xd6, 0xc0); dma.output(0xd4, 0); }
+    fdc.reset();
     controller.clear(); kbdCommand = 0x45; kbdOutput = 1; kbdWrite = fastA20 = cmosIndex = 0;
     keyboardLatch = 0; keyboardRead = false;
     pendingReset = false; cpu.a20 = false;

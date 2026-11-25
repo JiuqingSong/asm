@@ -1672,6 +1672,117 @@ void atapiTests(const std::filesystem::path& path) {
         "ATAPI software reset must restore its signature even without media");
     std::cout << "ATAPI / IRQ15 / packet phases / ISO streaming / host limits / sense / TOC / media-lock checks passed\n";
 }
+void fdcTests(const std::filesystem::path& base) {
+    auto path = std::filesystem::path(base.native() + L".floppy");
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    check(file != INVALID_HANDLE_VALUE, "Cannot create isolated FDC fixture");
+    LARGE_INTEGER size{}; size.QuadPart = 1474560;
+    bool allocated = SetFilePointerEx(file, size, nullptr, FILE_BEGIN) && SetEndOfFile(file);
+    CloseHandle(file);
+    try {
+        check(allocated, "Cannot size isolated floppy fixture");
+        for (auto model : {CpuModel::I8088,CpuModel::I286,CpuModel::I386,CpuModel::I486}) {
+            Pc p; p.setModel(model); auto& c = p.cpu;
+            p.floppy = std::make_unique<Disk>(path, true, false);
+            std::array<uint8_t, 512> first{}, second{};
+            for (unsigned i = 0; i < first.size(); ++i) { first[i] = uint8_t(i * 7); second[i] = uint8_t(i * 13 + 1); }
+            check(p.floppy->write(0, first.data()) && p.floppy->write(1, second.data())
+                && p.floppy->write(17, first.data()) && p.floppy->write(18, second.data()), "Cannot prepare FDC sectors");
+            auto tick = [&]() { p.advanceClock(p.clock + 600); };
+            auto send = [&](std::initializer_list<uint8_t> bytes) {
+                for (auto value : bytes) {
+                    check((c.in(0x3f4) & 0xc0) == 0x80, "FDC must request a host command byte");
+                    c.out(0x3f5, value);
+                }
+            };
+            auto receive = [&](unsigned count) {
+                std::vector<uint8_t> bytes;
+                for (unsigned i = 0; i < count; ++i) {
+                    check((c.in(0x3f4) & 0xd0) == 0xd0, "FDC must expose its result bytes through the FIFO");
+                    bytes.push_back(c.in(0x3f5));
+                }
+                check((c.in(0x3f4) & 0xd0) == 0x80, "FDC must return to command phase after its final result byte");
+                return bytes;
+            };
+            auto program = [&](uint16_t address, unsigned bytes, bool writing = false) {
+                c.out(0x0a, 6); c.out(0x0c, 0); c.out(4, uint8_t(address)); c.out(4, uint8_t(address >> 8));
+                c.out(5, uint8_t(bytes - 1)); c.out(5, uint8_t((bytes - 1) >> 8));
+                c.out(0x81, 0); c.out(0x0b, writing ? 0x4a : 0x46); c.out(0x0a, 2);
+            };
+            c.out(0x21, 0xbf); c.out(0x3f2, 0);
+            check(c.in(0x3f4) == 0, "FDC must remain unavailable while DOR reset is asserted");
+            c.out(0x3f2, 0x1c); check(c.irq() == -1, "FDC reset interrupt must not arrive before the device delay");
+            tick(); check(c.irq() == 0x0e, "FDC reset completion must signal IRQ6");
+            for (unsigned drive = 0; drive < 4; ++drive) {
+                send({8}); auto data = receive(2);
+                check(data[0] == 0xc0 + drive && data[1] == 0, "FDC reset must provide four ordered SENSE INTERRUPT statuses");
+            }
+            c.out(0x20, 0x20);
+            check(c.in(0x3f7) == 0x80, "A newly inserted floppy must assert the disk-change line");
+            c.out(0x3f2, 0x14); send({0x0f,0,1}); tick();
+            check(c.irq() == -1, "DOR must gate FDC interrupts while disabled");
+            c.out(0x3f2, 0x1c); check(c.irq() == 0x0e, "Reenabling the FDC interrupt gate must expose its pending seek completion");
+            send({8}); auto data = receive(2);
+            check(data == std::vector<uint8_t>({0x20,1}) && c.in(0x3f7) == 0, "Seek completion must update PCN and clear a present medium's change line");
+            c.out(0x20, 0x20); c.out(0x21, 0xff);
+            send({0x4a,0}); tick(); data = receive(7);
+            check(data[0] == 0 && data[3] == 1 && data[6] == 2, "READ ID must use the current cylinder and 512-byte sector IDs");
+            send({7,0}); tick(); send({8}); receive(2); send({3,0xdf,2});
+            program(0x6000, 1024); send({0xc6,0,0,0,18,2,18,0x1b,0xff}); tick(); tick(); data = receive(7);
+            check(data == std::vector<uint8_t>({4,0,0,0,1,2,2})
+                && std::equal(first.begin(), first.end(), c.mem.begin() + 0x6000)
+                && std::equal(second.begin(), second.end(), c.mem.begin() + 0x6200),
+                "Multi-track DMA must cross head zero EOT, stop exactly at terminal count, and report next CHRN");
+            program(0x6400, 512); c.out(0x0a, 6); send({0x46,0,0,0,1,2,1,0x1b,0xff}); tick();
+            check(c.in(0x3f4) == 0x10 && c.mem[0x6401] == 0, "A masked DMA channel must leave the FDC command pending without consuming its sector");
+            c.out(0x0a, 2); tick(); data = receive(7);
+            check(data[1] == 0 && std::equal(first.begin(), first.end(), c.mem.begin() + 0x6400), "Unmasking DMA must resume the same FDC sector");
+            program(0x6400, 512); send({0x46,0,0,0,1,2,255,0x1b,0xff}); tick(); data = receive(7);
+            check(data[1] == 0 && data[5] == 2, "DMA terminal count must stop a valid read before an oversized EOT reaches nonexistent sectors");
+            program(0x6800, 32); c.mem[0x6820] = 0xa5;
+            send({0x46,0,0,0,1,2,1,0x1b,0xff}); tick(); data = receive(7);
+            check(data[1] == 0 && std::equal(first.begin(), first.begin() + 32, c.mem.begin() + 0x6800) && c.mem[0x6820] == 0xa5,
+                "An early DMA terminal count on a read must not overwrite bytes beyond the programmed length");
+            program(0x6a00, 512, true); send({0x46,0,0,0,1,2,1,0x1b,0xff}); tick(); data = receive(7);
+            check(data[1] == 0x10, "A reversed DMA direction must report FDC overrun rather than fabricate transferred data");
+            send({3,0xdf,3}); send({0x46,0,0,0,1,2,1,0x1b,0xff}); tick();
+            std::array<uint8_t, 512> pio{};
+            for (auto& value : pio) { check(c.in(0x3f4) == 0xf0, "Non-DMA read must request FIFO input"); value = c.in(0x3f5); }
+            data = receive(7); check(pio == first && data[1] == 0x80, "PIO reads must expose every byte and report EOT without a DMA terminal count");
+            send({0x45,0,0,0,2,2,2,0x1b,0xff}); tick();
+            for (auto value : first) { check(c.in(0x3f4) == 0xb0, "Non-DMA write must request FIFO output"); c.out(0x3f5, value); }
+            receive(7); check(p.floppy->read(1, pio.data()) && pio == first, "PIO writes must persist their complete sector");
+            send({3,0xdf,2});
+            const uint8_t ids[] = {0,0,1,2,0,0,2,2};
+            std::copy(std::begin(ids), std::end(ids), c.mem.begin() + 0x7000);
+            program(0x7000, 8, true); send({0x4d,0,2,2,0x54,0xe5}); tick(); data = receive(7);
+            check(data[1] == 0 && p.floppy->read(0, pio.data())
+                && std::all_of(pio.begin(), pio.end(), [](uint8_t v) { return v == 0xe5; }), "FORMAT TRACK must consume DMA CHRN IDs and fill the actual sectors");
+            p.floppy.reset(); p.floppy = std::make_unique<Disk>(path, true, true);
+            send({0x45,0,0,0,1,2,1,0x1b,0xff}); tick(); data = receive(7);
+            check(data[1] == 2 && c.in(0x3f7) == 0x80, "Read-only floppy media must report write protection and reinsertion");
+            program(0x7200, 512); send({0x46,0,0,0,1,2,1,0x1b,0xff});
+            p.floppy.reset(); p.floppy = std::make_unique<Disk>(path, true, true);
+            tick(); data = receive(7);
+            check(data[1] == 4 && c.mem[0x7200] == 0, "Replacing media at the same path must abort an old transfer without dereferencing a stale Disk");
+            send({0x0f,0,2}); send({0x0f,1,3});
+            check((c.in(0x3f4) & 3) == 3, "Concurrent seeks must retain both drive-busy bits");
+            tick(); send({8}); data = receive(2);
+            check(data == std::vector<uint8_t>({0x20,2}), "Concurrent seeks must retain the real drive's completion");
+            send({8}); data = receive(2);
+            check(data == std::vector<uint8_t>({0x71,0}), "An absent second drive must report equipment-check instead of a successful seek");
+            send({9}); check(receive(1)[0] == 0x80, "Unsupported deleted-sector writes must report invalid-command status");
+            c.out(0x3f2, 0x0c); send({0x46,0,2,0,1,2,1,0x1b,0xff}); tick();
+            check(c.in(0x3f4) == 0x10 && !std::isfinite(p.fdc.nextEvent), "A stopped motor must not fabricate a completed floppy read");
+            c.out(0x3f2, 0); c.out(0x3f2, 0x1c); tick();
+            for (unsigned i = 0; i < 4; ++i) { send({8}); receive(2); }
+        }
+    } catch (...) {
+        std::filesystem::remove(path); throw;
+    }
+    std::filesystem::remove(path);
+    std::cout << "FDC / IRQ6 / reset-sense / DMA-PIO / multi-track / media-change / write-protection / format checks passed\n";
+}
 void dmaTests() {
     Pc p; p.setModel(CpuModel::I486); auto& c = p.cpu;
     auto program = [&](unsigned channel, uint16_t address, uint16_t count, uint8_t mode, uint8_t page) {
@@ -1831,7 +1942,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        dmaTests(); diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
+        dmaTests(); fdcTests(path); diskSizingTests(path); ideTests(path); atapiTests(path); videoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }
