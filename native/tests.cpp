@@ -2288,6 +2288,28 @@ void fdcTests(const std::filesystem::path& base) {
             c.out(0x3f2, 0); c.out(0x3f2, 0x1c); tick();
             for (unsigned i = 0; i < 4; ++i) { send({8}); receive(2); }
         }
+        for (auto model : {CpuModel::I8088,CpuModel::I486}) {
+            Pc p; p.setModel(model); auto& c = p.cpu;
+            p.floppy = std::make_unique<Disk>(path, true, false);
+            std::array<uint8_t, 512> boot{}; boot[0] = 0xf4; boot[510] = 0x55; boot[511] = 0xaa;
+            check(p.floppy->write(0, boot.data()), "Cannot prepare BIOS floppy boot sector");
+            p.boot(0);
+            // Win9x HSFLOP finds BIOS floppy drives by trapping the DOR write a real BIOS makes for media access.
+            auto call = [&](uint16_t ax, uint8_t drive) {
+                c.out(0x3f2, 0x0c);
+                c.loadSegment(CS, 0); c.loadSegment(ES, 0); c.ip = 0x500; c.halted = false;
+                c.r[AX] = ax; c.r[CX] = 1; c.r[DX] = drive; c.r[BX] = 0x600;
+                const uint8_t code[] = {0xcd,0x13,0xf4};
+                std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x500); p.run(100);
+                return c.in(0x3f2);
+            };
+            check(call(0x0201, 0) == 0x1c && !(c.flags & CF) && c.mem[0x600] == 0xf4,
+                "BIOS floppy reads must turn on drive A's motor through the DOR before reading");
+            check(call(0x0401, 0) == 0x1c && call(0x0201, 1) == 0x2d,
+                "BIOS floppy verify and drive B access must select the matching DOR motor");
+            check(call(0x0800, 0) == 0x0c && call(0x0000, 0) == 0x0c && call(0x0201, 2) == 0x0c && call(0x0201, 0x80) == 0x0c,
+                "BIOS parameter, reset, absent drive and hard disk calls must leave the DOR unchanged");
+        }
     } catch (...) {
         std::filesystem::remove(path); throw;
     }

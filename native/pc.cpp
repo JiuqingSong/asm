@@ -250,6 +250,20 @@ void Pc::boot(uint8_t drive) {
     const uint8_t serial[] = {0x50,0xe4,0x21,0x0c,0x10,0xe6,0x21,0xb0,0x20,0xe6,0x20,0x58,0xcf};
     std::copy(std::begin(serial), std::end(serial), cpu.mem.begin() + 0xf0840);
     cpu.ww(0, 0x0c * 4, 0x840);
+    // Floppy read/write/verify/format turn on the drive motor through a guest OUT to the DOR, like a real BIOS.
+    // Win9x HSFLOP maps BIOS drives to FDC units by trapping this write; without it no floppy drive is found
+    // and HSFLOP's no-drive error path later writes through a null pointer into the INT 1Ah vector.
+    const uint8_t disk[] = {
+        0x80,0xfa,0x01, 0x77,0x1a,        // cmp dl,1 / ja trap
+        0x80,0xfc,0x02, 0x72,0x15,        // cmp ah,2 / jb trap
+        0x80,0xfc,0x05, 0x77,0x10,        // cmp ah,5 / ja trap
+        0x50, 0x52, 0xb0,0x1c,            // push ax / push dx / mov al,1Ch (motor A, select A)
+        0x08,0xd2, 0x74,0x02, 0xb0,0x2d,  // or dl,dl / jz out / mov al,2Dh (motor B, select B)
+        0xba,0xf2,0x03, 0xee,             // out: mov dx,3F2h / out dx,al
+        0x5a, 0x58,                       // pop dx / pop ax
+        0xf1,0x13, 0xcf};                 // trap: INT 13h service / iret
+    std::copy(std::begin(disk), std::end(disk), cpu.mem.begin() + 0xf0860);
+    cpu.ww(0, 0x13 * 4, 0x860);
     cpu.ww(0x40, 0, 0x3f8); cpu.wb(0x40, 0x7c, 1);
     cpu.ww(0x40, 0x10, uint16_t(0x221 | (floppy ? 1 : 0) | (cpu.hasFpu() ? 2 : 0)));
     cpu.ww(0x40, 0x13, 640); cpu.ww(0x40, 0x1a, 0x1e); cpu.ww(0x40, 0x1c, 0x1e);
