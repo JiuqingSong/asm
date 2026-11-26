@@ -6,6 +6,12 @@
 // INT 13h，看 BIOS 是不是真的经过这些端口读硬盘，据此确认 BIOS 的 80h 号盘就是这个控制器上的盘。BIOS 不碰
 // 端口的话它在 IOS.LOG 里写"ESDI trap handler not called"，硬盘只能用"MS-DOS 兼容方式"。
 //
+// 软驱同理：Windows 9x 的 HSFLOP.PDR 截获 DOR（3F2h），调用 INT 13h AX=0301h，看 BIOS 为哪个驱动器打开电机，
+// 以此把 BIOS 的 A:/B: 对应到控制器上的单元。BIOS 不写 DOR 时它找不到软驱，并把"0 个"缓存在注册表
+// （cdrvs / cIOSFlop）；其无驱动器出错路径还会经空指针把 INT 1Ah 向量的段改成 001Dh，之后 V86 里调用
+// INT 1Ah（如 Windows 98 安装末尾的日期/时间对话框）出现 001D:000010D0 的异常 06 蓝屏。所以软驱的
+// 读、写、校验、格式化（AH=02h~05h）先像真 BIOS 一样写 DOR 打开电机（A: 1Ch，B: 2Dh），再进入陷阱。
+//
 // 只用 8086 指令（CPU 选 8088 时也能运行）；几何参数取 ROM 里的硬盘参数表（INT 41h/46h 指向的那两个）。
 import { assemble } from '../asm/assembler.ts';
 
@@ -17,6 +23,24 @@ rom segment
 assume cs:rom
 org 0${DISK_ROM.toString(16)}h
 int13 proc far
+        cmp dl, 1
+        ja notflop
+        cmp ah, 2                       ; 软驱 A:/B: 的读、写、校验、格式化：先打开电机
+        jb totrap
+        cmp ah, 5
+        ja totrap
+        push ax
+        push dx
+        mov al, 1Ch                     ; A:：电机 A、DMA/中断、不复位、选择 0
+        or dl, dl
+        jz motor
+        mov al, 2Dh                     ; B:：电机 B、选择 1
+motor:  mov dx, 3F2h
+        out dx, al
+        pop dx
+        pop ax
+        jmp short totrap
+notflop:
         cmp dl, 80h
         jb totrap
         cmp dl, 81h
