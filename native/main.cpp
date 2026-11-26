@@ -14,7 +14,7 @@
 
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
@@ -47,6 +47,7 @@ void title(HWND hwnd) {
         : pc->at() ? L"Asm86 native - 80286 / AT" : L"Asm86 native - 8088";
     value += L" | A: " + (pc->floppy ? pc->floppy->path.filename().wstring() : L"(empty)");
     value += L" | C: " + (pc->hard ? pc->hard->path.filename().wstring() : L"(empty)");
+    if (pc->hard && pc->hard->hasOverlay()) value += L" | Overlay: " + pc->hard->overlayPath().filename().wstring();
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
     value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 && stableTiming ? L" | Normal speed (486 ~32 MIPS virtual)"
         : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
@@ -58,6 +59,9 @@ void title(HWND hwnd) {
     else if (!running) value += L" | stopped";
     if (EnableMenuItem(GetMenu(hwnd), CtrlAltDel, MF_BYCOMMAND | (poweredOn ? MF_ENABLED : MF_GRAYED)) == -1)
         throw std::runtime_error("Cannot update restart menu");
+    if (EnableMenuItem(GetMenu(hwnd), DiscardOverlay, MF_BYCOMMAND |
+        (!poweredOn && pc->hard && pc->hard->hasOverlay() ? MF_ENABLED : MF_GRAYED)) == -1)
+        throw std::runtime_error("Cannot update overlay menu");
     if (EnableMenuItem(GetMenu(hwnd), StableTiming, MF_BYCOMMAND | (pc->cpu.model == CpuModel::I486 ? MF_ENABLED : MF_GRAYED)) == -1)
         throw std::runtime_error("Cannot update CPU timing menu");
     if (!ModifyMenuW(GetMenu(hwnd), FullSpeed, MF_BYCOMMAND | MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed,
@@ -85,12 +89,13 @@ void centerMouse(HWND hwnd) {
     if (!ClientToScreen(hwnd, &center) || !SetCursorPos(center.x, center.y))
         throw std::runtime_error("Cannot center captured mouse pointer");
 }
-std::filesystem::path choose(HWND hwnd, bool save, bool optical = false) {
+std::filesystem::path choose(HWND hwnd, bool save, bool optical = false, bool overlay = false) {
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = hwnd;
-    dialog.lpstrFilter = optical ? L"Optical images (*.iso)\0*.iso\0All files\0*.*\0" : L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
-    dialog.lpstrFile = path; dialog.nMaxFile = DWORD(std::size(path)); dialog.lpstrDefExt = optical ? L"iso" : L"img";
-    dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+    dialog.lpstrFilter = optical ? L"Optical images (*.iso)\0*.iso\0All files\0*.*\0"
+        : overlay ? L"Asm86 overlays (*.cow)\0*.cow\0All files\0*.*\0" : L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
+    dialog.lpstrFile = path; dialog.nMaxFile = DWORD(std::size(path)); dialog.lpstrDefExt = optical ? L"iso" : overlay ? L"cow" : L"img";
+    dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (save ? (overlay ? 0 : OFN_OVERWRITEPROMPT) : OFN_FILEMUSTEXIST);
     if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) return path;
     if (CommDlgExtendedError()) throw std::runtime_error("File selection dialog failed");
     return {};
@@ -208,13 +213,27 @@ void command(HWND hwnd, int id) {
         break;
     }
     case EjectCdrom: pc->cdrom.eject(); break;
+    case LoadOverlay: {
+        if (poweredOn) { MessageBoxW(hwnd, L"Power off before replacing the disk.", L"Disk overlay", MB_OK); break; }
+        auto base = choose(hwnd, false); if (base.empty()) break;
+        auto overlay = choose(hwnd, true, false, true); if (overlay.empty()) break;
+        auto disk = std::make_unique<Disk>(base, false, false, overlay);
+        pc->hard = std::move(disk);
+        if (preferences) { preferences->hard(base); preferences->overlay(overlay); }
+        break;
+    }
+    case DiscardOverlay:
+        if (poweredOn || !pc->hard || !pc->hard->hasOverlay()) break;
+        if (MessageBoxW(hwnd, L"Discard all writes in this overlay and return to the base disk?\nThis cannot be undone. The base IMG will not be modified.",
+            L"Discard overlay", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) pc->hard->discardOverlay();
+        break;
     case NewHard: case NewHard126: case NewHard504: case LoadHard: {
         if (running) { MessageBoxW(hwnd, L"Power off the machine before replacing the hard disk (Machine > Power off).", L"Hard disk", MB_OK); break; }
         auto p = choose(hwnd, id != LoadHard);
         if (!p.empty()) {
             if (id != LoadHard) Disk::create(p, id == NewHard504 ? 1024 : id == NewHard126 ? 256 : 64);
             pc->hard = std::make_unique<Disk>(p, false, false);
-            if (preferences) preferences->hard(pc->hard->path);
+            if (preferences) { preferences->hard(pc->hard->path); preferences->overlay({}); }
         }
         break;
     }
@@ -372,6 +391,9 @@ void namedKey(const std::string& value) {
         bool down = value == "ALT_DOWN";
         pc->key(down ? 0x38 : 0xb8, 0);
     }
+    else if (value == "CTRL_DOWN" || value == "CTRL_UP") {
+        pc->key(value == "CTRL_DOWN" ? 0x1d : 0x9d, 0);
+    }
     else if (value == "UP") tapKey(0x48, 0);
     else if (value == "DOWN") tapKey(0x50, 0);
     else if (value == "LEFT") tapKey(0x4b, 0);
@@ -496,11 +518,12 @@ int headless(const std::filesystem::path& script) {
 }
 int application(int argc, wchar_t** argv) {
     pc = std::make_unique<Pc>();
-    std::filesystem::path script; bool start = false, uiTest = false;
+    std::filesystem::path script, hardPath, overlayPath; bool start = false, uiTest = false, discardOverlay = false, overlaySpecified = false;
     bool cpuSpecified = false, speedSpecified = false, timingSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring option = argv[i];
         if (option == L"--ui-test") { uiTest = true; continue; }
+        if (option == L"--discard-overlay") { discardOverlay = true; continue; }
         if (option == L"--experimental-386") { experimental386 = true; continue; }
         if (option == L"--full-speed" || option == L"--normal-speed") {
             fullSpeed = option == L"--full-speed"; speedSpecified = true; continue;
@@ -511,7 +534,8 @@ int application(int argc, wchar_t** argv) {
         if (i + 1 >= argc) throw std::runtime_error("Missing command-line option value");
         std::filesystem::path value = argv[++i];
         if (option == L"--floppy") { pc->floppy = std::make_unique<Disk>(value, true, true); floppySpecified = true; }
-        else if (option == L"--hard") { pc->hard = std::make_unique<Disk>(value, false, false); hardSpecified = true; }
+        else if (option == L"--hard") { hardPath = value; hardSpecified = true; }
+        else if (option == L"--overlay") { overlayPath = value; overlaySpecified = true; }
         else if (option == L"--cdrom") pc->cdrom.insert(value);
         else if (option == L"--create-hard") {
             unsigned cylinders = 64;
@@ -521,7 +545,7 @@ int application(int argc, wchar_t** argv) {
                     throw std::runtime_error("Optional --create-hard size must be 31.5, 126 or 504 MiB");
                 cylinders = size == L"504" ? 1024 : size == L"126" ? 256 : 64;
             }
-            Disk::create(value, cylinders); pc->hard = std::make_unique<Disk>(value, false, false);
+            Disk::create(value, cylinders); hardPath = value;
             hardSpecified = true;
         }
         else if (option == L"--cpu") {
@@ -536,6 +560,14 @@ int application(int argc, wchar_t** argv) {
         } else if (option == L"--headless") script = value;
         else throw std::runtime_error("Unknown command-line option");
     }
+    if (hardSpecified) pc->hard = std::make_unique<Disk>(hardPath, false, false, overlayPath);
+    if (discardOverlay) {
+        if (start || uiTest || !script.empty() || !pc->hard || !pc->hard->hasOverlay())
+            throw std::runtime_error("--discard-overlay requires --hard and --overlay, without boot, headless or UI test");
+        pc->hard->discardOverlay(); std::cout << "Overlay writes discarded; base disk unchanged\n"; return 0;
+    }
+    if (overlaySpecified && !hardSpecified && (uiTest || !script.empty()))
+        throw std::runtime_error("--overlay requires --hard in scripted mode");
     if (experimental386) {
         if (script.empty() || uiTest || cpuSpecified)
             throw std::runtime_error("--experimental-386 requires --headless and cannot be combined with --cpu or --ui-test");
@@ -569,7 +601,7 @@ int application(int argc, wchar_t** argv) {
         if (!hardSpecified) {
             auto path = preferences->hard();
             if (!path.empty()) {
-                try { pc->hard = std::make_unique<Disk>(path, false, false); }
+                try { pc->hard = std::make_unique<Disk>(path, false, false, overlaySpecified ? overlayPath : preferences->overlay()); }
                 catch (const std::exception& e) {
                     auto message = L"Could not restore the remembered hard disk:\n" + path.wstring() + L"\n\n" + wide(e.what())
                         + L"\n\nC: will remain empty. Open another hard disk to replace the remembered path.";
@@ -592,7 +624,9 @@ int application(int argc, wchar_t** argv) {
         if (speedSpecified) preferences->fullSpeed(fullSpeed);
         if (timingSpecified) preferences->stableTiming(stableTiming);
         if (floppySpecified) preferences->floppy(pc->floppy->path);
+        if (overlaySpecified && !pc->hard) throw std::runtime_error("--overlay requires a base hard disk");
         if (hardSpecified) preferences->hard(pc->hard->path);
+        if ((hardSpecified || overlaySpecified) && pc->hard) preferences->overlay(pc->hard->overlayPath());
     }
     if (!script.empty()) {
         if (start) pc->boot(pc->bootDrive);
@@ -612,6 +646,8 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(sizes, MF_STRING, NewHard504, L"504 MiB...");
     AppendMenuW(disks, MF_POPUP, UINT_PTR(sizes), L"Create C: hard disk");
     AppendMenuW(disks, MF_STRING, LoadHard, L"Open C: hard disk...");
+    AppendMenuW(disks, MF_STRING, LoadOverlay, L"Open C: with overlay (base read-only)...");
+    AppendMenuW(disks, MF_STRING, DiscardOverlay, L"Discard overlay writes (powered off)...");
     AppendMenuW(disks, MF_STRING, LoadCdrom, L"Insert ATAPI CD-ROM (.iso)...");
     AppendMenuW(disks, MF_STRING, EjectCdrom, L"Eject ATAPI CD-ROM");
     AppendMenuW(disks, MF_SEPARATOR, 0, nullptr); AppendMenuW(disks, MF_STRING, Quit, L"Exit");
@@ -1116,7 +1152,8 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         if (argv) LocalFree(argv);
         std::cerr << "ERROR: " << e.what() << '\n';
         if (pc) std::cerr << "CS:IP " << std::hex << pc->cpu.s[CS] << ':' << pc->cpu.ip << std::dec << '\n' << pc->text();
-        if (!std::wcsstr(GetCommandLineW(), L"--headless") && !std::wcsstr(GetCommandLineW(), L"--ui-test"))
+        if (!std::wcsstr(GetCommandLineW(), L"--headless") && !std::wcsstr(GetCommandLineW(), L"--ui-test") &&
+            !std::wcsstr(GetCommandLineW(), L"--discard-overlay"))
             MessageBoxW(nullptr, wide(e.what()).c_str(), L"Asm86", MB_OK | MB_ICONERROR);
         return 1;
     }

@@ -68,6 +68,24 @@ Windows 98 的完整安装、重新启动及安装后基本操作也已由用户
 `--ui-test` 会将合并绘制与原逐格绘制逐像素比较，覆盖 CP437 字符、40/80 列、
 属性切换、活动页、调色板变更和消隐。
 
+## 差分硬盘（磁盘回滚）
+
+```powershell
+.\native\run.ps1 -Cpu 486 -HardDisk 'D:\images\base.img' -Overlay 'D:\images\experiment.cow'
+# 明确丢弃差分盘全部写入（先关机并关闭占用它的窗口）：
+.\native\build\asm86-native.exe --hard 'D:\images\base.img' --overlay 'D:\images\experiment.cow' --discard-overlay
+```
+
+`--overlay` 创建或重新打开差分盘；底盘始终以只读句柄打开，客体写入仅追加到 `.cow`。
+GUI 的 **Disks > Open C: with overlay** 选择底盘和差分盘；路径会一起记忆，标题栏显示差分盘。
+普通 **Open C: hard disk** / 显式 `--hard`（不带 `--overlay`）仍为原有直接写入模式，并清除记忆的差分盘。
+**Discard overlay writes** 仅在关机时可用，确认后返回底盘状态；不向底盘合并任何数据。
+关机并关闭占用差分盘的程序后，可复制 `.cow` 文件保存磁盘检查点。
+
+差分盘绑定底盘完整内容的 SHA256，每条追加记录带 CRC32；底盘变化、损坏记录或截断的尾记录会明确报错，
+不会忽略错误继续启动。异常中断导致损坏时应保留差分文件用于恢复，或明确删除差分文件后重新创建；
+当前不提供自动修复、合并、压缩、链式差分盘或运行中整机存档。底盘必须保持不变。
+
 ## APM 自动关机
 
 AT（286 / 386 / 486）提供 APM 1.2 实模式 / VM86 BIOS 接口（`INT 15h / AH=53h`），

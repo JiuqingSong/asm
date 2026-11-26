@@ -323,6 +323,58 @@ void benchmarks() {
             << " checksum=" << expected << '\n';
     }
 }
+void overlayTests(const std::filesystem::path& prefix) {
+    auto base = std::filesystem::path(prefix.wstring() + L".base.img");
+    auto other = std::filesystem::path(prefix.wstring() + L".other.img");
+    auto overlay = std::filesystem::path(prefix.wstring() + L".cow");
+    auto cleanup = [&]() { for (const auto& p : {overlay, other, base}) std::filesystem::remove(p); };
+    try {
+        Disk::create(base, 1); Disk::create(other, 1);
+        std::array<uint8_t, 512> bytes{}, actual{}; bytes.fill(0x17);
+        { Disk disk(base, false, false); check(disk.write(7, bytes.data()), "Seed overlay base"); disk.flush(); }
+        {
+            Disk disk(base, false, false, overlay);
+            check(disk.hasOverlay() && !disk.readOnly && disk.read(7, actual.data()) && actual == bytes, "Overlay reads must fall through to the read-only base");
+            bytes.fill(0x28); check(disk.write(7, bytes.data()), "Overlay first write");
+            bytes.fill(0x39); check(disk.write(7, bytes.data()), "Overlay repeated write"); disk.flush();
+            Disk source(base, false, true); check(source.read(7, actual.data()) && actual[0] == 0x17, "Guest writes must never reach the base image");
+            auto writer = CreateFileW(base.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+            if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
+            check(writer == INVALID_HANDLE_VALUE, "Overlay lifetime must deny writable host handles to the base");
+            check(!source.write(7, bytes.data()) && !disk.write(disk.sectors, bytes.data()), "Read-only base and overlay bounds must be enforced");
+        }
+        {
+            Disk disk(base, false, false, overlay);
+            check(disk.read(7, actual.data()) && actual == bytes, "Reopening an overlay must recover the latest sector version");
+        }
+        bool rejected = false;
+        try { Disk disk(other, false, false, overlay); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "Overlay SHA256 must reject a different same-sized base disk");
+        rejected = false;
+        try { Disk disk(base, false, false, base); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "An overlay must not overwrite its own base, including file aliases");
+        {
+            Disk disk(base, false, false, overlay); disk.discardOverlay();
+            check(std::filesystem::file_size(overlay) == 64 && disk.read(7, actual.data()) && actual[0] == 0x17,
+                "Powered-off discard must restore base reads and retain a reusable valid overlay");
+            check(disk.write(0, bytes.data()), "Write after overlay discard"); disk.flush();
+        }
+        {
+            std::fstream f(overlay, std::ios::in | std::ios::out | std::ios::binary);
+            f.seekp(70); f.put(char(0xff)); f.close(); check(bool(f), "Prepare corrupt overlay");
+        }
+        rejected = false;
+        try { Disk disk(base, false, false, overlay); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "Corrupt overlay records must be reported, not silently read as success");
+        std::filesystem::resize_file(overlay, 65);
+        rejected = false;
+        try { Disk disk(base, false, false, overlay); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected, "A torn final overlay record must be rejected explicitly without changing the base");
+        { Disk source(base, false, true); check(source.read(7, actual.data()) && actual[0] == 0x17, "Base survives corrupt and truncated overlays"); }
+    } catch (...) { cleanup(); throw; }
+    cleanup();
+    std::cout << "Disk overlays / base immutability / reopen / SHA256 / CRC / truncation / discard checks passed\n";
+}
 void preferenceTests() {
     auto key = L"Software\\Asm86NativeTest-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
     auto cleanup = [&]() {
@@ -338,7 +390,7 @@ void preferenceTests() {
             check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && !prefs.stableTiming() && prefs.floppy().empty() && prefs.hard().empty(),
                 "First launch must retain the default CPU, speed and empty disk preferences");
             prefs.cpu(CpuModel::I286); prefs.fullSpeed(true); prefs.floppy(path);
-            prefs.hard(hardPath); prefs.stableTiming(true);
+            prefs.hard(hardPath); prefs.overlay(path); prefs.stableTiming(true);
         }
         {
             Preferences prefs(key.c_str());
@@ -346,6 +398,8 @@ void preferenceTests() {
                 "CPU, speed and Unicode floppy path must survive reopening preferences");
             check(prefs.hard() == std::filesystem::absolute(hardPath),
                 "Selected Windows hard disk with spaces and Unicode must survive reopening preferences");
+            check(prefs.overlay() == std::filesystem::absolute(path), "Overlay Unicode path must survive reopening preferences");
+            prefs.overlay({}); check(prefs.overlay().empty(), "Switching back to direct disk access must clear the stored overlay");
             prefs.hard(path);
             prefs.cpu(CpuModel::I386);
         }
@@ -2862,7 +2916,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

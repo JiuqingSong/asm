@@ -6,7 +6,8 @@ param(
     [switch]$NormalSpeed,
     [string]$Cdrom,
     [switch]$StableTiming,
-    [switch]$RealTimeTiming
+    [switch]$RealTimeTiming,
+    [string]$Overlay
 )
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'build\asm86-native.exe'
@@ -18,6 +19,7 @@ if ($Cpu) { $arguments += @('--cpu', $Cpu) }
 if ($HardDisk) {
     $arguments += @('--hard', ('"{0}"' -f (Resolve-Path -LiteralPath $HardDisk).Path))
 }
+if ($Overlay) { $arguments += @('--overlay', ('"{0}"' -f [IO.Path]::GetFullPath($Overlay))) }
 if ($Floppy) {
     $arguments += @('--floppy', ('"{0}"' -f (Resolve-Path -LiteralPath $Floppy).Path))
 }

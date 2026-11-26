@@ -13,6 +13,7 @@
 #include <string>
 #include <deque>
 #include <limits>
+#include <unordered_map>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -20,7 +21,7 @@
 namespace asm86 {
 class Disk {
 public:
-    Disk(const std::filesystem::path& path, bool floppy, bool readOnly);
+    Disk(const std::filesystem::path& path, bool floppy, bool readOnly, const std::filesystem::path& overlay = {});
     ~Disk();
     Disk(const Disk&) = delete;
     Disk& operator=(const Disk&) = delete;
@@ -28,6 +29,9 @@ public:
     bool read(uint32_t lba, uint8_t* data);
     bool write(uint32_t lba, const uint8_t* data);
     void flush();
+    void discardOverlay();
+    bool hasOverlay() const { return overlayFile != INVALID_HANDLE_VALUE; }
+    const std::filesystem::path& overlayPath() const { return differential; }
     uint32_t sectors = 0;
     int cylinders = 0, heads = 0, spt = 0, floppyType = 0;
     bool readOnly = false, changed = true;
@@ -35,6 +39,11 @@ public:
     const uint64_t identity;
 private:
     HANDLE file = INVALID_HANDLE_VALUE;
+    HANDLE overlayFile = INVALID_HANDLE_VALUE;
+    std::filesystem::path differential;
+    std::unordered_map<uint32_t, uint64_t> overlayIndex;
+    uint64_t overlayEnd = 64;
+    void openOverlay();
     bool transfer(uint32_t lba, uint8_t* data, bool writing);
 };
 

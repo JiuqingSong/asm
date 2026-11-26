@@ -7,6 +7,7 @@
 #include <cmath>
 #include <sstream>
 #include <stdexcept>
+#include <wincrypt.h>
 
 namespace asm86 {
 static std::atomic<uint64_t> nextDiskIdentity{0};
@@ -103,19 +104,64 @@ static void installVideoFirmware(Cpu& cpu) {
     }
     cpu.ww(0, 0x43 * 4, font16Offset); cpu.ww(0, 0x43 * 4 + 2, 0xf000);
 }
-Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro), path(p), identity(++nextDiskIdentity) {
-    file = CreateFileW(p.c_str(), GENERIC_READ | (ro ? 0 : GENERIC_WRITE), FILE_SHARE_READ,
+static void diskIo(HANDLE file, uint64_t offset, uint8_t* data, DWORD size, bool writing) {
+    LARGE_INTEGER position{}; position.QuadPart = int64_t(offset); DWORD done = 0;
+    if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN)) throw osError("Disk seek failed");
+    auto ok = writing ? WriteFile(file, data, size, &done, nullptr) : ReadFile(file, data, size, &done, nullptr);
+    if (!ok || done != size) throw osError(writing ? "Disk write failed" : "Disk read failed");
+}
+static uint32_t diskWord(const uint8_t* p) {
+    return p[0] | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
+}
+static void diskWord(uint8_t* p, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i) p[i] = uint8_t(value >> (i * 8));
+}
+static uint32_t diskCrc(const uint8_t* data, unsigned size) {
+    uint32_t value = 0xffffffffu;
+    for (unsigned i = 0; i < size; ++i) {
+        value ^= data[i];
+        for (unsigned bit = 0; bit < 8; ++bit) value = (value >> 1) ^ (0xedb88320u & (0u - (value & 1)));
+    }
+    return ~value;
+}
+static std::array<uint8_t, 32> diskHash(HANDLE file, uint64_t size) {
+    HCRYPTPROV provider = 0; HCRYPTHASH hash = 0;
+    if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
+        throw osError("Cannot initialize disk SHA256");
+    std::array<uint8_t, 32> result{};
+    try {
+        if (!CryptCreateHash(provider, CALG_SHA_256, 0, 0, &hash)) throw osError("Cannot create disk SHA256");
+        std::vector<uint8_t> buffer(1024 * 1024);
+        for (uint64_t offset = 0; offset < size;) {
+            auto count = DWORD(std::min<uint64_t>(buffer.size(), size - offset));
+            diskIo(file, offset, buffer.data(), count, false);
+            if (!CryptHashData(hash, buffer.data(), count, 0)) throw osError("Cannot hash base disk");
+            offset += count;
+        }
+        DWORD count = DWORD(result.size());
+        if (!CryptGetHashParam(hash, HP_HASHVAL, result.data(), &count, 0) || count != result.size())
+            throw osError("Cannot finish disk SHA256");
+    } catch (...) {
+        if (hash) CryptDestroyHash(hash);
+        CryptReleaseContext(provider, 0); throw;
+    }
+    CryptDestroyHash(hash); CryptReleaseContext(provider, 0); return result;
+}
+Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::filesystem::path& overlay)
+    : readOnly(ro), path(p), identity(++nextDiskIdentity), differential(overlay) {
+    if (!overlay.empty() && (floppy || ro)) throw std::runtime_error("Overlays require a writable guest hard disk");
+    file = CreateFileW(p.c_str(), GENERIC_READ | (ro || !overlay.empty() ? 0 : GENERIC_WRITE), FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) throw osError("Cannot open disk image");
+    try {
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file, &size)) { auto e = osError("Cannot size disk image"); CloseHandle(file); throw e; }
+    if (!GetFileSizeEx(file, &size)) throw osError("Cannot size disk image");
     if (size.QuadPart <= 0 || size.QuadPart % 512 || size.QuadPart > 504LL * 1024 * 1024) {
-        CloseHandle(file); throw std::runtime_error("Disk image must contain whole 512-byte sectors and be at most 504 MiB");
+        throw std::runtime_error("Disk image must contain whole 512-byte sectors and be at most 504 MiB");
     }
     sectors = uint32_t(size.QuadPart / 512);
     if (floppy) {
-        try { sectors = floppyPayloadSectors(file, sectors); }
-        catch (...) { CloseHandle(file); throw; }
+        sectors = floppyPayloadSectors(file, sectors);
         switch (sectors) {
         case 320: heads = 1; spt = 8; floppyType = 1; break;
         case 360: heads = 1; spt = 9; floppyType = 1; break;
@@ -124,15 +170,63 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro) : readOnly(ro),
         case 1440: heads = 2; spt = 9; floppyType = 3; break;
         case 2400: heads = 2; spt = 15; floppyType = 2; break;
         case 2880: heads = 2; spt = 18; floppyType = 4; break;
-        default: CloseHandle(file); throw std::runtime_error("Unsupported floppy geometry");
+        default: throw std::runtime_error("Unsupported floppy geometry");
         }
     } else { heads = 16; spt = 63; }
     cylinders = int(sectors / unsigned(heads * spt));
     if (!floppy && (cylinders < 1 || sectors % unsigned(heads * spt) || cylinders > 1024)) {
-        CloseHandle(file); throw std::runtime_error("Hard disk image must use 16 heads, 63 sectors and 1..1024 complete cylinders");
+        throw std::runtime_error("Hard disk image must use 16 heads, 63 sectors and 1..1024 complete cylinders");
+    }
+    if (!overlay.empty()) openOverlay();
+    } catch (...) {
+        if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
+        CloseHandle(file); throw;
     }
 }
-Disk::~Disk() { if (file != INVALID_HANDLE_VALUE) CloseHandle(file); }
+void Disk::openOverlay() {
+    std::array<uint8_t, 64> expected{};
+    const char magic[] = "ASM86COW";
+    std::copy(magic, magic + 8, expected.begin());
+    diskWord(expected.data() + 8, 1); diskWord(expected.data() + 12, sectors);
+    auto hash = diskHash(file, uint64_t(sectors) * 512);
+    std::copy(hash.begin(), hash.end(), expected.begin() + 16);
+    overlayFile = CreateFileW(differential.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ,
+        nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (overlayFile == INVALID_HANDLE_VALUE) throw osError("Cannot open disk overlay");
+    bool existing = GetLastError() == ERROR_ALREADY_EXISTS;
+    if (!existing) {
+        diskIo(overlayFile, 0, expected.data(), DWORD(expected.size()), true);
+        if (!FlushFileBuffers(overlayFile)) throw osError("Cannot flush overlay header");
+        return;
+    }
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(overlayFile, &size)) throw osError("Cannot size disk overlay");
+    if (size.QuadPart < 64 || (size.QuadPart - 64) % 520)
+        throw std::runtime_error("Truncated disk overlay; preserve it for recovery or discard it manually. Base disk unchanged");
+    std::array<uint8_t, 64> header{};
+    diskIo(overlayFile, 0, header.data(), DWORD(header.size()), false);
+    if (header != expected) throw std::runtime_error("Invalid overlay header or base disk SHA256 mismatch; base disk unchanged");
+    std::array<uint8_t, 520> record{};
+    for (uint64_t offset = 64; offset < uint64_t(size.QuadPart); offset += record.size()) {
+        diskIo(overlayFile, offset, record.data(), DWORD(record.size()), false);
+        auto lba = diskWord(record.data());
+        if (lba >= sectors || diskWord(record.data() + 516) != diskCrc(record.data(), 516))
+            throw std::runtime_error("Corrupt disk overlay record; base disk unchanged");
+        overlayIndex[lba] = offset + 4;
+    }
+    overlayEnd = uint64_t(size.QuadPart);
+}
+void Disk::discardOverlay() {
+    if (!hasOverlay()) throw std::runtime_error("No disk overlay is attached");
+    LARGE_INTEGER end{}; end.QuadPart = 64;
+    if (!SetFilePointerEx(overlayFile, end, nullptr, FILE_BEGIN) || !SetEndOfFile(overlayFile))
+        throw osError("Cannot discard overlay writes");
+    overlayIndex.clear(); overlayEnd = 64; changed = true; flush();
+}
+Disk::~Disk() {
+    if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+}
 void Disk::create(const std::filesystem::path& p, unsigned cylinders) {
     if (cylinders < 1 || cylinders > 1024) throw std::runtime_error("Hard disk creation requires 1..1024 cylinders");
     auto h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -145,16 +239,28 @@ void Disk::create(const std::filesystem::path& p, unsigned cylinders) {
 }
 bool Disk::transfer(uint32_t lba, uint8_t* data, bool writing) {
     if (lba >= sectors || (writing && readOnly)) return false;
-    LARGE_INTEGER pos{}; pos.QuadPart = uint64_t(lba) * 512;
-    if (!SetFilePointerEx(file, pos, nullptr, FILE_BEGIN)) throw osError("Disk seek failed");
-    DWORD done = 0;
-    BOOL ok = writing ? WriteFile(file, data, 512, &done, nullptr) : ReadFile(file, data, 512, &done, nullptr);
-    if (!ok || done != 512) throw osError(writing ? "Disk write failed" : "Disk read failed");
+    if (hasOverlay()) {
+        if (writing) {
+            std::array<uint8_t, 520> record{};
+            diskWord(record.data(), lba); std::copy(data, data + 512, record.begin() + 4);
+            diskWord(record.data() + 516, diskCrc(record.data(), 516));
+            diskIo(overlayFile, overlayEnd, record.data(), DWORD(record.size()), true);
+            overlayIndex[lba] = overlayEnd + 4; overlayEnd += record.size();
+            return true;
+        }
+        auto found = overlayIndex.find(lba);
+        if (found != overlayIndex.end()) {
+            diskIo(overlayFile, found->second, data, 512, false); return true;
+        }
+    }
+    diskIo(file, uint64_t(lba) * 512, data, 512, writing);
     return true;
 }
 bool Disk::read(uint32_t lba, uint8_t* p) { return transfer(lba, p, false); }
 bool Disk::write(uint32_t lba, const uint8_t* p) { return transfer(lba, const_cast<uint8_t*>(p), true); }
-void Disk::flush() { if (!readOnly && !FlushFileBuffers(file)) throw osError("Disk flush failed"); }
+void Disk::flush() {
+    if (!readOnly && !FlushFileBuffers(hasOverlay() ? overlayFile : file)) throw osError("Disk flush failed");
+}
 
 Pc::Pc() {
     fdc.disk = [this]() { return floppy.get(); };

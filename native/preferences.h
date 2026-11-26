@@ -80,5 +80,7 @@ public:
     void floppy(const std::filesystem::path& path) { imagePath(L"Floppy", path); }
     std::filesystem::path hard() const { return imagePath(L"HardDisk"); }
     void hard(const std::filesystem::path& path) { imagePath(L"HardDisk", path); }
+    std::filesystem::path overlay() const { return imagePath(L"Overlay"); }
+    void overlay(const std::filesystem::path& path) { imagePath(L"Overlay", path); }
 };
 }
