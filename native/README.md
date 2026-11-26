@@ -446,6 +446,30 @@ DOS 的 AUTOEXEC 命令回显也包含提示符；加载 HIMEM/SMARTDRV 后，�
 Windows 95 Setup 的 `INT 67h / AX=DE00h` VCPI 探测返回非零 AH，明确报告没有驻留 VCPI；
 不会把该安装检查当成未实现中断而停机，也不宣告提供 EMS/VCPI 服务。
 
+## 已安装系统自动回归
+
+```powershell
+.\native\test-os.ps1 -DosImage 'D:\images\DOS.img' -Win31Image '.\native\win31-386.img' `
+  -Win95Image 'D:\images\Windows95.img' -Win98Image 'D:\images\Windows98_new.img'
+```
+
+每个系统先复制底盘，再使用独立差分盘；两次独立进程冷启动验证文件写入及持久化。
+Windows 3.1 验证增强模式启动和退出回 DOS；Windows 95/98 通过开始菜单运行 DOS 文件写入命令，
+再从开始菜单正常关机并断言 APM 关机。每次进程退出后，`os-disk-check.exe` 从已验证的差分盘
+流式生成独立临时视图，并通过 FAT 目录/簇链读取文件、校验真实内容；不会把输入回显当作成功。
+第二次冷启动再次读取并检查文件；不依赖 DOS 窗口上次记忆的全屏/窗口设置。
+此 FAT 文件校验器与现有 FAT 工具一样限于不超过 504 MiB 的 FAT12/FAT16 镜像。
+截图、寄存器、错误日志及 `results.json` 保存在输出目录；图形模式失败时自动保存 `.failure.bmp`。
+Windows 98 默认等待当前测试镜像的 `vnetbios.vxd` 提示并按 Enter；无此提示的镜像请传 `-Win98Warning ''`。
+未提供的系统明确标记 `Skipped`，任何已选择系统失败或全部跳过均返回失败。
+每个进程有超时限制，超时仅终止测试自己创建的进程；失败时保留工作盘，不修改源 IMG。
+可用 `-Executable` 选择候选 EXE、`-OutputDirectory` 指定尚不存在的结果目录、`-KeepDisks` 保留成功工作盘。
+
+新增脚本指令：`wait-realtime <毫秒> <文字>` 按 GUI 的实时调度等待文字、超时非零退出；
+`expect-state graphics/text/powered-off` 明确断言显示/关机状态，不能用脚本执行完代替关机成功。
+`key CTRL_DOWN/CTRL_UP` 支持控制键组合；`type-paced <文字>` 每字符推进约 100ms，
+适合 Windows GUI 输入；原有 `type` 保持原来的确定性快速输入行为。
+
 ## ISA DMA 底座
 
 XT 提供第一片 8237 的寄存器，AT 另提供第二片和级联通道；支持 8 位/16 位地址计数、

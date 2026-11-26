@@ -403,10 +403,25 @@ void namedKey(const std::string& value) {
         tapKey(uint8_t(0x3a + n), 0);
     } else throw std::runtime_error("Unknown scripted key: " + value);
 }
+void saveFrame(const std::filesystem::path& path) {
+    if (!pc->vga.graphics()) throw std::runtime_error("A graphics frame requires a graphics video mode");
+    unsigned width = pc->vga.width(), height = pc->vga.height();
+    BITMAPFILEHEADER file{}; BITMAPINFOHEADER info{};
+    file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(info); file.bfSize = file.bfOffBits + width * height * 4;
+    info.biSize = sizeof(info); info.biWidth = LONG(width); info.biHeight = -LONG(height);
+    info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
+    std::vector<uint32_t> pixels;
+    if (pc->powerOffRequested) pixels.resize(width * height);
+    else pc->vga.renderGraphics(pixels);
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(&file), sizeof(file)); out.write(reinterpret_cast<const char*>(&info), sizeof(info));
+    out.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(uint32_t)));
+    if (!out) throw std::runtime_error("Cannot save graphics frame");
+}
 int headless(const std::filesystem::path& script) {
     std::ifstream stream(script); if (!stream) throw std::runtime_error("Cannot open headless script");
     std::string line; unsigned lineNumber = 0;
-    while (std::getline(stream, line)) {
+    try { while (std::getline(stream, line)) {
         ++lineNumber; if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         auto split = line.find(' '); auto op = line.substr(0, split);
@@ -414,14 +429,20 @@ int headless(const std::filesystem::path& script) {
         if (op == "run") {
             uint64_t count = std::stoull(arg);
             while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80); }
-        } else if (op == "realtime") {
-            std::istringstream input(arg); int milliseconds = 0; std::string speed, extra;
-            if (!(input >> milliseconds >> speed) || milliseconds < 0 || (input >> extra) || (speed != "normal" && speed != "full"))
+        } else if (op == "realtime" || op == "wait-realtime") {
+            std::istringstream input(arg); int milliseconds = 0; std::string speed = "full", extra, text;
+            bool waiting = op == "wait-realtime";
+            if (!(input >> milliseconds) || milliseconds < 0) throw std::runtime_error("Expected nonnegative realtime milliseconds");
+            if (waiting) {
+                std::getline(input >> std::ws, text);
+                if (text.empty()) throw std::runtime_error("Expected wait-realtime <milliseconds> <text>");
+            } else if (!(input >> speed) || (input >> extra) || (speed != "normal" && speed != "full"))
                 throw std::runtime_error("Expected realtime <milliseconds> <normal|full>");
             ExecutionTiming timing; timing.reset(*pc);
             const auto started = ExecutionTiming::HostClock::now(), deadline = started + std::chrono::milliseconds(milliseconds);
             const auto beforeClock = pc->clock;
-            while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline) {
+            while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline &&
+                (!waiting || pc->text().find(text) == std::string::npos)) {
                 auto remaining = deadline - ExecutionTiming::HostClock::now();
                 if (remaining <= ExecutionTiming::HostClock::duration::zero()) break;
                 timing.run(*pc, speed == "full", std::min(remaining,
@@ -429,6 +450,8 @@ int headless(const std::filesystem::path& script) {
                 if (pc->rebootRequested) { pc->boot(pc->floppy ? 0 : 0x80); timing.reset(*pc); }
                 if (speed == "normal") Sleep(1);
             }
+            if (waiting && pc->text().find(text) == std::string::npos)
+                throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": realtime timeout waiting for: " + text);
             std::cout << "Realtime " << speed << ": host="
                 << std::chrono::duration<double>(ExecutionTiming::HostClock::now() - started).count()
                 << "s guest=" << (pc->clock - beforeClock) / ExecutionTiming::PitHz << "s\n";
@@ -468,8 +491,12 @@ int headless(const std::filesystem::path& script) {
             }
         } else if (op == "expect") {
             if (pc->text().find(arg) == std::string::npos) throw std::runtime_error("Screen assertion failed: " + arg);
+        } else if (op == "expect-state") {
+            bool valid = arg == "powered-off" ? pc->powerOffRequested : arg == "graphics" ? !pc->powerOffRequested && pc->vga.graphics()
+                : arg == "text" ? !pc->powerOffRequested && !pc->vga.graphics() : false;
+            if (!valid) throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": state assertion failed: " + arg);
         } else if (op == "key") namedKey(arg);
-        else if (op == "type") {
+        else if (op == "type" || op == "type-paced") {
             for (unsigned char ch : arg) {
                 SHORT vk = VkKeyScanA(char(ch)); unsigned scan = vk == -1 ? 0 : MapVirtualKeyW(uint8_t(vk), MAPVK_VK_TO_VSC);
                 if (!scan || scan > 0x7f) throw std::runtime_error("Cannot map scripted character to a keyboard scan code");
@@ -480,7 +507,13 @@ int headless(const std::filesystem::path& script) {
                 if (vk & 0x400) pc->key(0xb8, 0);
                 if (vk & 0x200) pc->key(0x9d, 0);
                 if (vk & 0x100) pc->key(0xaa, 0);
-                pc->run(50000);
+                if (op == "type") pc->run(50000);
+                else {
+                    ExecutionTiming typing; typing.reset(*pc);
+                    auto deadline = ExecutionTiming::HostClock::now() + std::chrono::milliseconds(100);
+                    while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline)
+                        typing.run(*pc, true, std::chrono::milliseconds(8), stableTiming);
+                }
             }
         } else if (op == "mouse") {
             std::istringstream input(arg);
@@ -497,21 +530,14 @@ int headless(const std::filesystem::path& script) {
         else if (op == "screen") {
             std::ofstream out(std::filesystem::u8path(arg)); out << pc->text();
             if (!out) throw std::runtime_error("Cannot save screen text");
-        } else if (op == "frame") {
-            if (!pc->vga.graphics()) throw std::runtime_error("A graphics frame requires a graphics video mode");
-            unsigned width = pc->vga.width(), height = pc->vga.height();
-            BITMAPFILEHEADER file{}; BITMAPINFOHEADER info{};
-            file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(info); file.bfSize = file.bfOffBits + width * height * 4;
-            info.biSize = sizeof(info); info.biWidth = LONG(width); info.biHeight = -LONG(height);
-            info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
-            std::vector<uint32_t> pixels;
-            if (pc->powerOffRequested) pixels.resize(width * height);
-            else pc->vga.renderGraphics(pixels);
-            std::ofstream out(std::filesystem::u8path(arg), std::ios::binary);
-            out.write(reinterpret_cast<const char*>(&file), sizeof(file)); out.write(reinterpret_cast<const char*>(&info), sizeof(info));
-            out.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(uint32_t)));
-            if (!out) throw std::runtime_error("Cannot save graphics frame");
-        } else throw std::runtime_error("Unknown script operation: " + op);
+        } else if (op == "frame") saveFrame(std::filesystem::u8path(arg));
+        else throw std::runtime_error("Unknown script operation: " + op);
+    } } catch (...) {
+        if (pc->vga.graphics()) {
+            try { saveFrame(std::filesystem::path(script.wstring() + L".failure.bmp")); }
+            catch (const std::exception& e) { std::cerr << "Cannot save failure diagnostics: " << e.what() << '\n'; }
+        }
+        throw;
     }
     if (pc->hard) pc->hard->flush();
     std::cout << pc->text() << "\nHeadless script passed\n"; return 0;
@@ -535,7 +561,10 @@ int application(int argc, wchar_t** argv) {
         std::filesystem::path value = argv[++i];
         if (option == L"--floppy") { pc->floppy = std::make_unique<Disk>(value, true, true); floppySpecified = true; }
         else if (option == L"--hard") { hardPath = value; hardSpecified = true; }
-        else if (option == L"--overlay") { overlayPath = value; overlaySpecified = true; }
+        else if (option == L"--overlay") {
+            if (value.empty()) throw std::runtime_error("--overlay requires a nonempty overlay path");
+            overlayPath = value; overlaySpecified = true;
+        }
         else if (option == L"--cdrom") pc->cdrom.insert(value);
         else if (option == L"--create-hard") {
             unsigned cylinders = 64;

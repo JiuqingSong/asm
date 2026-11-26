@@ -14,6 +14,8 @@ $core = @("$root\cpu.cpp", "$root\386.cpp", "$root\protected.cpp", "$root\video.
 if ($LASTEXITCODE -ne 0) { throw 'Native application build failed' }
 & $Zig @common @core "$root\image.cpp" "$root\tests.cpp" $softfloat -o "$output\native-tests.exe" -luser32 -ladvapi32
 if ($LASTEXITCODE -ne 0) { throw 'Native tests build failed' }
+& $Zig @common '-municode' @core "$root\image.cpp" "$root\test-os-disk.cpp" $softfloat -o "$output\os-disk-check.exe" -luser32 -ladvapi32
+if ($LASTEXITCODE -ne 0) { throw 'OS disk verifier build failed' }
 if ($output -ne (Join-Path $root 'build')) {
     Copy-Item -LiteralPath "$root\build\softfloat-license.txt" -Destination (Join-Path $output 'softfloat-license.txt')
 }
