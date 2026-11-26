@@ -198,6 +198,10 @@ Pc::Pc() {
         else pic[1].pending &= uint8_t(~0x80);
     };
     cpu.resetSignal = [this] { pendingReset = true; };
+    cpu.fpuIrq = [this](bool raised) {
+        if (raised) pic[1].raise(5);
+        else pic[1].pending &= uint8_t(~0x20);
+    };
 }
 void Pc::setModel(CpuModel model) { cpu.setModel(model); keys.clear(); resetAt(); }
 unsigned Pc::columns() const { return cpu.rw(0x40, 0x4a); }
@@ -247,7 +251,7 @@ void Pc::boot(uint8_t drive) {
     std::copy(std::begin(serial), std::end(serial), cpu.mem.begin() + 0xf0840);
     cpu.ww(0, 0x0c * 4, 0x840);
     cpu.ww(0x40, 0, 0x3f8); cpu.wb(0x40, 0x7c, 1);
-    cpu.ww(0x40, 0x10, uint16_t(0x221 | (floppy ? 1 : 0)));
+    cpu.ww(0x40, 0x10, uint16_t(0x221 | (floppy ? 1 : 0) | (cpu.hasFpu() ? 2 : 0)));
     cpu.ww(0x40, 0x13, 640); cpu.ww(0x40, 0x1a, 0x1e); cpu.ww(0x40, 0x1c, 0x1e);
     cpu.ww(0x40, 0x80, 0x1e); cpu.ww(0x40, 0x82, 0x3e);
     cpu.wb(0x40, 0x49, 3); cpu.ww(0x40, 0x4a, 80); cpu.ww(0x40, 0x4c, 4096);
@@ -370,6 +374,8 @@ void Pc::output(uint16_t p, uint8_t v) {
     else if (at() && p == 0x60) keyboardData(v);
     else if (at() && p == 0x70) cmosIndex = v & 127;
     else if (at() && p == 0x71) cmosWrite(v);
+    else if (at() && p == 0xf0) cpu.clearFpuIrq();
+    else if (at() && p == 0xf1) { cpu.clearFpuIrq(); cpu.fpu.init(); }
     else if (at() && p == 0x92) {
         if ((v & 1) && !(fastA20 & 1)) pendingReset = true;
         fastA20 = v; cpu.a20 = v & 2; kbdOutput = uint8_t((kbdOutput & ~2) | (v & 2));

@@ -1,4 +1,5 @@
 #pragma once
+#include "fpu.h"
 #include <array>
 #include <cstdint>
 #include <functional>
@@ -14,6 +15,10 @@ struct CpuFault { uint8_t vector; int code; };
 class Cpu {
 public:
     CpuModel model = CpuModel::I8088;
+    Fpu fpu;
+    bool hasFpu() const { return model == CpuModel::I486; }
+    std::function<void(bool)> fpuIrq;
+    void clearFpuIrq();
     bool a20 = false;
     uint32_t msw = 0xfff0, cr2 = 0, cr3 = 0;
     unsigned cpl = 0;
@@ -100,6 +105,10 @@ private:
     bool taskCommitted = false;
     bool operand32 = false, address32 = false, lockPrefix = false;
     bool eaUsesSp = false;
+    bool fpuIrqRaised = false, fpuIrqInhibited = false;
+    void updateFpuIrq();
+    bool waitFpu();
+    void executeFpu(uint8_t op);
     uint8_t fetch8();
     uint16_t fetch16();
     uint32_t fetch(int size);

@@ -1,4 +1,4 @@
-# C++ 原生 DOS / Windows 3.x 虚拟机（Windows）
+# C++ 原生 DOS / Windows 虚拟机（Windows）
 
 独立的 Windows 桌面程序，不使用浏览器、JavaScript、.NET、DOSBox 或硬件虚拟化。
 现有 TypeScript 网页版保持不变。
@@ -28,6 +28,8 @@ IRQ1 固件通过客户机 `IN 60h` 接收虚拟扫描码；文本、属性与�
 避免绕过 Windows 的虚拟键盘或让 DOS 窗口抓取到空白文本。
 MS-DOS EDIT 已验证在 8088 和 286 上输入文字、通过 Alt+F 菜单保存、退出，
 以及独立冷启动后读回保存的文件。
+Windows 95 已完成真实安装，验证窗口/全屏 DOS 命令、`EXIT` 返回桌面及 APM 自动关机。
+Windows 95 OSR2 完整安装由用户确认。Windows 9x 支持仍属实验性，不代表所有驱动或应用兼容。
 
 ## APM 自动关机
 
@@ -67,7 +69,7 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\run.ps1 -Cpu 286 -HardDisk '.\native\win31.img' -FullSpeed
 # 运行包含增强模式组件的独立 Windows 3.1 安装：
 .\native\run.ps1 -Cpu 386 -HardDisk '.\native\win31-386.img' -FullSpeed
-# 使用实验性 486 整数核心（暂不带 x87）：
+# 使用实验性 486DX 核心（带 x87）：
 .\native\run.ps1 -Cpu 486 -HardDisk '.\native\win31-386.img' -FullSpeed
 # 挂载 ISO（需在客体中加载 ATAPI 光驱驱动和 MSCDEX）：
 .\native\run.ps1 -Cpu 486 -Cdrom 'D:\images\install.iso'
@@ -99,7 +101,7 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
   标题栏显示 **Full speed / Normal speed**；首次运行默认正常速度，以后自动记住选择。
   正常档随 CPU 型号切换：8088 约 0.33 MIPS，286 约 2 MIPS，386 约 4 MIPS，486 约 8 MIPS；标题栏显示当前档位。
   这是指令吞吐量近似值，不代表周期精确的 CPU 主频。
-- **Machine > CPU: 8088 / CPU: 80286 / AT / CPU: 80386 / AT (experimental) / CPU: 80486SX / AT (experimental)**：
+- **Machine > CPU: 8088 / CPU: 80286 / AT / CPU: 80386 / AT (experimental) / CPU: 80486DX / AT (experimental)**：
   停机后选择 CPU；首次运行默认 8088，以后自动记住选择；Windows 3.1 标准模式选择 286，
   增强模式可选择实验性 386 或 486。
   切换型号会重置机器，请先在客体中退出程序。
@@ -445,7 +447,7 @@ READ(10/12)、SEEK、READ TOC、MODE SENSE 和锁盘/退盘；换盘、无介质
 列出原始安装 ISO 的文件，并将 PRECOPY1.CAB 的 1,331,200 字节复制到独立硬盘副本；
 退出虚拟机后解析 FAT16，确认持久化文件与 ISO 原文件逐字节一致。
 Windows 95 OSR2 启动软盘中的 NEC IDE 驱动及 MSCDEX 也已识别光驱。
-这些只证明 DOS 启动环境和光驱读取，不代表 Windows 95/98 已安装或进入桌面。
+这些光驱测试只证明 DOS 启动环境和读取，不代表 Windows 98 已安装或进入桌面。
 当前仍从 A:/C: 启动；未实现 El Torito 光盘启动，请使用启动软盘加载光驱驱动。
 
 ## 386 增强模式开发状态
@@ -492,10 +494,11 @@ LAR/LSL 已支持 32 位结果和适用的 386 系统描述符。调试寄存器
 调试陷阱仍会明确报错，DR4/DR5 不受支持。386 兼容性仍以真实系统和应用回归逐步扩展，
 不能仅凭合成 CPU 测试或一次成功启动宣称所有增强模式功能均已完成。
 
-## 实验性 486 整数核心
+## 实验性 486DX 核心
 
-菜单、`--cpu 486` 和 `run.ps1 -Cpu 486` 提供不带 x87 的 486SX 级别核心；
-`CPUID` 报告 family 4、model 5（SX2），不宣告 FPU、Pentium 或其他未提供的扩展。
+菜单、`--cpu 486` 和 `run.ps1 -Cpu 486` 提供带 x87 的 486DX 级别核心；
+`CPUID` 报告 family 4、model 0（DX）及 FPU 位，不宣告 Pentium 或其他未提供的扩展。
+BIOS 和 CMOS 的设备信息也报告协处理器；8088、286、386 档位仍不提供 FPU。
 386 的寻址、保护模式、分页、VM86、系统门和任务切换路径由 386/486 共享，
 同一套 CPU/系统测试分别在两个型号下运行，原有 386 不会获得 486 专属指令或标志位。
 
@@ -505,7 +508,7 @@ WP 对内核写只读页生效；AM+AC 在 3 级保护模式与 VM86 下产生�
 INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据缓存需要实际清空。
 
 真实 Windows 3.1 / 3.2 已验证增强模式桌面、DOS 全屏/窗口切换、命令与持久化文件写入。
-这只是后续 Windows 95/98 工作的 CPU 底座，尚不代表完整 486 硬件或后续 Windows 安装兼容性。
+这仍不代表完整 486 硬件或所有 Windows 安装兼容性。
 
 ## 边界
 
@@ -517,11 +520,11 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 - 显示使用宿主固定宽度字体绘制 CP437 字符，不模拟可编程 VGA 字形和全部扩展功能。
   图形模式 ROM 的 8×16 点阵由现有内置 8×8 字库纵向扩展，包含可见 ASCII、制表符和方块；
   不是完整的 IBM VGA 字库，缺少的扩展字形不会借用浏览器字体填充。
-- 386/486、虚拟 8086 和 Windows 3.x 增强模式仍属实验支持；不提供更高 CPU、Windows 95 或 x87。
+- 386/486、虚拟 8086、Windows 3.x 增强模式及 Windows 9x 仍属实验支持；不提供更高 CPU。
 - RTC 目前只实现周期中断，不包含完整的闹钟、更新中断和日期时间设置。
 - 支持 DOS 安装和普通命令行程序，不等同于兼容全部 DOS 游戏、驱动或磁盘工具。
 
-## x87 数值底座（尚未接入指令）
+## x87 数学协处理器
 
 已原生编译复用 `vendor/softfloat` 的 8086 特化和 `tools/softfloat/kernel.c`，
 保留与网页版共用的 80 位格式、64 位有效数、24/53/64 位精度控制、
@@ -530,9 +533,19 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 测试覆盖超出 binary64 的精度、舍入中点、64 位整数边界、NaN/无穷、
 异常标志及独立 binary64 运算比对。
 
-此阶段仅完成原生数值运算层；x87 寄存器栈、D8h–DFh 指令、
-环境保存恢复和异常投递尚未接入。CPU 菜单与 CPUID 仍不宣告 FPU，
-不能据此运行需要数学协处理器的程序。
+486DX 已接入八级寄存器栈、标签和控制/状态字、D8h–DFh 指令、整数/BCD 转换、
+实模式及保护模式环境保存恢复。超越函数采用多字整数定点运算，不依赖宿主浮点近似。
+支持 CR0.EM/TS 的 `#NM`、CR0.NE 的 `#MF` 及传统 IRQ13/F0h/F1h 异常路径。
+内存操作遵循分段、分页和对齐检查；跨页写入失败不会部分写入或弹出寄存器栈。
+测试覆盖真实 FPU 探测指令、扩展精度、舍入、94/108 字节保存恢复、
+VM86 缺页后的原子重试及保护模式 SIB 寻址。
+
+未支持的指令编码仍会明确报错；三角函数参数绝对值达到 2^63 时置 C2，
+F2XM1 超出定义域时保留 ST(0)。这不是周期或微码精确的 x87。
+Windows 98 安装器已在硬盘副本上对照验证：旧版本报告缺少数学协处理器，
+新版本在全速运行时通过硬件检查，进入图形安装向导的 Welcome / Continue 页面。
+请选择 **486DX** 和 **Full speed**；正常档的模拟速度可能触发安装器的 66MHz 最低速度检查。
+该验证不等同于 Windows 98 完整安装成功。
 
 ## 文件
 
@@ -544,6 +557,7 @@ INVLPG/cache 操作执行特权检查，但当前没有宿主侧 TLB 或数据�
 - `dma.h/cpp`：8237 DMA 寄存器、8/16 位外设传输、物理总线和终点计数。
 - `fdc.h/cpp`：A: 软驱控制器、命令 FIFO、IRQ6、DMA/PIO、换盘和格式化。
 - `softfloat.h/cpp`、`build-softfloat.ps1`：共享 SoftFloat C 数值内核的原生构建与类型化入口。
+- `fpu.h/cpp`、`fpu-math.h/inl`：x87 指令、寄存器栈、环境及多字定点超越函数。
 - `pc.h/cpp`：设备、BIOS、启动和磁盘映像；磁盘 I/O 使用 Windows API。
 - `video.h/cpp`：VGA 显存、寄存器、调色板和图形像素。
 - `font8x8.h`：从 `src/machine/font8x8.ts` 的 `builtinFont()` 导出的原生 ROM 字形数据。

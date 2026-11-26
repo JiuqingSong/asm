@@ -41,7 +41,10 @@ void Cpu::reset() {
     r.fill(0); s.fill(0); s[CS] = 0xffff; ip = 0;
     msw = supports386() ? 0x10 : 0xfff0; cr2 = cr3 = upperFlags = 0;
     upperR.fill(0); cpl = 0; hiddenSegments = 0;
-    if (model == CpuModel::I486) { msw = 0x60000010; r[DX] = 0x450; }
+    if (model == CpuModel::I486) { msw = 0x60000010; r[DX] = 0x400; }
+    fpuIrqInhibited = false;
+    fpu.init();
+    updateFpuIrq();
     debugRegisters.fill(0); debugRegisters[6] = 0xffff0ff0; debugRegisters[7] = 0x400;
     gdtr = {0, 0xffff}; idtr = {0, 0x3ff}; ldtr = {}; tr = {};
     for (auto& segment : segments) segment = {};
@@ -263,8 +266,68 @@ void Cpu::muldiv(int op, int size) {
     if (size == 1) r[AX] = uint16_t((uint16_t(uint8_t(rem)) << 8) | uint8_t(q));
     else { r[AX] = uint16_t(q); r[DX] = uint16_t(rem); }
 }
+void Cpu::updateFpuIrq() {
+    if (!fpu.pending()) fpuIrqInhibited = false;
+    bool raised = hasFpu() && fpu.pending() && !(msw & 0x20) && !fpuIrqInhibited;
+    if (raised != fpuIrqRaised) {
+        fpuIrqRaised = raised;
+        if (fpuIrq) fpuIrq(raised);
+    }
+}
+void Cpu::clearFpuIrq() {
+    fpuIrqInhibited = true;
+    updateFpuIrq();
+}
+bool Cpu::waitFpu() {
+    if (!fpu.pending()) { waiting = false; return false; }
+    if (msw & 0x20) fault(16);
+    updateFpuIrq();
+    ip = startIp; waiting = true; return true;
+}
+void Cpu::executeFpu(uint8_t op) {
+    auto m = uint8_t((mod << 6) | (reg << 3) | rm);
+    if (!Fpu::noWait(op, m) && waitFpu()) return;
+    bool memory = mod != 3;
+    auto operand = Fpu::memoryOperation(op, uint8_t(reg), operand32);
+    if (!memory) { operand.size = 0; operand.write = false; }
+    if (memory && !operand.size) fault(6);
+    if (!memory) {
+        bool valid = op == 0xd8 || op == 0xdc ||
+            (op == 0xd9 && (m <= 0xd0 || m == 0xe0 || m == 0xe1 || m == 0xe4 || m == 0xe5
+                || (m >= 0xe8 && m <= 0xee) || m >= 0xf0)) ||
+            (op == 0xda && m == 0xe9) || (op == 0xdb && m >= 0xe0 && m <= 0xe4) ||
+            (op == 0xdd && (m < 0xc8 || (m >= 0xd0 && m < 0xf0))) ||
+            (op == 0xde && (m < 0xd0 || m == 0xd9 || m >= 0xe0)) || (op == 0xdf && m == 0xe0);
+        if (!valid) fault(6);
+    }
+    std::vector<uint32_t> addresses(operand.size);
+    if (memory) {
+        checkSegment(eaSeg, eaOff, operand.size, operand.write);
+        auto base = segmentBase(eaSeg) + eaOff;
+        for (unsigned i = 0; i < operand.size; ++i) addresses[i] = translate(base + i, operand.write, false);
+        unsigned alignment = operand.size == 4 || operand.size == 8 ? operand.size
+            : operand.size == 10 ? 2 : operand32 && operand.size > 10 ? 4 : 2;
+        checkAlignment(base, alignment);
+    }
+    FpuContext context;
+    context.read = [&]() {
+            std::vector<uint8_t> bytes(addresses.size());
+            for (unsigned i = 0; i < bytes.size(); ++i) bytes[i] = readPhysical(addresses[i]);
+            return bytes;
+        };
+    context.write = [&](const std::vector<uint8_t>& bytes) {
+            if (bytes.size() != addresses.size()) throw std::runtime_error("Invalid x87 memory result size");
+            for (unsigned i = 0; i < bytes.size(); ++i) writePhysical(addresses[i], bytes[i]);
+        };
+    context.ax = [&](uint16_t value) { r[AX] = value; };
+    context.ip = startIp; context.dp = eaOff; context.cs = s[CS]; context.ds = s[eaSeg];
+    context.operand32 = operand32; context.protectedMode = protectedMode() && !virtual8086();
+    waiting = false; fpu.execute(op, m, context);
+    updateFpuIrq();
+}
 void Cpu::stepInstruction() {
     repContinue = false;
+    updateFpuIrq();
     if (!inhibit && (flags & IF) && irq) {
         int n = irq();
         if (n >= 0) { interrupt(uint8_t(n), -1, false, true); return; }
@@ -362,7 +425,11 @@ void Cpu::execute(uint8_t op) {
     case 0x8d: modrm(); r[reg] = eaOff; return;
     case 0x8e: { modrm(); if (model != CpuModel::I8088 && (reg == CS || reg > 3)) fault(6); auto v = getRM(2); loadSegment(reg & 3, uint16_t(v)); if ((reg & 3) == SS) inhibit = true; return; }
     case 0x8f: { modrm(); auto v = pop(); setRM(2, v); return; }
-    case 0x90: case 0x9b: return;
+    case 0x90: return;
+    case 0x9b:
+        if (model != CpuModel::I8088 && (msw & 10) == 10) fault(7);
+        if (hasFpu()) waitFpu();
+        return;
     case 0x98: r[AX] = uint16_t(int16_t(int8_t(reg8(0)))); return;
     case 0x99: r[DX] = (r[AX] & 0x8000) ? 0xffff : 0; return;
     case 0x9a: { auto off = fetch16(), seg = fetch16(); farJump(seg, off, true); return; }
@@ -402,7 +469,9 @@ void Cpu::execute(uint8_t op) {
     case 0xd7: reg8(0, rbS(overrideSeg >= 0 ? overrideSeg : DS, uint16_t(r[BX] + reg8(0)))); return;
     case 0xd8: case 0xd9: case 0xda: case 0xdb: case 0xdc: case 0xdd: case 0xde: case 0xdf:
         if (model != CpuModel::I8088 && (msw & 12)) fault(7);
-        modrm(); return;
+        if (hasFpu()) { if (lockPrefix) fault(6); modrm(); executeFpu(op); }
+        else modrm();
+        return;
     case 0xe0: case 0xe1: case 0xe2: {
         int d = int8_t(fetch8()); --r[CX];
         if (r[CX] && (op == 0xe2 || (bool(flags & ZF) == (op == 0xe1)))) ip += d; return;

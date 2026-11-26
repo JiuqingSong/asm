@@ -225,8 +225,8 @@ void cpu386Tests(CpuModel model) {
         check(c.r32(AX) == 1 && c.r32(BX) == 0x756e6547 && c.r32(DX) == 0x49656e69 && c.r32(CX) == 0x6c65746e,
             "486 CPUID leaf zero must identify GenuineIntel and the supported leaf range");
         c.r32(AX, 1); run(c, {0x0f,0xa2,0xf4});
-        check(c.r32(AX) == 0x450 && !c.r32(DX) && !c.r32(CX),
-            "486 CPUID must not advertise an x87 or other unavailable instruction-set extensions");
+        check(c.r32(AX) == 0x400 && c.r32(DX) == 1 && !c.r32(CX),
+            "486DX CPUID must advertise the implemented x87 but no unavailable instruction-set extensions");
         c.r32(AX, 0xffffffff); run(c, {0x0f,0xa2,0xf4});
         check(!c.r32(AX) && !c.r32(BX) && !c.r32(CX) && !c.r32(DX), "Unsupported CPUID leaves must return no features");
         c.r32(AX, 0x2000); unsigned reads = 0;
@@ -1194,6 +1194,128 @@ void keyboardProbeTests() {
                 "BIOS modifier handling must distinguish left/right Shift and suppress Caps Lock auto-repeat");
         }
     }
+}
+void x87Tests() {
+    Cpu c; c.setModel(CpuModel::I486);
+    auto run = [&](std::initializer_list<uint8_t> code) {
+        c.halted = c.waiting = false; c.ip = 0x500;
+        std::copy(code.begin(), code.end(), c.mem.begin() + 0x500);
+        for (unsigned i = 0; i < 1000 && !c.halted && !c.waiting; ++i) c.step();
+        check(c.halted || c.waiting, "x87 test program must reach its termination instruction");
+    };
+    c.loadSegment(CS, 0); c.loadSegment(DS, 0); c.loadSegment(SS, 0); c.setFlags(2);
+    run({0xdb,0xe3,0xdf,0xe0,0xd9,0x3e,0,0x20,0xf4});
+    check(c.r[AX] == 0 && c.readWord(0x2000) == 0x037f && c.fpu.tagWord() == 0xffff,
+        "Windows FPU discovery must execute FNINIT, FNSTSW and FNSTCW, not merely advertise CPUID");
+    c.writeDword(0x2000, 1); c.writeDword(0x2004, 0x80000000); c.writeWord(0x2008, 0x3fff);
+    run({0xdb,0x2e,0,0x20,0xd9,0xe8,0xde,0xe9,0xdb,0x3e,0,0x21,0xf4});
+    check(c.readDword(0x2100) == 0 && c.readDword(0x2104) == 0x80000000 && c.readWord(0x2108) == 0x3fc0,
+        "x87 must retain the 64th significand bit beyond binary64 through load, subtract and extended store");
+    c.writeDword(0x2000, 1); c.writeDword(0x2004, 0x200000);
+    run({0xdf,0x2e,0,0x20,0xd9,0xe8,0xde,0xc1,0xdf,0x3e,0,0x21,0xf4});
+    check(c.readDword(0x2100) == 2 && c.readDword(0x2104) == 0x200000,
+        "x87 64-bit integer loads, stack arithmetic and integer stores must remain exact beyond 2^53");
+    c.writeDword(0x2000, 0); c.writeDword(0x2004, 0xbff80000);
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        c.writeWord(0x2200, uint16_t(0x037f | (mode << 10)));
+        run({0xdb,0xe3,0xd9,0x2e,0,0x22,0xdd,0x06,0,0x20,0xdf,0x1e,0,0x21,0xf4});
+        check(int16_t(c.readWord(0x2100)) == (mode < 2 ? -2 : -1) && (c.fpu.statusWord() & 0x20),
+            "FISTP must obey all four control-word rounding modes and expose precision loss");
+    }
+    for (bool wide : {false, true}) {
+        run({0xdb,0xe3,0xd9,0xe8,0xd9,0xee,0xf4});
+        auto top = c.fpu.top; auto tags = c.fpu.tagWord(); auto status = c.fpu.statusWord();
+        unsigned length = wide ? 108 : 94; c.mem[0x2300 + length] = 0x5a;
+        if (wide) run({0x66,0xdd,0x36,0,0x23,0xf4}); else run({0xdd,0x36,0,0x23,0xf4});
+        check(c.fpu.tagWord() == 0xffff && c.fpu.control == 0x037f && c.mem[0x2300 + length] == 0x5a,
+            "FNSAVE must save the correct environment size and reinitialize the FPU without overflowing the buffer");
+        if (wide) run({0x66,0xdd,0x26,0,0x23,0xf4}); else run({0xdd,0x26,0,0x23,0xf4});
+        check(c.fpu.top == top && c.fpu.tagWord() == tags && c.fpu.statusWord() == status
+            && c.fpu.st() == Float80{} && c.fpu.st(1) == (Float80{0x8000000000000000ull,0x3fff}),
+            "FRSTOR must restore TOP, tags, status and all logical stack registers in both environment formats");
+    }
+    run({0xdb,0xe3,0xd8,0xc0,0xf4});
+    check((c.fpu.statusWord() & 0x241) == 0x41 && c.fpu.tag() == 2,
+        "Masked stack underflow must produce indefinite and set invalid/stack flags without a false overflow");
+    c.msw |= 0x20;
+    run({0xdb,0xe3,0xf4});
+    c.fpu.control = 0x037b;
+    run({0xd9,0xe8,0xd9,0xee,0xde,0xf9,0xf4});
+    check(c.fpu.pending() && (c.fpu.statusWord() & 0x8084) == 0x8084 && c.fpu.top == 6,
+        "Unmasked divide-by-zero must set pending status without popping or overwriting the operands");
+    c.onFault = [](CpuFault fault, uint32_t) { throw fault; };
+    bool faulted = false;
+    try { run({0x9b,0xf4}); } catch (const CpuFault& fault) { faulted = fault.vector == 16; }
+    check(faulted && c.ip == 0x500, "CR0.NE must deliver pending x87 exceptions as precise #MF at FWAIT");
+    run({0xdf,0xe0,0xdb,0xe2,0xf4});
+    check((c.r[AX] & 0x8084) == 0x8084 && !c.fpu.pending(),
+        "No-wait status and clear instructions must remain usable while an x87 exception is pending");
+    for (unsigned bits : {4u, 8u}) {
+        c.msw = 0x10 | bits; faulted = false;
+        try { run({0xdb,0xe3,0xf4}); } catch (const CpuFault& fault) { faulted = fault.vector == 7; }
+        check(faulted, "CR0.EM and TS must trap x87 instructions with #NM");
+    }
+    c.msw = 0x1a; faulted = false;
+    try { run({0x9b,0xf4}); } catch (const CpuFault& fault) { faulted = fault.vector == 7; }
+    check(faulted, "FWAIT must honor CR0.MP+TS for lazy FPU switching");
+    c.msw = 0x10; c.onFault = {};
+    run({0xdb,0xe3,0xd9,0xe8,0xf4});
+    c.a20 = true; c.cr3 = 0x10000; c.writeDword(0x10000, 0x11007);
+    for (unsigned page = 0; page < 256; ++page) c.writeDword(0x11000 + page * 4, (page * 4096) | 7);
+    c.writeDword(0x1100c, 0); c.msw = 0x80000011; c.setEflags(0x23002); c.cpl = 3;
+    auto top = c.fpu.top; auto tags = c.fpu.tagWord(); auto value = c.fpu.st();
+    std::fill(c.mem.begin() + 0x2ffa, c.mem.begin() + 0x3004, 0x5a);
+    c.onFault = [](CpuFault fault, uint32_t) { throw fault; }; faulted = false;
+    try { run({0xdb,0x3e,0xfa,0x2f,0xf4}); } catch (const CpuFault& fault) { faulted = fault.vector == 14 && fault.code == 6; }
+    check(faulted && c.cr2 == 0x3000 && c.ip == 0x500 && c.fpu.top == top && c.fpu.tagWord() == tags && c.fpu.st() == value
+        && std::all_of(c.mem.begin() + 0x2ffa, c.mem.begin() + 0x3004, [](uint8_t b) { return b == 0x5a; }),
+        "A VM86 page-crossing x87 store must fault before any memory write or stack pop");
+    c.writeDword(0x1100c, 0x3007); c.step();
+    check(c.fpu.top == ((top + 1) & 7) && c.readWord(0x3002) == 0x3fff,
+        "Retrying the mapped VM86 x87 store must commit the full value and pop exactly once");
+    {
+        Cpu d; d.setModel(CpuModel::I486); d.gdtr = {0x1000, 0x17};
+        d.writeDword(0x1008, 0x0000ffff); d.writeDword(0x100c, 0x00cf9a00);
+        d.writeDword(0x1010, 0x0000ffff); d.writeDword(0x1014, 0x00cf9200);
+        d.loadSegment(CS, 0); d.setFlags(2); d.ip = 0x400;
+        const uint8_t enter[] = {0xea,0,5,8,0};
+        std::copy(std::begin(enter), std::end(enter), d.mem.begin() + 0x400);
+        d.msw = 0x11; d.onFault = [](CpuFault fault, uint32_t) { throw fault; }; d.step();
+        d.loadSegment(DS, 0x10); d.loadSegment(SS, 0x10);
+        d.r32(BX, 0x2000); d.r32(SI, 3);
+        d.writeDword(0x201c, 0x3fc00000); d.writeDword(0x2020, 0x40200000);
+        const uint8_t code[] = {0xdb,0xe3,0xd9,0x44,0xb3,0x10,0xd8,0x44,0xb3,0x14,0xdd,0x5c,0xb3,0x18,0xf4};
+        std::copy(std::begin(code), std::end(code), d.mem.begin() + 0x500);
+        for (unsigned i = 0; i < 16 && !d.halted; ++i) d.step();
+        check(d.halted && d.readDword(0x2024) == 0 && d.readDword(0x2028) == 0x40100000 && d.fpu.tagWord() == 0xffff,
+            "Protected-mode x87 memory arithmetic must honor 32-bit SIB addressing, scaled indices and displacement on load and store");
+    }
+    std::cout << "x87 discovery / extended precision / integer rounding / save-restore / #NM-#MF / paged VM86 atomicity / protected SIB checks passed\n";
+}
+void x87IrqTests(const std::filesystem::path& disk) {
+    Pc p; p.setModel(CpuModel::I486); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
+    auto& c = p.cpu;
+    c.r[AX] = 0; check(c.trap(0x11) && (c.r[AX] & 2), "486DX BIOS equipment must advertise a math coprocessor");
+    c.out(0x70, 0x14); check(c.in(0x71) & 2, "486DX CMOS equipment must agree with the BIOS FPU indication");
+    c.out(0x21, 0xfb); c.out(0xa1, 0xdf);
+    const uint8_t divide[] = {0xdb,0xe3,0xd9,0x2e,0,0x20,0xd9,0xe8,0xd9,0xee,0xde,0xf9,0xf4};
+    auto execute = [&]() {
+        c.loadSegment(CS, 0); c.loadSegment(DS, 0); c.setFlags(2);
+        c.halted = c.waiting = false; c.ip = 0x500; c.writeWord(0x2000, 0x037b);
+        std::copy(std::begin(divide), std::end(divide), c.mem.begin() + 0x500);
+        p.runCpu(100);
+    };
+    execute();
+    check(c.fpu.pending() && c.irq() == 0x75, "Legacy x87 exceptions must reach IRQ13 through the cascaded PICs");
+    c.out(0xf0, 0); c.out(0xa0, 0x20); c.out(0x20, 0x20); p.runCpu(2);
+    check(c.fpu.pending() && c.irq() == -1, "Port F0 must acknowledge the external error latch without clearing x87 status or reasserting IRQ13");
+    execute();
+    check(c.irq() == 0x75, "Clearing and raising a new x87 exception must rearm the legacy error latch");
+    c.out(0xf1, 0); c.out(0xa0, 0x20); c.out(0x20, 0x20);
+    check(!c.fpu.pending() && c.fpu.tagWord() == 0xffff && c.irq() == -1, "Port F1 must reset the coprocessor and clear its IRQ latch");
+    c.msw |= 0x20; execute();
+    check(c.fpu.pending() && c.irq() == -1, "CR0.NE must select native #MF delivery instead of the legacy IRQ13 path");
+    std::cout << "486DX BIOS-CMOS detection / cascaded x87 IRQ13 / F0-F1 error latch / CR0.NE checks passed\n";
 }
 void apmTests(const std::filesystem::path& disk) {
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
@@ -2324,7 +2446,7 @@ void mbrBootstrapTests(const std::filesystem::path& base) {
     std::cout << "Generated MBR / VBR chainload / high-cylinder LBA / fourth slot / DL / invalid metadata checks passed\n";
 }
 void unit() {
-    videoTests(); graphicsBiosTests(); serialTests(); keyboardProbeTests();
+    videoTests(); graphicsBiosTests(); serialTests(); keyboardProbeTests(); x87Tests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
     c.mem[0x100] = 0x54; c.r[SP] = 0x200; c.step();
     check(c.r[SP] == 0x1fe && c.rw(0, 0x1fe) == 0x1fe, "8088 PUSH SP");
@@ -2368,7 +2490,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

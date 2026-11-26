@@ -41,7 +41,7 @@ std::wstring wide(const std::string& value) {
     std::wstring result(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, value.data(), int(value.size()), result.data(), n); return result;
 }
 void title(HWND hwnd) {
-    std::wstring value = pc->cpu.model == CpuModel::I486 ? L"Asm86 native - 80486SX / AT (experimental)"
+    std::wstring value = pc->cpu.model == CpuModel::I486 ? L"Asm86 native - 80486DX / AT (experimental)"
         : pc->cpu.model == CpuModel::I386 ? L"Asm86 native - 80386 / AT (experimental)"
         : pc->at() ? L"Asm86 native - 80286 / AT" : L"Asm86 native - 8088";
     value += L" | A: " + (pc->floppy ? pc->floppy->path.filename().wstring() : L"(empty)");
@@ -595,7 +595,7 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I8088 ? MF_CHECKED : MF_UNCHECKED), Cpu8088, L"CPU: 8088");
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I286 ? MF_CHECKED : MF_UNCHECKED), Cpu286, L"CPU: 80286 / AT");
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I386 ? MF_CHECKED : MF_UNCHECKED), Cpu386, L"CPU: 80386 / AT (experimental)");
-    AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I486 ? MF_CHECKED : MF_UNCHECKED), Cpu486, L"CPU: 80486SX / AT (experimental)");
+    AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I486 ? MF_CHECKED : MF_UNCHECKED), Cpu486, L"CPU: 80486DX / AT (experimental)");
     AppendMenuW(view, MF_STRING, Original, L"Original size");
     AppendMenuW(view, MF_STRING, Maximize, L"Maximize");
     AppendMenuW(menu, MF_POPUP, UINT_PTR(disks), L"Disks");
@@ -869,7 +869,7 @@ int application(int argc, wchar_t** argv) {
             GetWindowTextW(hwnd, caption, int(std::size(caption)));
             if (pc->cpu.model != (selection == Cpu486 ? CpuModel::I486 : selection == Cpu386 ? CpuModel::I386 : CpuModel::I286)
                 || !(GetMenuState(menu, selection, MF_BYCOMMAND) & MF_CHECKED)
-                || !std::wcsstr(caption, selection == Cpu486 ? L"80486SX" : selection == Cpu386 ? L"80386" : L"80286"))
+                || !std::wcsstr(caption, selection == Cpu486 ? L"80486DX" : selection == Cpu386 ? L"80386" : L"80286"))
                 throw std::runtime_error("AT CPU selection did not update the machine, title and menu");
             running = true;
             SendMessageW(hwnd, WM_KEYDOWN, VK_SHIFT, LPARAM(0x2a << 16));

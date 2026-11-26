@@ -342,9 +342,9 @@ void Cpu::system386() {
     if (op == 0xa2) {
         if (model != CpuModel::I486 || lockPrefix) fault(6);
         auto leaf = r32(AX);
-        r32(AX, leaf == 0 ? 1 : leaf == 1 ? 0x450 : 0);
+        r32(AX, leaf == 0 ? 1 : leaf == 1 ? 0x400 : 0);
         r32(BX, leaf == 0 ? 0x756e6547 : 0);
-        r32(DX, leaf == 0 ? 0x49656e69 : 0);
+        r32(DX, leaf == 0 ? 0x49656e69 : leaf == 1 ? 1 : 0);
         r32(CX, leaf == 0 ? 0x6c65746e : 0);
         return;
     }
