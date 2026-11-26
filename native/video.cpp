@@ -162,6 +162,39 @@ uint32_t Vga::color(uint8_t index) const {
     unsigned off = (index & pelMask) * 3;
     return (uint32_t(dac[off] * 255 / 63) << 16) | (uint32_t(dac[off + 1] * 255 / 63) << 8) | (dac[off + 2] * 255 / 63);
 }
+void Vga::renderGraphics(std::vector<uint32_t>& pixels) const {
+    if (!graphics()) throw std::runtime_error("A graphics frame requires a graphics video mode");
+    const auto columns = width(), rows = height();
+    pixels.resize(columns * rows);
+    if (blanked()) { std::fill(pixels.begin(), pixels.end(), 0); return; }
+    const bool indexed = indexed256();
+    std::array<uint32_t, 256> palette{};
+    for (unsigned i = 0; i < (indexed ? 256u : 16u); ++i)
+        palette[i] = color(indexed ? uint8_t(i) : paletteIndex(uint8_t(i)));
+    const unsigned start = (unsigned(crtc[12]) << 8) | crtc[13], stride = crtc[0x13] * 2;
+    for (unsigned y = 0; y < rows; ++y) {
+        auto* row = pixels.data() + y * columns;
+        const auto address = start + y * stride;
+        if (indexed) {
+            for (unsigned x = 0; x < columns; x += 4) {
+                auto offset = (address + x / 4) & 65535;
+                for (unsigned plane = 0; plane < 4; ++plane)
+                    row[x + plane] = palette[planes[plane][offset]];
+            }
+        } else {
+            for (unsigned x = 0; x < columns; x += 8) {
+                auto offset = (address + x / 8) & 65535;
+                const auto p0 = planes[0][offset], p1 = planes[1][offset], p2 = planes[2][offset], p3 = planes[3][offset];
+                for (unsigned bit = 0; bit < 8; ++bit) {
+                    unsigned shift = 7 - bit;
+                    auto index = ((p0 >> shift) & 1) | (((p1 >> shift) & 1) << 1)
+                        | (((p2 >> shift) & 1) << 2) | (((p3 >> shift) & 1) << 3);
+                    row[x + bit] = palette[index];
+                }
+            }
+        }
+    }
+}
 uint8_t Vga::input(uint16_t port) {
     switch (port) {
     case 0x3c0: return attrAddress;

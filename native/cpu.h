@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <type_traits>
 #include <vector>
 
 namespace asm86 {
@@ -106,6 +107,8 @@ private:
     bool operand32 = false, address32 = false, lockPrefix = false;
     bool eaUsesSp = false;
     bool fpuIrqRaised = false, fpuIrqInhibited = false;
+    uint32_t busAddress(uint32_t address) const;
+    const uint8_t* physicalRam(uint32_t address, unsigned size) const;
     void updateFpuIrq();
     bool waitFpu();
     void executeFpu(uint8_t op);
@@ -113,6 +116,7 @@ private:
     uint16_t fetch16();
     uint32_t fetch(int size);
     uint32_t fetch32();
+    uint32_t fetchWide(unsigned size);
     void modrm();
     uint32_t getReg(int size, int i) const;
     void setReg(int size, int i, uint32_t value);
@@ -167,6 +171,8 @@ private:
     uint32_t readSystem(uint32_t address, unsigned size);
     void writeSystem(uint32_t address, uint32_t value, unsigned size);
     uint32_t translate(uint32_t address, bool write, bool supervisor);
+    template<bool Operand> uint32_t translatePage(uint32_t address, bool write, std::conditional_t<Operand, bool*, bool> access);
+    bool translateOperand(uint32_t address, unsigned size, bool write, std::array<uint32_t, 4>& physical);
     void checkAlignment(uint32_t address, unsigned size) const;
     uint32_t offsetPlus(uint32_t offset, unsigned delta) const;
     [[noreturn]] static void fault(uint8_t vector, int code = -1);

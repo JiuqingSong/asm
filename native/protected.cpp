@@ -37,9 +37,11 @@ uint16_t Cpu::rwS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 2, false);
     auto base = segmentBase(segment);
     if (supports386()) {
-        auto low = translate(base + offset, false, false), high = translate(base + offset + 1, false, false);
+        std::array<uint32_t, 4> physical{};
+        bool contiguous = translateOperand(base + offset, 2, false, physical);
         checkAlignment(base + offset, 2);
-        return readPhysical(low) | (uint16_t(readPhysical(high)) << 8);
+        if (contiguous) return readWord(physical[0]);
+        return readPhysical(physical[0]) | (uint16_t(readPhysical(physical[1])) << 8);
     }
     return readPhysical(base + offset) | (uint16_t(readPhysical(base + uint16_t(offset + 1))) << 8);
 }
@@ -51,9 +53,10 @@ void Cpu::wbS(int segment, uint32_t offset, uint8_t value) {
 void Cpu::wwS(int segment, uint32_t offset, uint16_t value) {
     checkSegment(segment, offset, 2, true); auto base = segmentBase(segment);
     if (supports386()) {
-        auto low = translate(base + offset, true, false), high = translate(base + offset + 1, true, false);
+        std::array<uint32_t, 4> physical{};
+        translateOperand(base + offset, 2, true, physical);
         checkAlignment(base + offset, 2);
-        writePhysical(low, uint8_t(value)); writePhysical(high, uint8_t(value >> 8)); return;
+        writePhysical(physical[0], uint8_t(value)); writePhysical(physical[1], uint8_t(value >> 8)); return;
     }
     writePhysical(base + offset, uint8_t(value)); writePhysical(base + uint16_t(offset + 1), uint8_t(value >> 8));
 }

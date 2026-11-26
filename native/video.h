@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <vector>
 
 namespace asm86 {
 class Vga {
@@ -21,6 +22,7 @@ public:
     void pixel(unsigned x, unsigned y, uint8_t color, bool exclusiveOr = false);
     uint8_t paletteIndex(uint8_t color) const;
     uint32_t color(uint8_t index) const;
+    void renderGraphics(std::vector<uint32_t>& pixels) const;
     bool blanked() const { return (seq[1] & 0x20) || !(attrAddress & 0x20); }
     uint8_t mode = 3;
     std::array<uint8_t, 8> seq{};

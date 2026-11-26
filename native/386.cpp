@@ -10,27 +10,72 @@ void Cpu::setEflags(uint32_t value) {
     setFlags(uint16_t(value));
     upperFlags = value & (model == CpuModel::I486 ? 0x270000u : supports386() ? 0x30000u : 0);
 }
-uint32_t Cpu::fetch32() { auto low = fetch16(); return low | (uint32_t(fetch16()) << 16); }
-uint32_t Cpu::readDword(uint32_t address) const { return readWord(address) | (uint32_t(readWord(address + 2)) << 16); }
+uint32_t Cpu::fetch32() { return fetchWide(4); }
 void Cpu::writeDword(uint32_t address, uint32_t value) { writeWord(address, uint16_t(value)); writeWord(address + 2, uint16_t(value >> 16)); }
-uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
-    if (!supports386() || !(msw & 0x80000000u)) return address;
+template<bool Operand>
+uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Operand, bool*, bool> access) {
+    if (!supports386() || !(msw & 0x80000000u)) {
+        if constexpr (Operand) *access = true;
+        return address;
+    }
+    // Both specializations fit the register ABI; scalar walks need no operand guard or out-parameter.
+    bool supervisor = false;
+    if constexpr (!Operand) supervisor = access;
     const bool user = !supervisor && (cpl == 3 || virtual8086());
     auto missing = [&](bool present) {
         cr2 = address; fault(14, (present ? 1 : 0) | (write ? 2 : 0) | (user ? 4 : 0));
     };
     auto directory = (cr3 & 0xfffff000u) + (address >> 22) * 4;
+    bool ordinary = false;
+    if constexpr (Operand) ordinary = !onWrite && (!mmioWrite || mmioRead) && physicalRam(directory, 4);
     auto pde = readDword(directory);
     if (!(pde & 1)) missing(false);
     auto table = (pde & 0xfffff000u) + ((address >> 12) & 1023) * 4;
+    if constexpr (Operand) ordinary = ordinary && physicalRam(table, 4);
     auto pte = readDword(table);
     if (!(pte & 1)) missing(false);
     if (user && (!(pde & pte & 4) || (write && !(pde & pte & 2)))) missing(true);
     if (write && !user && model == CpuModel::I486 && (msw & 0x10000) && !(pde & pte & 2)) missing(true);
+    if constexpr (Operand) *access = ordinary;
     if (!(pde & 0x20)) writeDword(directory, pde | 0x20);
     auto updated = pte | 0x20 | (write ? 0x40 : 0);
     if (updated != pte) writeDword(table, updated);
     return (pte & 0xfffff000u) | (address & 4095);
+}
+uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
+    return translatePage<false>(address, write, supervisor);
+}
+bool Cpu::translateOperand(uint32_t address, unsigned size, bool write, std::array<uint32_t, 4>& physical) {
+    bool stable = false;
+    bool singlePage = (address & 4095) <= 4096 - size;
+    physical[0] = singlePage ? translatePage<true>(address, write, &stable) : translate(address, write, false);
+    // Reuse only this operand's walk: MMIO page tables and write observers may change the next byte's mapping.
+    for (unsigned i = 1; i < size; ++i)
+        physical[i] = stable ? physical[0] + i : translate(address + i, write, false);
+    return stable;
+}
+uint32_t Cpu::fetchWide(unsigned size) {
+    auto linear = segmentBase(CS) + ip;
+    const auto& code = segments[CS];
+    if (supports386() && ip - startIp <= 15 - size && uint64_t(ip) + size - 1 <= code.limit
+        && (code.access & 12) != 4 && (linear & 4095) <= 4096 - size) {
+        checkSegment(CS, ip, size, false, true);
+        bool stable = false;
+        auto physical = translatePage<true>(linear, false, &stable);
+        if (stable) {
+            if (auto bytes = physicalRam(physical, size)) {
+                uint32_t value = 0;
+                for (unsigned i = 0; i < size; ++i) value |= uint32_t(bytes[i]) << (i * 8);
+                ip += size; return value;
+            }
+        }
+        auto value = uint32_t(readPhysical(physical)); ++ip;
+        for (unsigned i = 1; i < size; ++i) value |= uint32_t(fetch8()) << (i * 8);
+        return value;
+    }
+    uint32_t value = 0;
+    for (unsigned i = 0; i < size; ++i) value |= uint32_t(fetch8()) << (i * 8);
+    return value;
 }
 uint8_t Cpu::readLinear(uint32_t address, bool supervisor) { return readPhysical(translate(address, false, supervisor)); }
 void Cpu::writeLinear(uint32_t address, uint8_t value, bool supervisor) { writePhysical(translate(address, true, supervisor), value); }
@@ -56,8 +101,9 @@ uint32_t Cpu::readSegment(int segment, uint32_t offset, unsigned size) {
     checkSegment(segment, offset, size, false);
     auto base = segmentBase(segment); uint32_t value = 0;
     std::array<uint32_t, 4> physical{};
-    for (unsigned i = 0; i < size; ++i) physical[i] = translate(base + offset + i, false, false);
+    bool contiguous = translateOperand(base + offset, size, false, physical);
     checkAlignment(base + offset, size);
+    if (contiguous) return readDword(physical[0]);
     for (unsigned i = 0; i < size; ++i) value |= uint32_t(readPhysical(physical[i])) << (i * 8);
     return value;
 }
@@ -67,7 +113,7 @@ void Cpu::writeSegment(int segment, uint32_t offset, uint32_t value, unsigned si
     if (size != 4) throw std::runtime_error("Invalid CPU memory operand size");
     checkSegment(segment, offset, size, true);
     std::array<uint32_t, 4> physical{};
-    for (unsigned i = 0; i < size; ++i) physical[i] = translate(segmentBase(segment) + offset + i, true, false);
+    translateOperand(segmentBase(segment) + offset, size, true, physical);
     checkAlignment(segmentBase(segment) + offset, size);
     for (unsigned i = 0; i < size; ++i) writePhysical(physical[i], uint8_t(value >> (i * 8)));
 }

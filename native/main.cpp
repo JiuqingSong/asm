@@ -113,25 +113,36 @@ void render(HDC target, int width, int height) {
     auto v = viewport(width, height, int(pc->vga.width()), int(pc->vga.height()));
     static std::vector<uint32_t> pixels;
     if (graphics) {
-        pixels.resize(pc->vga.width() * pc->vga.height());
-        for (unsigned y = 0; y < pc->vga.height(); ++y) for (unsigned x = 0; x < pc->vga.width(); ++x) {
-            auto color = pc->vga.pixel(x, y);
-            auto index = pc->vga.indexed256() ? color : pc->vga.paletteIndex(color);
-            pixels[y * pc->vga.width() + x] = pc->vga.blanked() ? 0 : pc->vga.color(index);
-        }
+        pc->vga.renderGraphics(pixels);
     } else {
         int cellWidth = 8;
         SetBkMode(back, OPAQUE);
-        auto palette = [](uint8_t index) {
-            auto rgb = pc->vga.color(pc->vga.paletteIndex(index));
-            return pc->vga.blanked() ? RGB(0,0,0) : RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
-        };
+        std::array<COLORREF, 16> palette{};
+        for (unsigned i = 0; i < palette.size(); ++i) {
+            auto rgb = pc->vga.color(pc->vga.paletteIndex(uint8_t(i)));
+            palette[i] = pc->vga.blanked() ? RGB(0,0,0) : RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+        }
+        std::array<wchar_t, 80> text{};
+        std::array<uint8_t, 80> attributes{};
+        std::array<int, 80> advances{};
+        advances.fill(cellWidth);
         const unsigned base = page * 4096;
-        for (unsigned y = 0; y < 25; ++y) for (unsigned x = 0; x < cols; ++x) {
-            uint8_t ch = pc->vga.textByte(base + (y * cols + x) * 2), attr = pc->vga.textByte(base + (y * cols + x) * 2 + 1);
-            SetTextColor(back, palette(attr & 15)); SetBkColor(back, palette((attr >> 4) & 7));
-            RECT cell{int(x) * cellWidth, int(y) * 16, int(x + 1) * cellWidth, int(y + 1) * 16};
-            ExtTextOutW(back, cell.left, cell.top, ETO_OPAQUE | ETO_CLIPPED, &cell, &glyphs[ch], 1, nullptr);
+        for (unsigned y = 0; y < 25; ++y) {
+            for (unsigned x = 0; x < cols; ++x) {
+                text[x] = glyphs[pc->vga.textByte(base + (y * cols + x) * 2)];
+                attributes[x] = pc->vga.textByte(base + (y * cols + x) * 2 + 1);
+            }
+            for (unsigned x = 0; x < cols;) {
+                unsigned end = x + 1;
+                while (end < cols && attributes[end] == attributes[x]) ++end;
+                auto attr = attributes[x];
+                if (SetTextColor(back, palette[attr & 15]) == CLR_INVALID || SetBkColor(back, palette[(attr >> 4) & 7]) == CLR_INVALID)
+                    throw std::runtime_error("Cannot set DOS text colors");
+                RECT area{int(x) * cellWidth, int(y) * 16, int(end) * cellWidth, int(y + 1) * 16};
+                if (!ExtTextOutW(back, area.left, area.top, ETO_OPAQUE | ETO_CLIPPED, &area, text.data() + x, end - x, advances.data()))
+                    throw std::runtime_error("Cannot render DOS text");
+                x = end;
+            }
         }
         unsigned pos = pc->cursor(), x = pos & 255, y = pos >> 8;
         auto shape = pc->cpu.rw(0x40, 0x60);
@@ -471,11 +482,9 @@ int headless(const std::filesystem::path& script) {
             file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(info); file.bfSize = file.bfOffBits + width * height * 4;
             info.biSize = sizeof(info); info.biWidth = LONG(width); info.biHeight = -LONG(height);
             info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
-            std::vector<uint32_t> pixels(width * height);
-            if (!pc->powerOffRequested && !pc->vga.blanked()) for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
-                auto color = pc->vga.pixel(x, y);
-                pixels[y * width + x] = pc->vga.color(pc->vga.indexed256() ? color : pc->vga.paletteIndex(color));
-            }
+            std::vector<uint32_t> pixels;
+            if (pc->powerOffRequested) pixels.resize(width * height);
+            else pc->vga.renderGraphics(pixels);
             std::ofstream out(std::filesystem::u8path(arg), std::ios::binary);
             out.write(reinterpret_cast<const char*>(&file), sizeof(file)); out.write(reinterpret_cast<const char*>(&info), sizeof(info));
             out.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(uint32_t)));
@@ -721,6 +730,59 @@ int application(int argc, wchar_t** argv) {
         original(hwnd); GetClientRect(hwnd, &rect);
         if (IsZoomed(hwnd) || rect.right != 640 || rect.bottom != 400) throw std::runtime_error("Original-size restore failed");
         std::cout << "Native UI maximize / scaled render / original-size checks passed\n";
+        {
+            auto referenceDc = CreateCompatibleDC(back);
+            auto referenceImage = CreateCompatibleBitmap(back, 640, 400);
+            if (!referenceDc || !referenceImage) throw std::runtime_error("Cannot create text-run reference buffer");
+            auto previousImage = SelectObject(referenceDc, referenceImage);
+            auto previousFont = SelectObject(referenceDc, font);
+            SetBkMode(referenceDc, OPAQUE);
+            auto capture = [&](HDC dc, HBITMAP image, HGDIOBJ previous) {
+                BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+                info.bmiHeader.biWidth = 640; info.bmiHeader.biHeight = -400;
+                info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+                std::vector<uint32_t> pixels(640 * 400);
+                SelectObject(dc, previous);
+                auto rows = GetDIBits(dc, image, 0, 400, pixels.data(), &info, DIB_RGB_COLORS);
+                SelectObject(dc, image);
+                if (rows != 400) throw std::runtime_error("Cannot capture text-run comparison");
+                return pixels;
+            };
+            for (unsigned cols : {80u, 40u}) for (unsigned pattern = 0; pattern < 5; ++pattern) {
+                pc->vga.setMode(cols == 80 ? 3 : 1);
+                pc->cpu.ww(0x40, 0x4a, uint16_t(cols)); pc->cpu.wb(0x40, 0x62, 1);
+                pc->cpu.ww(0x40, 0x60, 0x2000);
+                if (pattern == 3) {
+                    pc->vga.attr[1] = 4; pc->vga.attr[0x12] = 5; pc->vga.output(0x3c6, 0x53);
+                    pc->vga.output(0x3c8, 0);
+                    for (unsigned i = 0; i < 768; ++i) pc->vga.output(0x3c9, uint8_t((i * 13 + 7) & 63));
+                }
+                if (pattern == 4) pc->vga.seq[1] |= 0x20;
+                RECT area{0,0,640,400};
+                FillRect(back, &area, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+                FillRect(referenceDc, &area, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+                for (unsigned y = 0; y < 25; ++y) for (unsigned x = 0; x < cols; ++x) {
+                    auto ch = uint8_t(y * cols + x);
+                    auto attr = uint8_t(pattern == 0 ? 0x1f : pattern == 1 ? y * 11 + x / 7 : y * cols + x);
+                    pc->cpu.ww(0xb800, uint16_t(4096 + (y * cols + x) * 2), ch | (uint16_t(attr) << 8));
+                    auto color = [&](uint8_t index) {
+                        auto rgb = pc->vga.color(pc->vga.paletteIndex(index));
+                        return pc->vga.blanked() ? RGB(0,0,0) : RGB((rgb >> 16) & 255, (rgb >> 8) & 255, rgb & 255);
+                    };
+                    SetTextColor(referenceDc, color(attr & 15)); SetBkColor(referenceDc, color((attr >> 4) & 7));
+                    RECT cell{int(x) * 8,int(y) * 16,int(x + 1) * 8,int(y + 1) * 16};
+                    if (!ExtTextOutW(referenceDc, cell.left, cell.top, ETO_OPAQUE | ETO_CLIPPED, &cell, &glyphs[ch], 1, nullptr))
+                        throw std::runtime_error("Cannot draw per-cell text reference");
+                }
+                auto target = GetDC(hwnd); render(target, 640, 400); ReleaseDC(hwnd, target);
+                if (capture(back, bitmap, oldBitmap) != capture(referenceDc, referenceImage, previousImage))
+                    throw std::runtime_error("Batched text differs from per-cell glyphs, attributes, palette or blanking");
+            }
+            SelectObject(referenceDc, previousFont); SelectObject(referenceDc, previousImage);
+            DeleteObject(referenceImage); DeleteDC(referenceDc);
+            pc->vga.setMode(3); pc->cpu.ww(0x40, 0x4a, 80); pc->cpu.wb(0x40, 0x62, 0);
+        }
+        std::cout << "Text runs / all CP437 glyphs / 40-80 columns / attributes / active page / live palette / blanking pixel checks passed\n";
         for (auto mode : {0x13, 0x12}) {
             pc->cpu.r[AX] = uint16_t(mode); pc->cpu.trap(0x10);
             for (unsigned y = 0; y < 16; ++y) for (unsigned x = 0; x < 16; ++x) {

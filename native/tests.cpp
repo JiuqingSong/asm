@@ -16,6 +16,313 @@
 using namespace asm86;
 namespace {
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+void referenceGraphics(const Vga& vga, std::vector<uint32_t>& pixels) {
+    auto width = vga.width(), height = vga.height();
+    pixels.resize(width * height);
+    for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
+        auto color = vga.pixel(x, y);
+        pixels[y * width + x] = vga.blanked() ? 0 : vga.color(vga.indexed256() ? color : vga.paletteIndex(color));
+    }
+}
+void seedGraphics(Vga& vga, uint8_t mode) {
+    vga.setMode(mode);
+    auto memoryMode = vga.seq[4];
+    vga.seq[4] = 6;
+    for (unsigned plane = 0; plane < 4; ++plane) {
+        vga.seq[2] = uint8_t(1u << plane);
+        for (unsigned offset = 0; offset < 65536; ++offset)
+            vga.write(0xa0000 + offset, uint8_t((offset * (plane * 2 + 1)) ^ (offset >> 8) ^ (plane * 73)));
+    }
+    vga.seq[4] = memoryMode; vga.seq[2] = 15;
+}
+void graphicsFrameTests() {
+    Vga vga;
+    std::vector<uint32_t> expected, actual;
+    auto verify = [&]() {
+        referenceGraphics(vga, expected); vga.renderGraphics(actual);
+        check(actual == expected, "Bulk graphics rendering must match every reference pixel and palette entry");
+    };
+    for (uint8_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
+        seedGraphics(vga, mode); verify();
+        vga.crtc[12] = 0xff; vga.crtc[13] = 0xfd; vga.crtc[0x13] = 255; verify();
+        vga.attr[0x12] = 5; vga.attr[0x10] |= 0x80; vga.attr[0x14] = 0x0b;
+        for (unsigned i = 0; i < 16; ++i) vga.attr[i] = uint8_t(15 - i);
+        vga.output(0x3c6, 0x53); vga.output(0x3c8, 0);
+        for (unsigned i = 0; i < 768; ++i) vga.output(0x3c9, uint8_t((i * 13 + 7) & 63));
+        verify();
+        vga.gc[5] ^= 0x40; verify();
+        vga.crtc[1] = 0; vga.crtc[9] = 0x83; verify();
+        vga.seq[1] |= 0x20; verify();
+        check(std::all_of(actual.begin(), actual.end(), [](uint32_t color) { return !color; }),
+            "Sequencer blanking must clear the entire frame, including a reused pixel buffer");
+        vga.seq[1] &= ~0x20; verify();
+        vga.input(0x3da); vga.output(0x3c0, 0); verify();
+        check(std::all_of(actual.begin(), actual.end(), [](uint32_t color) { return !color; }),
+            "Attribute-controller blanking must clear the entire frame");
+        vga.input(0x3da); vga.output(0x3c0, 0x20); verify();
+    }
+    vga.setMode(3);
+    bool rejected = false;
+    try { vga.renderGraphics(actual); } catch (const std::runtime_error&) { rejected = true; }
+    check(rejected, "Graphics rendering must explicitly reject text mode");
+    std::cout << "Bulk VGA frames / all pixels / CRTC wrap-stride / live palette / plane-PEL masks / blanking checks passed\n";
+}
+void videoBenchmarks() {
+    constexpr unsigned frames = 30;
+    for (uint8_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
+        Vga vga; seedGraphics(vga, mode);
+        std::vector<uint32_t> pixels;
+        std::array<double, 5> seconds{};
+        uint64_t expected = 0;
+        for (unsigned sample = 0; sample < seconds.size(); ++sample) {
+            vga.renderGraphics(pixels);
+            auto start = ExecutionTiming::HostClock::now();
+            for (unsigned i = 0; i < frames; ++i) vga.renderGraphics(pixels);
+            seconds[sample] = std::chrono::duration<double>(ExecutionTiming::HostClock::now() - start).count();
+            uint64_t checksum = 14695981039346656037ull;
+            for (auto pixel : pixels) { checksum ^= pixel; checksum *= 1099511628211ull; }
+            if (sample) check(checksum == expected, "Video benchmark frame must be repeatable");
+            expected = checksum;
+        }
+        std::sort(seconds.begin(), seconds.end());
+        std::cout << "VGA-mode=" << unsigned(mode) << ' ' << vga.width() << 'x' << vga.height()
+            << " median-ms/frame=" << seconds[2] * 1000 / frames
+            << " min-ms/frame=" << seconds.front() * 1000 / frames
+            << " max-ms/frame=" << seconds.back() * 1000 / frames << " checksum=" << expected << '\n';
+    }
+}
+void physicalReadTests() {
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
+        Cpu c; c.setModel(model);
+        for (size_t i = 0; i < c.mem.size(); ++i) c.mem[i] = uint8_t(i ^ (i >> 12) ^ (i >> 20));
+        for (bool enabled : {false, true}) {
+            c.a20 = enabled;
+            for (uint32_t address : {0x123u,0xffdu,0xfffu,0xffffdu,0xfffffu,0x100000u,0x1fffffu,
+                0xfffffdu,0xffffffu,0x1000000u,0xfffeffffu,0xffff0000u,0xfffffffdu,0xffffffffu}) {
+                uint32_t expected = 0;
+                for (unsigned i = 0; i < 4; ++i) expected |= uint32_t(c.readPhysical(address + i)) << (i * 8);
+                check(c.readWord(address) == uint16_t(expected) && c.readDword(address) == expected,
+                    "Wide physical reads must preserve wrapping, A20, RAM bounds and reset-ROM aliases");
+            }
+        }
+        c.mem.resize(0x3003); c.mem[0x3002] = 0x12;
+        check(c.readDword(0x3002) == 0xffffff12u, "Wide reads must not overrun a partial RAM page");
+        c.mem.resize(0x4000); c.mem[0x3000] = 0x11; c.mem[0x3003] = 0x44;
+        c.mmioStart = 0x3001; c.mmioEnd = 0x3003;
+        std::vector<uint32_t> reads;
+        c.mmioRead = [&](uint32_t address) { reads.push_back(address); return uint8_t(address == 0x3001 ? 0xaa : 0x55); };
+        check(c.readDword(0x3000) == 0x4455aa11 && reads == std::vector<uint32_t>{0x3001,0x3002},
+            "Wide reads overlapping MMIO must invoke every device byte read in address order");
+        reads.clear();
+        check(c.readWord(0x3001) == 0x55aa && reads == std::vector<uint32_t>{0x3001,0x3002},
+            "Word reads wholly inside MMIO must retain device side effects");
+    }
+}
+void operandPagingTests() {
+    constexpr uint32_t directory = 0x10000, entry = 0x11020;
+    auto machine = [&]() {
+        Cpu c; c.setModel(CpuModel::I486); c.a20 = true;
+        c.msw |= 1; c.setEflags(0x23002); c.cpl = 3; c.loadSegment(DS, 0);
+        c.cr3 = directory; c.writeDword(directory, 0x11007); c.writeDword(entry, 0x30007);
+        c.msw |= 0x80000000u;
+        return c;
+    };
+    for (unsigned size : {2u, 4u}) {
+        auto c = machine();
+        c.mem[0x30000] = 0xa5; c.mem[0x30005] = 0x5a;
+        c.writeDword(0x30001, 0x55443322);
+        check(c.readSegment(DS, 0x8001, size) == (size == 2 ? 0x3322u : 0x55443322u)
+            && c.readDword(directory) == 0x11027 && c.readDword(entry) == 0x30027,
+            "Same-page operands must set accessed bits and preserve unaligned little-endian reads");
+        c.writeSegment(DS, 0x8001, 0x88776655, size);
+        check(c.readSegment(DS, 0x8001, size) == (size == 2 ? 0x6655u : 0x88776655u)
+            && c.readDword(entry) == 0x30067 && c.mem[0x30000] == 0xa5 && c.mem[0x30005] == 0x5a,
+            "Same-page stores must set dirty bits without changing neighboring bytes");
+        c.writeDword(entry, 0x40007); c.writeDword(0x40001, 0x12345678);
+        check(c.readSegment(DS, 0x8001, size) == (size == 2 ? 0x5678u : 0x12345678u),
+            "Operand translations must not survive direct guest page-table changes");
+        c.writeDword(entry, 0x40005);
+        bool denied = false;
+        try { c.writeSegment(DS, 0x8001, 0, size); }
+        catch (const CpuFault& f) { denied = f.vector == 14 && f.code == 7 && c.cr2 == 0x8001; }
+        check(denied && c.readDword(0x40001) == 0x12345678, "Cached-looking same-page stores must still enforce current page permissions");
+
+        c = machine();
+        const uint32_t offset = size == 2 ? 0x8fff : 0x8ffe;
+        c.writeDword(entry + 4, 0x50007);
+        c.mem[0x30ffe] = 0x11; c.mem[0x30fff] = 0x22; c.mem[0x50000] = 0x33; c.mem[0x50001] = 0x44;
+        check(c.readSegment(DS, offset, size) == (size == 2 ? 0x3322u : 0x44332211u),
+            "Cross-page operands must honor independently mapped, noncontiguous physical pages");
+        c.writeDword(entry + 4, 0);
+        denied = false;
+        try { c.writeSegment(DS, offset, 0xaabbccdd, size); }
+        catch (const CpuFault& f) { denied = f.vector == 14 && f.code == 6 && c.cr2 == 0x9000; }
+        check(denied && c.mem[0x30ffe] == 0x11 && c.mem[0x30fff] == 0x22,
+            "Cross-page stores must fault at the missing byte before modifying any operand byte");
+        unsigned reads = 0;
+        c.mmioStart = 0x30000; c.mmioEnd = 0x31000;
+        c.mmioRead = [&](uint32_t) { ++reads; return uint8_t(0); };
+        denied = false;
+        try { c.readSegment(DS, offset, size); }
+        catch (const CpuFault& f) { denied = f.vector == 14 && f.code == 4 && c.cr2 == 0x9000; }
+        check(denied && !reads, "Cross-page reads must precheck all mappings before consuming MMIO input");
+    }
+    {
+        auto c = machine(); c.writeDword(directory, 0x11027);
+        unsigned reads = 0;
+        c.mmioStart = entry; c.mmioEnd = entry + 4;
+        c.mmioRead = [&](uint32_t address) {
+            uint32_t pte = (0x30000 + (reads / 4) * 4096) | 0x27;
+            ++reads; return uint8_t(pte >> ((address - entry) * 8));
+        };
+        for (unsigned i = 0; i < 4; ++i) c.mem[0x30000 + i * 4096 + i] = uint8_t(0x11 * (i + 1));
+        check(c.readSegment(DS, 0x8000, 4) == 0x44332211 && reads == 16,
+            "MMIO-backed page tables must retain every byte's page walk and mapping side effects");
+    }
+    for (bool observer : {false, true}) {
+        auto c = machine(); c.writeDword(directory, 0x11027);
+        c.mem[0x30000] = 0x11; c.mem[0x40001] = 0x22; c.mem[0x40002] = 0x33; c.mem[0x40003] = 0x44;
+        unsigned writes = 0;
+        if (observer) {
+            c.onWrite = [&](uint32_t address) {
+                if (address >= entry && address < entry + 4) {
+                    ++writes; if (address == entry + 3) c.mem[entry + 2] = 4;
+                }
+            };
+        } else {
+            c.mmioStart = entry; c.mmioEnd = entry + 4;
+            c.mmioWrite = [&](uint32_t address, uint8_t value) {
+                ++writes; c.mem[address] = value;
+                if (address == entry + 3) c.mem[entry + 2] = 4;
+            };
+        }
+        check(c.readSegment(DS, 0x8000, 4) == 0x44332211 && writes == 4,
+            "Write-only page-table MMIO and write observers may remap later bytes during accessed-bit updates");
+    }
+    {
+        auto c = machine(); std::vector<uint32_t> reads, writes;
+        c.mmioStart = 0x30000; c.mmioEnd = 0x31000;
+        c.mmioRead = [&](uint32_t address) { reads.push_back(address); return uint8_t(address + 1); };
+        c.mmioWrite = [&](uint32_t address, uint8_t value) {
+            writes.push_back(address); check(value == uint8_t(0x44332211u >> ((address & 3) * 8)), "MMIO operand byte order");
+        };
+        check(c.readSegment(DS, 0x8000, 4) == 0x04030201 && reads == std::vector<uint32_t>{0x30000,0x30001,0x30002,0x30003},
+            "A shared ordinary-RAM page walk must not merge or reorder MMIO operand reads");
+        c.writeSegment(DS, 0x8000, 0x44332211, 4);
+        check(writes == std::vector<uint32_t>{0x30000,0x30001,0x30002,0x30003},
+            "A shared page walk must preserve every MMIO operand write");
+    }
+    {
+        auto c = machine(); c.loadSegment(CS, 0); c.ip = 0x8000;
+        const uint8_t code[] = {0x66,0xb8,0x11,0x22,0x33,0x44};
+        std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x30000);
+        c.step();
+        check(c.r32(AX) == 0x44332211 && c.ip == 0x8006 && c.readDword(entry) == 0x30027,
+            "Same-page instruction immediates must preserve decoding, EIP and page accessed bits");
+        c.ip = 0x8000; c.r32(AX, 0);
+        c.mem[0x40003] = 0x55; c.mem[0x40004] = 0x66; c.mem[0x40005] = 0x77;
+        unsigned reads = 0;
+        c.mmioStart = 0x30000; c.mmioEnd = 0x31000;
+        c.mmioRead = [&](uint32_t address) {
+            ++reads;
+            if (address == 0x30002) c.writeDword(entry, 0x40027);
+            return c.mem[address];
+        };
+        c.step();
+        check(c.r32(AX) == 0x77665511 && c.ip == 0x8006 && reads == 3,
+            "Instruction MMIO reads may remap the remaining immediate bytes and must not be prefetched");
+    }
+    {
+        auto c = machine(); c.loadSegment(CS, 0); c.ip = 0x8000;
+        c.mem[0x30000] = 0xb8; c.mem[0x31001] = 0x22; c.mem[0x32002] = 0x33;
+        unsigned reads = 0;
+        c.mmioStart = entry; c.mmioEnd = entry + 4;
+        c.mmioRead = [&](uint32_t address) {
+            uint32_t pte = (0x30000 + (reads / 4) * 4096) | 0x27;
+            ++reads; return uint8_t(pte >> ((address - entry) * 8));
+        };
+        c.step();
+        check(c.r[AX] == 0x3322 && reads == 12, "Instruction fetches must retain every MMIO page-table read and remapping");
+    }
+    for (unsigned scenario = 0; scenario < 3; ++scenario) {
+        auto c = machine(); c.loadSegment(CS, 0); c.ip = scenario == 0 ? 0x8ffc : scenario == 1 ? 0x8000 : 0xfffe;
+        unsigned expectedReads = scenario == 0 ? 4 : scenario == 1 ? 15 : 2;
+        if (scenario == 0) {
+            c.mem[0x30ffc] = 0x66; c.mem[0x30ffd] = 0xb8;
+        } else if (scenario == 1) {
+            std::fill_n(c.mem.begin() + 0x30000, 14, 0x66); c.mem[0x3000e] = 0xb8;
+        } else {
+            c.writeDword(0x1103c, 0x30007); c.mem[0x30ffe] = 0xb8;
+        }
+        unsigned reads = 0; bool denied = false;
+        c.mmioStart = 0x30000; c.mmioEnd = 0x31000;
+        c.mmioRead = [&](uint32_t address) { ++reads; return c.mem[address]; };
+        c.onFault = [](CpuFault fault, uint32_t) { throw fault; };
+        try { c.step(); }
+        catch (const CpuFault& f) {
+            denied = scenario == 0 ? f.vector == 14 && f.code == 4 && c.cr2 == 0x9000 : f.vector == 13 && f.code == 0;
+        }
+        check(denied && reads == expectedReads, "Wide instruction fetch must preserve bytewise page, length and segment-limit fault side effects");
+    }
+    std::cout << "Operand-instruction page walks / accessed-dirty / live mappings / cross-page atomicity / MMIO / observers / fetch limits checks passed\n";
+}
+void benchmarks() {
+    constexpr unsigned steps = 1000000;
+    for (unsigned workload = 0; workload < 4; ++workload) {
+        std::array<double, 5> seconds{};
+        uint64_t expected = 0;
+        for (unsigned sample = 0; sample < seconds.size(); ++sample) {
+            Cpu c; c.setModel(CpuModel::I486); c.a20 = true;
+            c.loadSegment(CS, 0); c.ip = 0x2000;
+            if (workload == 3) {
+                const uint8_t gdt[] = {0,0,0,0,0,0,0,0, 0xff,0xff,0,0,0,0x9a,0xcf,0,
+                    0xff,0xff,0,0,0,0x92,0xcf,0};
+                std::copy(std::begin(gdt), std::end(gdt), c.mem.begin() + 0x1000);
+                c.gdtr = {0x1000, 23}; c.msw |= 1;
+                const uint8_t entry[] = {0x66,0xea,0x10,0x20,0,0,8,0};
+                std::copy(std::begin(entry), std::end(entry), c.mem.begin() + 0x2000);
+                c.step(); c.loadSegment(DS, 16);
+            } else if (workload) {
+                c.msw |= 1; c.setEflags(0x23002); c.cpl = 3;
+                c.loadSegment(CS, 0); c.loadSegment(DS, 0);
+            }
+            if (workload) {
+                c.cr3 = 0x10000; c.writeDword(0x10000, 0x11007);
+                for (unsigned i = 0; i < 1024; ++i) c.writeDword(0x11000 + i * 4, (i << 12) | 7);
+                c.msw |= 0x80000000u;
+            }
+            const std::vector<uint8_t> code = workload < 2 ? std::vector<uint8_t>{0x40,0x43,0x31,0xd8,0xeb,0xfa}
+                : workload == 2 ? std::vector<uint8_t>{0x66,0xa1,0,0x80,0x66,0x40,0x66,0xa3,0,0x80,
+                    0x66,0x8b,0x1e,0,0x80,0xeb,0xef}
+                : std::vector<uint8_t>{0xa1,0,0x80,0,0,0x40,0xa3,0,0x80,0,0,0x8b,0x1d,0,0x80,0,0,0xeb,0xed};
+            const auto entry = c.ip;
+            std::copy(code.begin(), code.end(), c.mem.begin() + entry);
+            c.onFault = [](CpuFault f, uint32_t) {
+                throw std::runtime_error("Benchmark guest fault " + std::to_string(f.vector));
+            };
+            for (unsigned i = 0; i < steps / 10; ++i) c.step();
+            c.r.fill(0); c.r32(AX, 0); c.r32(BX, 0); c.writeDword(0x8000, 0);
+            c.ip = entry;
+            auto start = ExecutionTiming::HostClock::now();
+            for (unsigned i = 0; i < steps; ++i) c.step();
+            seconds[sample] = std::chrono::duration<double>(ExecutionTiming::HostClock::now() - start).count();
+            check(!c.halted && !c.waiting && c.ip == entry, "Benchmark must complete whole guest loops");
+            if (workload >= 2) check(c.readDword(0x8000) == steps / 5 && c.r32(BX) == steps / 5,
+                "Memory benchmark must execute every load and store");
+            uint64_t checksum = 14695981039346656037ull;
+            for (auto byte : c.mem) { checksum ^= byte; checksum *= 1099511628211ull; }
+            for (int i = 0; i < 8; ++i) { checksum ^= c.r32(i); checksum *= 1099511628211ull; }
+            checksum ^= c.eflags(); checksum *= 1099511628211ull; checksum ^= c.ip;
+            if (sample) check(checksum == expected, "Benchmark state must be repeatable");
+            expected = checksum;
+        }
+        std::sort(seconds.begin(), seconds.end());
+        const char* names[] = {"486-real-register", "486-vm86-paged-register", "486-vm86-paged-memory", "486-protected32-paged-memory"};
+        std::cout << names[workload] << " median-MIPS=" << steps / seconds[2] / 1e6
+            << " min-MIPS=" << steps / seconds.back() / 1e6 << " max-MIPS=" << steps / seconds.front() / 1e6
+            << " checksum=" << expected << '\n';
+    }
+}
 void preferenceTests() {
     auto key = L"Software\\Asm86NativeTest-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
     auto cleanup = [&]() {
@@ -2564,7 +2871,9 @@ void unit() {
 }
 }
 int main(int argc, char** argv) {
-    try { if (argc == 2) return corpus(argv[1]); preferenceTests(); timingTests(); cpu386Tests(CpuModel::I386); cpu386Tests(CpuModel::I486);
+    try { if (argc == 2 && std::string(argv[1]) == "--benchmark-video") { videoBenchmarks(); return 0; }
+        if (argc == 2 && std::string(argv[1]) == "--benchmark") { benchmarks(); return 0; }
+        if (argc == 2) return corpus(argv[1]); graphicsFrameTests(); physicalReadTests(); operandPagingTests(); preferenceTests(); timingTests(); cpu386Tests(CpuModel::I386); cpu386Tests(CpuModel::I486);
         protectedTests(); atTests(CpuModel::I286); atTests(CpuModel::I386); atTests(CpuModel::I486); unit(); return 0; }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

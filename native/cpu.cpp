@@ -5,10 +5,20 @@ namespace asm86 {
 uint8_t Cpu::rb(uint16_t seg, uint16_t off) const {
     return readPhysical((uint32_t(seg) << 4) + off);
 }
-uint8_t Cpu::readPhysical(uint32_t address) const {
+uint32_t Cpu::busAddress(uint32_t address) const {
     auto a = address & (model == CpuModel::I8088 ? 0xfffff : model == CpuModel::I286 ? (a20 ? 0xffffff : 0xefffff) : (a20 ? 0xffffffffu : 0xffefffffu));
     if (supports386() && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
-    return readBus(a);
+    return a;
+}
+const uint8_t* Cpu::physicalRam(uint32_t address, unsigned size) const {
+    auto a = busAddress(address);
+    // Stay within one page so address wrapping, A20 and reset-ROM aliases cannot split the span.
+    if ((a & 4095) > 4096 - size || a >= mem.size() || size > mem.size() - a) return nullptr;
+    if (mmioRead && a < mmioEnd && uint64_t(a) + size > mmioStart) return nullptr;
+    return mem.data() + a;
+}
+uint8_t Cpu::readPhysical(uint32_t address) const {
+    return readBus(busAddress(address));
 }
 uint8_t Cpu::readBus(uint32_t a) const {
     return a >= mmioStart && a < mmioEnd && mmioRead ? mmioRead(a) : a < mem.size() ? mem[a] : 0xff;
@@ -17,12 +27,20 @@ uint16_t Cpu::rw(uint16_t seg, uint16_t off) const { return rb(seg, off) | (uint
 void Cpu::wb(uint16_t seg, uint16_t off, uint8_t v) {
     writePhysical((uint32_t(seg) << 4) + off, v);
 }
-uint16_t Cpu::readWord(uint32_t address) const { return readPhysical(address) | (uint16_t(readPhysical(address + 1)) << 8); }
+uint16_t Cpu::readWord(uint32_t address) const {
+    if (auto bytes = physicalRam(address, 2)) return bytes[0] | (uint16_t(bytes[1]) << 8);
+    auto low = readPhysical(address);
+    return low | (uint16_t(readPhysical(address + 1)) << 8);
+}
+uint32_t Cpu::readDword(uint32_t address) const {
+    if (auto bytes = physicalRam(address, 4))
+        return bytes[0] | (uint32_t(bytes[1]) << 8) | (uint32_t(bytes[2]) << 16) | (uint32_t(bytes[3]) << 24);
+    auto low = readWord(address);
+    return low | (uint32_t(readWord(address + 2)) << 16);
+}
 void Cpu::writeWord(uint32_t address, uint16_t value) { writePhysical(address, uint8_t(value)); writePhysical(address + 1, uint8_t(value >> 8)); }
 void Cpu::writePhysical(uint32_t address, uint8_t v) {
-    auto a = address & (model == CpuModel::I8088 ? 0xfffff : model == CpuModel::I286 ? (a20 ? 0xffffff : 0xefffff) : (a20 ? 0xffffffffu : 0xffefffffu));
-    if (supports386() && (a & 0xffef0000u) == 0xffef0000u) a = 0xf0000 | (a & 0xffff);
-    writeBus(a, v);
+    writeBus(busAddress(address), v);
 }
 void Cpu::writeBus(uint32_t a, uint8_t v) {
     if (onWrite) onWrite(a);
@@ -62,7 +80,10 @@ uint8_t Cpu::fetch8() {
     auto v = supports386() ? readLinear(segmentBase(CS) + ip) : readPhysical(segmentBase(CS) + ip);
     ++ip; if (!supports386()) ip = uint16_t(ip); return v;
 }
-uint16_t Cpu::fetch16() { auto lo = fetch8(); return lo | (uint16_t(fetch8()) << 8); }
+uint16_t Cpu::fetch16() {
+    if (supports386()) return uint16_t(fetchWide(2));
+    auto lo = fetch8(); return lo | (uint16_t(fetch8()) << 8);
+}
 uint32_t Cpu::fetch(int size) { return size == 1 ? fetch8() : size == 4 ? fetch32() : fetch16(); }
 uint32_t Cpu::inputPort(uint16_t port, unsigned size) {
     if (size != 1 && size != 2 && size != 4) throw std::runtime_error("Invalid CPU I/O operand size");
