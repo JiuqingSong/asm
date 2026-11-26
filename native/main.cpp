@@ -14,7 +14,7 @@
 
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504 };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
@@ -23,6 +23,7 @@ bool running = false;
 bool poweredOn = false;
 bool rightCtrlDown = false;
 bool fullSpeed = false;
+bool stableTiming = false;
 bool mouseCaptured = false;
 std::array<bool, 128> pressedKeys{};
 double mouseFractionX = 0, mouseFractionY = 0;
@@ -47,14 +48,21 @@ void title(HWND hwnd) {
     value += L" | A: " + (pc->floppy ? pc->floppy->path.filename().wstring() : L"(empty)");
     value += L" | C: " + (pc->hard ? pc->hard->path.filename().wstring() : L"(empty)");
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
-    value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
+    value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 && stableTiming ? L" | Normal speed (486 ~32 MIPS virtual)"
+        : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
         : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
         : pc->at() ? L" | Normal speed (286 ~2 MIPS)" : L" | Normal speed (8088 ~0.33 MIPS)";
     if (mouseCaptured) value += L" | Mouse captured (Right Ctrl releases)";
+    if (stableTiming && pc->cpu.model == CpuModel::I486) value += L" | Stable CPU timing";
     if (!poweredOn) value += L" | powered off";
     else if (!running) value += L" | stopped";
     if (EnableMenuItem(GetMenu(hwnd), CtrlAltDel, MF_BYCOMMAND | (poweredOn ? MF_ENABLED : MF_GRAYED)) == -1)
         throw std::runtime_error("Cannot update restart menu");
+    if (EnableMenuItem(GetMenu(hwnd), StableTiming, MF_BYCOMMAND | (pc->cpu.model == CpuModel::I486 ? MF_ENABLED : MF_GRAYED)) == -1)
+        throw std::runtime_error("Cannot update CPU timing menu");
+    if (!ModifyMenuW(GetMenu(hwnd), FullSpeed, MF_BYCOMMAND | MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed,
+        stableTiming && pc->cpu.model == CpuModel::I486 ? L"Full speed (stable CPU timers)" : L"Full speed (real-time timers)"))
+        throw std::runtime_error("Cannot update execution speed menu");
     SetWindowTextW(hwnd, value.c_str());
 }
 void releaseMouse(HWND hwnd) {
@@ -150,7 +158,7 @@ void render(HDC target, int width, int height) {
 }
 void execute(HWND hwnd) {
     bool hadDisc = pc->cdrom.medium() != nullptr;
-    executionTiming.run(*pc, fullSpeed);
+    executionTiming.run(*pc, fullSpeed, std::chrono::milliseconds(8), stableTiming);
     if (pc->powerOffRequested) {
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
         if (pc->hard) pc->hard->flush();
@@ -221,6 +229,14 @@ void command(HWND hwnd, int id) {
         if (CheckMenuItem(GetMenu(hwnd), FullSpeed, MF_BYCOMMAND | (fullSpeed ? MF_CHECKED : MF_UNCHECKED)) == DWORD(-1))
             throw std::runtime_error("Cannot update execution speed menu");
         if (preferences) preferences->fullSpeed(fullSpeed);
+        break;
+    case StableTiming:
+        if (pc->cpu.model != CpuModel::I486) break;
+        stableTiming = !stableTiming;
+        executionTiming.reset(*pc);
+        if (CheckMenuItem(GetMenu(hwnd), StableTiming, MF_BYCOMMAND | (stableTiming ? MF_CHECKED : MF_UNCHECKED)) == DWORD(-1))
+            throw std::runtime_error("Cannot update CPU timing menu");
+        if (preferences) preferences->stableTiming(stableTiming);
         break;
     case Original: original(hwnd); break;
     case Maximize: ShowWindow(hwnd, SW_MAXIMIZE); break;
@@ -376,7 +392,7 @@ int headless(const std::filesystem::path& script) {
                 auto remaining = deadline - ExecutionTiming::HostClock::now();
                 if (remaining <= ExecutionTiming::HostClock::duration::zero()) break;
                 timing.run(*pc, speed == "full", std::min(remaining,
-                    std::chrono::duration_cast<ExecutionTiming::HostClock::duration>(std::chrono::milliseconds(8))));
+                    std::chrono::duration_cast<ExecutionTiming::HostClock::duration>(std::chrono::milliseconds(8))), stableTiming);
                 if (pc->rebootRequested) { pc->boot(pc->floppy ? 0 : 0x80); timing.reset(*pc); }
                 if (speed == "normal") Sleep(1);
             }
@@ -472,13 +488,16 @@ int headless(const std::filesystem::path& script) {
 int application(int argc, wchar_t** argv) {
     pc = std::make_unique<Pc>();
     std::filesystem::path script; bool start = false, uiTest = false;
-    bool cpuSpecified = false, speedSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
+    bool cpuSpecified = false, speedSpecified = false, timingSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring option = argv[i];
         if (option == L"--ui-test") { uiTest = true; continue; }
         if (option == L"--experimental-386") { experimental386 = true; continue; }
         if (option == L"--full-speed" || option == L"--normal-speed") {
             fullSpeed = option == L"--full-speed"; speedSpecified = true; continue;
+        }
+        if (option == L"--stable-timing" || option == L"--real-time-timing") {
+            stableTiming = option == L"--stable-timing"; timingSpecified = true; continue;
         }
         if (i + 1 >= argc) throw std::runtime_error("Missing command-line option value");
         std::filesystem::path value = argv[++i];
@@ -537,6 +556,7 @@ int application(int argc, wchar_t** argv) {
         preferences = std::make_unique<Preferences>();
         if (!cpuSpecified) pc->setModel(preferences->cpu());
         if (!speedSpecified) fullSpeed = preferences->fullSpeed();
+        if (!timingSpecified) stableTiming = preferences->stableTiming();
         if (!hardSpecified) {
             auto path = preferences->hard();
             if (!path.empty()) {
@@ -561,6 +581,7 @@ int application(int argc, wchar_t** argv) {
         }
         if (cpuSpecified) preferences->cpu(pc->cpu.model);
         if (speedSpecified) preferences->fullSpeed(fullSpeed);
+        if (timingSpecified) preferences->stableTiming(stableTiming);
         if (floppySpecified) preferences->floppy(pc->floppy->path);
         if (hardSpecified) preferences->hard(pc->hard->path);
     }
@@ -591,6 +612,7 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(machine, MF_STRING, Reset, L"Power off");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed, L"Full speed (real-time timers)");
+    AppendMenuW(machine, MF_STRING | (stableTiming ? MF_CHECKED : MF_UNCHECKED), StableTiming, L"Stable CPU timing (Windows 98)");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I8088 ? MF_CHECKED : MF_UNCHECKED), Cpu8088, L"CPU: 8088");
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I286 ? MF_CHECKED : MF_UNCHECKED), Cpu286, L"CPU: 80286 / AT");
@@ -883,6 +905,26 @@ int application(int argc, wchar_t** argv) {
                 throw std::runtime_error("Losing focus did not release held AT keys");
             SendMessageW(hwnd, WM_COMMAND, Reset, 0);
         }
+        if (stableTiming) SendMessageW(hwnd, WM_COMMAND, StableTiming, 0);
+        SendMessageW(hwnd, WM_COMMAND, StableTiming, 0);
+        GetWindowTextW(hwnd, caption, int(std::size(caption)));
+        if (!stableTiming || !(GetMenuState(menu, StableTiming, MF_BYCOMMAND) & MF_CHECKED) || !std::wcsstr(caption, L"Stable CPU timing"))
+            throw std::runtime_error("Stable CPU timing did not update the title and menu");
+        pc->cpu.loadSegment(CS, 0); pc->cpu.ip = 0x500; pc->cpu.setFlags(2);
+        pc->cpu.halted = pc->cpu.waiting = false;
+        pc->cpu.mem[0x500] = 0xeb; pc->cpu.mem[0x501] = 0xfe;
+        running = poweredOn = true;
+        auto stableBefore = pc->instructions; auto stableClock = pc->clock;
+        Sleep(2); SendMessageW(hwnd, WM_TIMER, 1, 0);
+        if (pc->instructions == stableBefore || std::abs(double(pc->instructions - stableBefore)
+            - (pc->clock - stableClock) * ExecutionTiming::Stable486Rate / ExecutionTiming::PitHz) > 0.0001)
+            throw std::runtime_error("GUI stable timing did not bind device time to executed CPU instructions");
+        stableClock = pc->clock;
+        SendMessageW(hwnd, WM_COMMAND, StableTiming, 0);
+        if (stableTiming || pc->clock != stableClock || GetMenuState(menu, StableTiming, MF_BYCOMMAND) & MF_CHECKED)
+            throw std::runtime_error("Restoring real-time CPU timing introduced a guest clock jump");
+        SendMessageW(hwnd, WM_COMMAND, Reset, 0);
+        std::cout << "Stable CPU timing menu / execution / live-toggle / real-time restoration checks passed\n";
         SendMessageW(hwnd, WM_COMMAND, Cpu8088, 0);
         if (pc->at() || !(GetMenuState(menu, Cpu8088, MF_BYCOMMAND) & MF_CHECKED))
             throw std::runtime_error("8088 CPU selection was not restored");

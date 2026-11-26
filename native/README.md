@@ -71,6 +71,8 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\run.ps1 -Cpu 386 -HardDisk '.\native\win31-386.img' -FullSpeed
 # 使用实验性 486DX 核心（带 x87）：
 .\native\run.ps1 -Cpu 486 -HardDisk '.\native\win31-386.img' -FullSpeed
+# Windows 98：避免安装器测速受宿主负载影响：
+.\native\run.ps1 -Cpu 486 -StableTiming -FullSpeed
 # 挂载 ISO（需在客体中加载 ATAPI 光驱驱动和 MSCDEX）：
 .\native\run.ps1 -Cpu 486 -Cdrom 'D:\images\install.iso'
 # 或直接指定映像：
@@ -101,6 +103,11 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
   标题栏显示 **Full speed / Normal speed**；首次运行默认正常速度，以后自动记住选择。
   正常档随 CPU 型号切换：8088 约 0.33 MIPS，286 约 2 MIPS，386 约 4 MIPS，486 约 8 MIPS；标题栏显示当前档位。
   这是指令吞吐量近似值，不代表周期精确的 CPU 主频。
+- **Machine > Stable CPU timing (Windows 98)**：仅用于 486，默认关闭，选择会记忆。
+  启用后按执行的指令量推进忙碌 CPU 的虚拟时间，安装器测速不再依赖宿主负载；
+  宿主较慢时客体时间也会变慢。可配合 Full speed，菜单会标明 stable CPU timers。
+  正常档在此模式下使用约 32 MIPS 的虚拟吞吐量。关闭后恢复原有实时计时，无时钟跳变。
+  改变计时模式后应重新启动安装程序，避免一次测速跨越两种模式。
 - **Machine > CPU: 8088 / CPU: 80286 / AT / CPU: 80386 / AT (experimental) / CPU: 80486DX / AT (experimental)**：
   停机后选择 CPU；首次运行默认 8088，以后自动记住选择；Windows 3.1 标准模式选择 286，
   增强模式可选择实验性 386 或 486。
@@ -118,7 +125,7 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
 宿主文件对话框和菜单保持 Windows 原生行为。因执行错误而停止时保留错误画面供排查，
 这与明确选择 **Power off** 的黑屏关机状态不同。
 
-硬盘路径、软盘路径（包括换盘和取出）、CPU 型号和速度模式在选择成功后立即保存到当前 Windows
+硬盘路径、软盘路径（包括换盘和取出）、CPU 型号、速度和计时模式在选择成功后立即保存到当前 Windows
 用户的注册表 `HKEY_CURRENT_USER\Software\Asm86\Native`，不依赖启动目录，也不需要管理员权限。
 软盘保存为绝对路径；下次启动自动以只读方式重新插入。若文件已移动或不可读取，会明确提示，
 让 A: 保持空盘；可重新插盘或选择 **Eject A:** 清除旧路径。
@@ -127,6 +134,8 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
 命令行的 `--hard`、`--create-hard`、`--floppy`、`--cpu`、`--full-speed` / `--normal-speed` 优先于已保存的对应设置，
 并成为新的记忆值；`run.ps1` 未指定硬盘、CPU 或速度时也沿用已保存的选择，不再强制加载 `dos622.img`，
 可用 `-Cpu 8088` / `-Cpu 286`、`-FullSpeed` / `-NormalSpeed` 显式覆盖。
+`--stable-timing` / `--real-time-timing`（脚本对应 `-StableTiming` / `-RealTimeTiming`）
+显式覆盖并保存计时模式；未指定时沿用记忆，脚本拒绝同时指定两个相反的开关。
 `--headless` 和 `--ui-test` 不读取或修改这些用户设置，保证脚本和测试相互独立。
 
 ## VGA 图形与 COM1 鼠标
@@ -161,7 +170,7 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
   支持相对移动和左右键；暂不提供 INT 33h 驱动、PS/2 鼠标或中键/滚轮。
 
 正常档限制 CPU 指令吞吐量；全速档在处理窗口消息的间隙尽可能多执行指令，
-每约 8ms 交还控制权，画面仍约每 16ms 刷新。两档的 PIT、RTC、串口鼠标和
+每约 8ms 交还控制权，画面仍约每 16ms 刷新。默认实时计时模式下，两档的 PIT、RTC、串口鼠标和
 依赖这些设备的 Windows 计时均按宿主单调时钟推进，不随 CPU 吞吐量加速。
 设备推进最多以 0.25ms 为一片，与 CPU 执行交替，避免窗口绘制后的时间追赶
 把多字节鼠标包一次性塞入 UART；RTC 周期中断保持原有相位，不累积轮询误差。
@@ -543,8 +552,14 @@ VM86 缺页后的原子重试及保护模式 SIB 寻址。
 未支持的指令编码仍会明确报错；三角函数参数绝对值达到 2^63 时置 C2，
 F2XM1 超出定义域时保留 ST(0)。这不是周期或微码精确的 x87。
 Windows 98 安装器已在硬盘副本上对照验证：旧版本报告缺少数学协处理器，
-新版本在全速运行时通过硬件检查，进入图形安装向导的 Welcome / Continue 页面。
-请选择 **486DX** 和 **Full speed**；正常档的模拟速度可能触发安装器的 66MHz 最低速度检查。
+新版本启用稳定计时后，已在降低测试进程优先级的条件下通过硬件检查，
+进入图形安装向导的 Welcome / Continue 页面；宿主执行 180 秒时，客体仅推进约 52 秒，
+测速仍通过，验证不是靠宿主空闲时偶然达到最低速度。
+请选择 **486DX** 并启用 **Stable CPU timing (Windows 98)**，可同时启用 **Full speed**。
+仅使用实时模式的 Full speed 无法保证最低测速结果：宿主负载或绘制开销仍可能触发 66MHz 检查。
+稳定计时使用约 32 MIPS 的虚拟指令吞吐量，并非周期精确的 66MHz 硬件；
+CPU 空闲等待期间设备按宿主时间推进，避免空闲时加速时钟或停止中断。
+原来的实时计时模式及其他 CPU 档位保持不变。
 该验证不等同于 Windows 98 完整安装成功。
 
 ## 文件

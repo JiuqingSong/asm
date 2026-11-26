@@ -4,12 +4,15 @@ param(
     [switch]$FullSpeed,
     [ValidateSet('8088', '286', '386', '486')][string]$Cpu,
     [switch]$NormalSpeed,
-    [string]$Cdrom
+    [string]$Cdrom,
+    [switch]$StableTiming,
+    [switch]$RealTimeTiming
 )
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'build\asm86-native.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw 'Build the native application with native\build.ps1 first' }
 if ($FullSpeed -and $NormalSpeed) { throw 'Choose either -FullSpeed or -NormalSpeed, not both' }
+if ($StableTiming -and $RealTimeTiming) { throw 'Choose either -StableTiming or -RealTimeTiming, not both' }
 $arguments = @()
 if ($Cpu) { $arguments += @('--cpu', $Cpu) }
 if ($HardDisk) {
@@ -23,5 +26,7 @@ if ($Cdrom) {
 }
 if ($FullSpeed) { $arguments += '--full-speed' }
 if ($NormalSpeed) { $arguments += '--normal-speed' }
+if ($StableTiming) { $arguments += '--stable-timing' }
+if ($RealTimeTiming) { $arguments += '--real-time-timing' }
 if ($arguments.Count) { Start-Process -FilePath $exe -ArgumentList $arguments }
 else { Start-Process -FilePath $exe }

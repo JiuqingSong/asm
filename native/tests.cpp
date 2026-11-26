@@ -28,14 +28,14 @@ void preferenceTests() {
         auto hardPath = std::filesystem::path(L"Windows 95 \u4e00 with spaces.img");
         {
             Preferences prefs(key.c_str());
-            check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && prefs.floppy().empty() && prefs.hard().empty(),
+            check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && !prefs.stableTiming() && prefs.floppy().empty() && prefs.hard().empty(),
                 "First launch must retain the default CPU, speed and empty disk preferences");
             prefs.cpu(CpuModel::I286); prefs.fullSpeed(true); prefs.floppy(path);
-            prefs.hard(hardPath);
+            prefs.hard(hardPath); prefs.stableTiming(true);
         }
         {
             Preferences prefs(key.c_str());
-            check(prefs.cpu() == CpuModel::I286 && prefs.fullSpeed() && prefs.floppy() == std::filesystem::absolute(path),
+            check(prefs.cpu() == CpuModel::I286 && prefs.fullSpeed() && prefs.stableTiming() && prefs.floppy() == std::filesystem::absolute(path),
                 "CPU, speed and Unicode floppy path must survive reopening preferences");
             check(prefs.hard() == std::filesystem::absolute(hardPath),
                 "Selected Windows hard disk with spaces and Unicode must survive reopening preferences");
@@ -54,11 +54,11 @@ void preferenceTests() {
             Preferences prefs(key.c_str());
             check(prefs.cpu() == CpuModel::I486 && prefs.fullSpeed() && prefs.floppy() == std::filesystem::absolute(path),
                 "Experimental 486 selection must survive reopening without changing other preferences");
-            prefs.cpu(CpuModel::I8088); prefs.fullSpeed(false); prefs.floppy({});
+            prefs.cpu(CpuModel::I8088); prefs.fullSpeed(false); prefs.stableTiming(false); prefs.floppy({});
         }
         {
             Preferences prefs(key.c_str());
-            check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && prefs.floppy().empty(),
+            check(prefs.cpu() == CpuModel::I8088 && !prefs.fullSpeed() && !prefs.stableTiming() && prefs.floppy().empty(),
                 "Switching back to 8088/normal speed and ejecting must persist");
             DWORD invalidCpu = 123;
             check(RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"Cpu", REG_DWORD, &invalidCpu, sizeof(invalidCpu)) == ERROR_SUCCESS,
@@ -73,6 +73,12 @@ void preferenceTests() {
             rejected = false;
             try { prefs.fullSpeed(); } catch (const std::runtime_error&) { rejected = true; }
             check(rejected, "Malformed saved speed must report an error");
+            DWORD invalidTiming = 2;
+            check(RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"StableTiming", REG_DWORD, &invalidTiming, sizeof(invalidTiming)) == ERROR_SUCCESS,
+                "Cannot prepare malformed CPU timing preference test");
+            rejected = false;
+            try { prefs.stableTiming(); } catch (const std::runtime_error&) { rejected = true; }
+            check(rejected, "Invalid saved CPU timing must report an error");
             check(RegSetKeyValueW(HKEY_CURRENT_USER, key.c_str(), L"HardDisk", REG_DWORD, &invalidCpu, sizeof(invalidCpu)) == ERROR_SUCCESS,
                 "Cannot prepare malformed hard disk preference test");
             rejected = false;
@@ -144,11 +150,48 @@ void timingTests() {
         timing.advance(p, false, end);
         check(p.instructions == before && p.clock == ExecutionTiming::PitHz, "Speed toggles must not introduce a clock jump or CPU credit burst");
     }
+    {
+        Pc stable; stable.setModel(CpuModel::I486);
+        stable.cpu.loadSegment(CS, 0); stable.cpu.ip = 0x500; stable.cpu.setFlags(2);
+        stable.cpu.mem[0x500] = 0xeb; stable.cpu.mem[0x501] = 0xfe;
+        ExecutionTiming timing; ExecutionTiming::HostClock::time_point origin{};
+        timing.reset(stable, origin);
+        for (unsigned i = 1; i <= 1000; ++i)
+            timing.advance(stable, true, origin + std::chrono::milliseconds(i * 100), true);
+        check(std::abs(double(stable.instructions) - stable.clock * ExecutionTiming::Stable486Rate / ExecutionTiming::PitHz) < 0.00001
+            && stable.clock < ExecutionTiming::PitHz,
+            "Host stalls must not advance stable CPU timers without the matching instruction budget");
+        auto before = stable.instructions;
+        timing.reset(stable, origin);
+        timing.advance(stable, false, origin, true);
+        check(stable.instructions == before, "Stable timing reset must not bank a normal-speed CPU catch-up burst");
+    }
+    {
+        Pc idle; idle.setModel(CpuModel::I486);
+        auto& c = idle.cpu;
+        c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.r[SP] = 0x9000; c.ip = 0x500; c.setFlags(2);
+        c.mem[0x500] = 0xf4; c.mem[0x600] = 0xeb; c.mem[0x601] = 0xfe;
+        c.writeWord(0x20, 0x600); c.writeWord(0x22, 0);
+        ExecutionTiming timing; ExecutionTiming::HostClock::time_point origin{};
+        timing.reset(idle, origin); timing.advance(idle, true, origin, true);
+        auto idleOrigin = idle.clock;
+        auto end = origin + std::chrono::seconds(1);
+        while (idle.clock < timing.target(end)) timing.advance(idle, true, end, true);
+        check(c.halted && std::abs(idle.clock - idleOrigin - ExecutionTiming::PitHz) < 0.00001,
+            "Stable timing must keep a halted CPU's devices on host time rather than fast-forwarding or freezing");
+        c.irq = [pending = true]() mutable { if (!pending) return -1; pending = false; return 8; };
+        c.setFlags(IF | 2); timing.advance(idle, true, end, true);
+        check(!c.halted && c.ip == 0x600, "Host-paced idle devices must still wake the stable CPU through guest interrupts");
+        auto before = idle.instructions; auto beforeClock = idle.clock;
+        timing.advance(idle, true, end + std::chrono::seconds(10), true);
+        check(std::abs(double(idle.instructions - before) - (idle.clock - beforeClock) * ExecutionTiming::Stable486Rate / ExecutionTiming::PitHz) < 0.00001,
+            "Waking from idle must restore stable CPU speed without injecting a delayed host-time catch-up");
+    }
     Pc idle; idle.setModel(CpuModel::I8088);
     idle.cpu.loadSegment(CS, 0); idle.cpu.ip = 0x500; idle.cpu.mem[0x500] = 0xf4;
     idle.runCpu(100000);
     check(idle.cpu.halted && idle.instructions == 1 && idle.clock == 0, "A halted CPU must yield without accelerating time or banking instructions");
-    std::cout << "Real-time CPU rates / PIT / RTC / UART / speed-toggle checks passed\n";
+    std::cout << "Real-time CPU rates / PIT / RTC / UART / speed-toggle / stable CPU timing / idle-wakeup checks passed\n";
 }
 void cpu386Tests(CpuModel model) {
     auto real = [&]() {
