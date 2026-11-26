@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <functional>
 #include <algorithm>
+#include <array>
+#include <map>
 
 namespace {
 using Bytes = std::vector<uint8_t>;
@@ -57,6 +59,84 @@ void layout(const std::filesystem::path& path, bool floppy, uint64_t size) {
     size_t fat = base + word(b, base + 14) * 512, fatSize = word(b, base + 22) * 512;
     require(std::equal(b.begin() + fat, b.begin() + fat + fatSize, b.begin() + fat + fatSize), "FAT mirrors");
 }
+
+Bytes readMemory(const Bytes& disk, const std::wstring& path) {
+    return asm86::image::readSectors(uint32_t(disk.size() / 512), [&](uint32_t lba, uint8_t* out) {
+        std::copy_n(disk.begin() + size_t(lba) * 512, 512, out); return true;
+    }, path);
+}
+
+void streamingFatTests() {
+    // 8 GiB 的稀疏逻辑盘只保存测试涉及的扇区；文件簇位于 4 GiB 之后且不连续。
+    constexpr uint32_t sectors = uint32_t(8ULL * 1024 * 1024 * 1024 / 512);
+    constexpr uint32_t base = 63, fat = base + 32, fatSize = 16384, data = fat + 2 * fatSize;
+    constexpr uint32_t first = 0x120001, second = 0x120003;
+    std::map<uint32_t, Bytes> disk;
+    auto block = [&](uint32_t lba) -> Bytes& {
+        auto& bytes = disk[lba]; if (bytes.empty()) bytes.resize(512); return bytes;
+    };
+    auto setWord = [](Bytes& bytes, unsigned at, uint16_t value) {
+        bytes[at] = uint8_t(value); bytes[at + 1] = uint8_t(value >> 8);
+    };
+    auto setDword = [&](Bytes& bytes, unsigned at, uint32_t value) {
+        setWord(bytes, at, uint16_t(value)); setWord(bytes, at + 2, uint16_t(value >> 16));
+    };
+    auto entry = [&](Bytes& bytes, const char* name, uint8_t attr, uint32_t cluster, uint32_t size) {
+        std::copy_n(name, 11, bytes.begin()); bytes[11] = attr;
+        setWord(bytes, 20, uint16_t(cluster >> 16)); setWord(bytes, 26, uint16_t(cluster));
+        setDword(bytes, 28, size);
+    };
+    auto link = [&](uint32_t cluster, uint32_t value) {
+        for (unsigned copy = 0; copy < 2; ++copy)
+            setDword(block(fat + copy * fatSize + cluster / 128), (cluster % 128) * 4, value);
+    };
+    auto& mbr = block(0); mbr[450] = 0x0c;
+    setDword(mbr, 454, base); setDword(mbr, 458, sectors - base); setWord(mbr, 510, 0xaa55);
+    auto& boot = block(base); setWord(boot, 11, 512); boot[13] = 8;
+    setWord(boot, 14, 32); boot[16] = 2; boot[21] = 0xf8;
+    setDword(boot, 32, sectors - base); setDword(boot, 36, fatSize);
+    setDword(boot, 44, 5); setWord(boot, 510, 0xaa55);
+    link(0, 0xfffffff8); link(1, 0xffffffff); link(5, 0xffffffff); link(7, 0xffffffff);
+    link(first, second); link(second, 0xffffffff);
+    entry(block(data + 3 * 8), "TEST       ", 16, 7, 0);
+    Bytes payload(6000);
+    for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i * 37);
+    entry(block(data + 5 * 8), "CHECK   TXT", 32, first, uint32_t(payload.size()));
+    for (size_t i = 0; i < payload.size(); ++i) {
+        auto cluster = i < 4096 ? first : second;
+        block(data + (cluster - 2) * 8 + uint32_t(i % 4096 / 512))[i % 512] = payload[i];
+    }
+    unsigned reads = 0; uint32_t largest = 0;
+    auto reader = [&](uint32_t lba, uint8_t* out) {
+        require(lba < sectors, "Streaming reader must not request outside the disk");
+        ++reads; largest = std::max(largest, lba);
+        auto at = disk.find(lba);
+        if (at == disk.end()) std::fill_n(out, 512, 0);
+        else std::copy_n(at->second.begin(), 512, out);
+        return true;
+    };
+    auto read = [&] { return asm86::image::readSectors(sectors, reader, L"\\test\\check.txt"); };
+    require(read() == payload && reads < 64 && uint64_t(largest) * 512 > 0x100000000ULL,
+        "8 GiB FAT32 nested fragmented file must read less than 64 sectors, including data beyond 4 GiB");
+    auto saved = disk;
+    setDword(block(fat + first / 128), (first % 128) * 4, 0xffffffff);
+    fails(read, "FAT copies disagree");
+    setWord(block(base), 40, 0x81);
+    require(read() == payload, "FAT32 active FAT must ignore inactive copies when mirroring is disabled");
+    setWord(block(base), 40, 0x82); fails(read, "active FAT");
+    disk = saved; link(first, 0xffffffff); fails(read, "Truncated");
+    disk = saved; link(second, first); setDword(block(data + 5 * 8), 28, 9000); fails(read, "Cyclic");
+    disk = saved; setDword(block(0), 458, sectors); fails(read, "out-of-bounds");
+    disk = saved; setDword(block(data + 5 * 8), 28, 17 * 1024 * 1024); fails(read, "verification limit");
+    disk = saved;
+    for (unsigned i = 0; i < 8; ++i) std::fill(block(data + 3 * 8 + i).begin(), block(data + 3 * 8 + i).end(), 0xe5);
+    link(5, 5); fails(read, "Cyclic FAT directory");
+    disk = saved;
+    fails([&] {
+        asm86::image::readSectors(sectors, [](uint32_t, uint8_t*) { return false; }, L"\\TEST\\CHECK.TXT");
+    }, "Cannot read FAT disk sector");
+    std::cout << "Streaming FAT12/16/32 / 8 GiB / high fragmented clusters / active FAT / corruption bounds checks passed\n";
+}
 }
 
 int main() {
@@ -64,6 +144,7 @@ int main() {
     using namespace asm86::image;
     std::filesystem::path root;
     try {
+        streamingFatTests();
         wchar_t temp[MAX_PATH]{}, file[MAX_PATH]{};
         require(GetTempPathW(MAX_PATH, temp) && GetTempFileNameW(temp, L"a86", 0, file), "Test temp path");
         require(DeleteFileW(file) && CreateDirectoryW(file, nullptr), "Test temp directory");
@@ -76,6 +157,21 @@ int main() {
             std::filesystem::remove(floppy);
         }
         create(floppy, floppySize(L"1440"), true, false); layout(floppy, true, floppySize(L"1440"));
+        {
+            auto disk = bytes(floppy);
+            auto setWord = [&](size_t at, uint16_t value) { disk[at] = uint8_t(value); disk[at + 1] = uint8_t(value >> 8); };
+            auto fat = size_t(word(disk, 14)) * 512, fatBytes = size_t(word(disk, 22)) * 512;
+            auto root = fat + 2 * fatBytes, data = root + word(disk, 17) * 32;
+            std::copy_n("CROSS   BIN", 11, disk.begin() + root);
+            setWord(root + 26, 341); setWord(root + 28, 700);
+            setWord(fat + 511, uint16_t((word(disk, fat + 511) & 15) | (342 << 4)));
+            setWord(fat + 513, uint16_t((word(disk, fat + 513) & 0xf000) | 0xfff));
+            std::copy_n(disk.begin() + fat, fatBytes, disk.begin() + fat + fatBytes);
+            std::fill_n(disk.begin() + data + 339 * 512, 512, 0x5a);
+            std::fill_n(disk.begin() + data + 340 * 512, 188, 0xa5);
+            auto expected = Bytes(512, 0x5a); expected.insert(expected.end(), 188, 0xa5);
+            require(readMemory(disk, L"\\CROSS.BIN") == expected, "FAT12 packed entry crossing a sector boundary");
+        }
         for (const auto& s : {L"31.5",L"63",L"126",L"252",L"504"}) {
             create(hard, hardSize(s), false, false);
             auto info = inspect(hard);
@@ -104,6 +200,7 @@ int main() {
         write(root / L"NOTE.TXT", {'o','k'});
         put(floppy, {root / L"TREE", root / L"NOTE.TXT"}, L"\\DATA\\FILES", false);
         require(read(floppy, L"\\DATA\\FILES\\TREE\\SUB\\DATA.BIN") == payload, "Multi-cluster FAT12 recursive import");
+        require(readMemory(bytes(floppy), L"\\DATA\\FILES\\TREE\\SUB\\DATA.BIN") == payload, "Streaming FAT12 recursive file read");
         require(read(floppy, L"\\DATA\\FILES\\TREE\\EMPTY.TXT").empty(), "Empty file");
         require(read(floppy, L"\\DATA\\FILES\\NOTE.TXT") == Bytes({'o','k'}), "Multiple source import");
         auto before = bytes(floppy);
@@ -141,6 +238,7 @@ int main() {
         create(hard, hardSize(L"31.5"), false, false);
         put(hard, {root / L"TREE"}, L"\\INSTALL", false);
         require(read(hard, L"\\INSTALL\\TREE\\SUB\\DATA.BIN") == payload, "FAT16 import persists");
+        require(readMemory(bytes(hard), L"\\INSTALL\\TREE\\SUB\\DATA.BIN") == payload, "Streaming FAT16 recursive file read");
         auto h = bytes(hard);
         std::fill(h.begin(), h.begin() + 440, 0x90); // 90h 是 NOP；这里是保留性探针，不实际执行。
         write(hard, h);

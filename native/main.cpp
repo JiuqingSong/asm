@@ -491,6 +491,17 @@ void namedKey(const std::string& value) {
     else if (value == "DOWN") tapKey(0x50, 0);
     else if (value == "LEFT") tapKey(0x4b, 0);
     else if (value == "RIGHT") tapKey(0x4d, 0);
+    else if (value == "END") {
+        pc->key(0xe0, 0); pc->key(0x4f, 0); pc->key(0xe0, 0); pc->key(0xcf, 0);
+    }
+    else if (value.size() == 1 && ((value[0] >= 'a' && value[0] <= 'z') ||
+        (value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= '0' && value[0] <= '9'))) {
+        // 快捷键只发送物理扫描码，让客体根据 Ctrl/Alt 状态译码；type 则明确提供文本字符。
+        auto key = value[0]; if (key >= 'a' && key <= 'z') key -= 'a' - 'A';
+        auto scan = MapVirtualKeyA(unsigned(key), MAPVK_VK_TO_VSC);
+        if (!scan || scan > 0x7f) throw std::runtime_error("Cannot map scripted key to a keyboard scan code");
+        tapKey(uint8_t(scan), 0);
+    }
     else if (value.size() >= 2 && value[0] == 'F') {
         int n = std::stoi(value.substr(1)); if (n < 1 || n > 10) throw std::runtime_error("Expected F1..F10");
         tapKey(uint8_t(0x3a + n), 0);
@@ -518,7 +529,7 @@ int headless(const std::filesystem::path& script) {
     // run/wait 使用确定性指令预算；realtime/wait-realtime 使用与 GUI 相同的宿主计时。
     // expect-state powered-off 必须看到 APM 请求，不能因超时/CPU 停止就判成功。
     std::ifstream stream(script); if (!stream) throw std::runtime_error("Cannot open headless script");
-    std::string line; unsigned lineNumber = 0;
+    std::string line; unsigned lineNumber = 0; bool pacedFullSpeed = true;
     try { while (std::getline(stream, line)) {
         ++lineNumber; if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
@@ -527,20 +538,39 @@ int headless(const std::filesystem::path& script) {
         if (op == "run") {
             uint64_t count = std::stoull(arg);
             while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80); }
-        } else if (op == "realtime" || op == "wait-realtime") {
+        } else if (op == "realtime" || op == "wait-realtime" || op == "boot-normal") {
             std::istringstream input(arg); int milliseconds = 0; std::string speed = "full", extra, text;
-            bool waiting = op == "wait-realtime";
+            bool waiting = op == "wait-realtime", booting = op == "boot-normal";
             if (!(input >> milliseconds) || milliseconds < 0) throw std::runtime_error("Expected nonnegative realtime milliseconds");
             if (waiting) {
+                speed = pacedFullSpeed ? "full" : "normal";
                 std::getline(input >> std::ws, text);
                 if (text.empty()) throw std::runtime_error("Expected wait-realtime <milliseconds> <text>");
-            } else if (!(input >> speed) || (input >> extra) || (speed != "normal" && speed != "full"))
-                throw std::runtime_error("Expected realtime <milliseconds> <normal|full>");
+            } else {
+                if (!(input >> speed) || (speed != "normal" && speed != "full"))
+                    throw std::runtime_error("Expected realtime/boot-normal <milliseconds> <normal|full>");
+                if (booting) std::getline(input >> std::ws, text);
+                else if (input >> extra) throw std::runtime_error("Unexpected realtime argument");
+                pacedFullSpeed = speed == "full";
+            }
+            bool selectedNormal = false, dismissedWarning = false;
+            auto ready = [&] { return pc->vga.graphics() && pc->vga.width() >= 640 && pc->vga.height() >= 480; };
             ExecutionTiming timing; timing.reset(*pc);
             const auto started = ExecutionTiming::HostClock::now(), deadline = started + std::chrono::milliseconds(milliseconds);
             const auto beforeClock = pc->clock;
             while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline &&
-                (!waiting || pc->text().find(text) == std::string::npos)) {
+                (!waiting || pc->text().find(text) == std::string::npos) && (!booting || !ready())) {
+                if (booting && !pc->vga.graphics()) {
+                    auto screen = pc->text();
+                    if (!selectedNormal && screen.find("Startup Menu") != std::string::npos && screen.find("Normal") != std::string::npos) {
+                        tapKey(2, '1'); namedKey("ENTER"); selectedNormal = true;
+                        std::cout << "Selected Normal startup\n";
+                    }
+                    if (!dismissedWarning && !text.empty() && screen.find(text) != std::string::npos) {
+                        namedKey("ENTER"); dismissedWarning = true;
+                        std::cout << "Dismissed configured startup warning: " << text << '\n';
+                    }
+                }
                 auto remaining = deadline - ExecutionTiming::HostClock::now();
                 if (remaining <= ExecutionTiming::HostClock::duration::zero()) break;
                 timing.run(*pc, speed == "full", std::min(remaining,
@@ -550,6 +580,8 @@ int headless(const std::filesystem::path& script) {
             }
             if (waiting && pc->text().find(text) == std::string::npos)
                 throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": realtime timeout waiting for: " + text);
+            if (booting && (pc->powerOffRequested || !ready()))
+                throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": timeout waiting for Windows graphics startup");
             std::cout << "Realtime " << speed << ": host="
                 << std::chrono::duration<double>(ExecutionTiming::HostClock::now() - started).count()
                 << "s guest=" << (pc->clock - beforeClock) / ExecutionTiming::PitHz << "s\n";
@@ -594,6 +626,18 @@ int headless(const std::filesystem::path& script) {
             bool valid = arg == "powered-off" ? pc->powerOffRequested : arg == "graphics" ? !pc->powerOffRequested && pc->vga.graphics()
                 : arg == "text" ? !pc->powerOffRequested && !pc->vga.graphics() : false;
             if (!valid) throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": state assertion failed: " + arg);
+        } else if (op == "reject-fault") {
+            std::istringstream input(arg); unsigned vector; std::string address, extra;
+            if (!(input >> vector >> address) || vector > 31 || (input >> extra))
+                throw std::runtime_error("Expected reject-fault <vector 0..31> <linear address>");
+            size_t used = 0; auto value = std::stoull(address, &used, 0);
+            if (used != address.size() || value > UINT32_MAX) throw std::runtime_error("Invalid reject-fault address");
+            auto previous = pc->cpu.onFault;
+            pc->cpu.onFault = [previous, vector, value](CpuFault fault, uint32_t linear) {
+                if (fault.vector == vector && linear == value)
+                    throw std::runtime_error("Rejected guest fault " + std::to_string(vector) + " at linear address " + std::to_string(linear));
+                if (previous) previous(fault, linear);
+            };
         } else if (op == "key") namedKey(arg);
         else if (op == "type" || op == "type-paced") {
             // 先按修饰键，再 make/break 字符键；paced 版本留出宿主时间供图形系统消费输入。
@@ -612,7 +656,7 @@ int headless(const std::filesystem::path& script) {
                     ExecutionTiming typing; typing.reset(*pc);
                     auto deadline = ExecutionTiming::HostClock::now() + std::chrono::milliseconds(100);
                     while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline)
-                        typing.run(*pc, true, std::chrono::milliseconds(8), stableTiming);
+                        typing.run(*pc, pacedFullSpeed, std::chrono::milliseconds(8), stableTiming);
                 }
             }
         } else if (op == "mouse") {
@@ -641,6 +685,48 @@ int headless(const std::filesystem::path& script) {
     }
     if (pc->hard) pc->hard->flush();
     std::cout << pc->text() << "\nHeadless script passed\n"; return 0;
+}
+
+void headlessRegressionTests() {
+    auto savedPc = std::move(pc);
+    auto savedTiming = stableTiming;
+    stableTiming = false;
+    std::filesystem::path path;
+    try {
+        wchar_t name[MAX_PATH]{};
+        auto folder = std::filesystem::temp_directory_path();
+        if (!GetTempFileNameW(folder.c_str(), L"ash", 0, name)) throw std::runtime_error("Cannot create headless-test script");
+        path = name;
+        auto run = [&](const std::string& commands, const std::vector<uint8_t>& code, const std::string& expectedError) {
+            pc = std::make_unique<Pc>(); pc->setModel(CpuModel::I486);
+            pc->cpu.loadSegment(CS, 0); pc->cpu.ip = 0x500; pc->cpu.setFlags(2);
+            std::copy(code.begin(), code.end(), pc->cpu.mem.begin() + 0x500);
+            std::ofstream out(path); out << commands; out.close();
+            if (!out) throw std::runtime_error("Cannot write headless-test script");
+            try { headless(path); }
+            catch (const std::runtime_error& e) {
+                if (expectedError.empty() || std::string(e.what()).find(expectedError) == std::string::npos) throw;
+                return;
+            }
+            if (!expectedError.empty()) throw std::runtime_error("Headless script should have rejected: " + expectedError);
+        };
+        // EB FE=JMP $；仅忙等，用于验证未触发的故障监控和正常档输入预算。
+        run("reject-fault 0 0x504\nrun 1000\n", {0xeb, 0xfe}, "");
+        // 31 C0=XOR AX,AX；31 D2=XOR DX,DX；F7 F0=DIV AX，应在 0000:0504 产生 #DE。
+        run("reject-fault 0 0x504\nrun 1000\n", {0x31,0xc0,0x31,0xd2,0xf7,0xf0}, "Rejected guest fault 0");
+        run("boot-normal 0 full\n", {0xeb, 0xfe}, "timeout waiting for Windows graphics startup");
+        run("realtime 0 normal\ntype-paced a\n", {0xeb, 0xfe}, "");
+        if (pc->instructions > 1000000) throw std::runtime_error("Normal-speed paced typing exceeded its 100 ms instruction budget");
+        std::filesystem::remove(path);
+    } catch (...) {
+        pc = std::move(savedPc); stableTiming = savedTiming;
+        std::error_code cleanup;
+        if (!path.empty()) std::filesystem::remove(path, cleanup);
+        if (cleanup) std::cerr << "Cannot remove headless-test script: " << cleanup.message() << '\n';
+        throw;
+    }
+    pc = std::move(savedPc); stableTiming = savedTiming;
+    std::cout << "Headless targeted fault rejection / boot timeout / normal-speed paced typing checks passed\n";
 }
 
 int application(int argc, wchar_t** argv) {
@@ -766,6 +852,7 @@ int application(int argc, wchar_t** argv) {
         if (start) pc->boot(pc->bootDrive);
         return headless(script);
     }
+    if (uiTest) headlessRegressionTests();
     auto instance = GetModuleHandleW(nullptr);
     SetProcessDPIAware();
     WNDCLASSW cls{}; cls.hInstance = instance; cls.lpfnWndProc = windowProc; cls.lpszClassName = L"Asm86Native";

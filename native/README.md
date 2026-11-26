@@ -474,17 +474,41 @@ Windows 95 Setup 的 `INT 67h / AX=DE00h` VCPI 探测返回非零 AH，明确报
 
 ```powershell
 .\native\test-os.ps1 -DosImage 'D:\images\DOS.img' -Win31Image '.\native\win31-386.img' `
-  -Win95Image 'D:\images\Windows95.img' -Win98Image 'D:\images\Windows98_new.img'
+  -Win95Image 'D:\images\Windows95.img' -Win98Image 'D:\images\Windows98_8GB.img'
 ```
 
-每个系统先复制底盘，再使用独立差分盘；两次独立进程冷启动验证文件写入及持久化。
-Windows 3.1 验证增强模式启动和退出回 DOS；Windows 95/98 通过开始菜单运行 DOS 文件写入命令，
-再从开始菜单正常关机并断言 APM 关机。每次进程退出后，`os-disk-check.exe` 从已验证的差分盘
-流式生成独立临时视图，并通过 FAT 目录/簇链读取文件、校验真实内容；不会把输入回显当作成功。
-第二次冷启动再次读取并检查文件；不依赖 DOS 窗口上次记忆的全屏/窗口设置。
-此 FAT 文件校验器与现有 FAT 工具一样限于不超过 504 MiB 的 FAT12/FAT16 镜像。
+每个系统先在禁止并发写入的只读锁下复制、校验底盘，再使用独立差分盘；
+两次独立进程冷启动验证文件写入及持久化。Windows 3.1 验证增强模式启动和退出回 DOS；
+Windows 95 通过开始菜单运行 DOS 文件写入命令，再正常关机并断言 APM 关机。
+`os-disk-check.exe` 直接按需读取底盘+已验证差分盘的逻辑扇区，不生成整盘合并快照，
+支持运行时上限内的 FAT12/FAT16/FAT32 镜像，包括 8 GiB FAT32 和 4 GiB 之后的文件簇。
+校验所需链的 FAT 副本、活动 FAT、分区/簇边界、环和文件长度；单文件最多读取 16 MiB。
+文件内容必须完整匹配预期 ASCII 文本，仅额外允许 DOS ECHO 的结尾 CRLF，不把输入回显或子串当作成功。
+底盘的差分身份哈希仍采用流式整盘校验；离线编辑工具的 FAT12/16、504 MiB 上限保持不变。
+
+Windows 98 默认分别测试 `real-full`、`real-normal`、`stable-full`、`stable-normal`：
+同一只读底盘配四个独立差分盘，每个模式都执行两次冷启动。
+当前流程针对安装在 `C:\WINDOWS`、标准 VGA、空密码登录的英文 Windows 98：
+自动选择恢复启动菜单的 Normal；启动 Welcome 并监控当前回归镜像的 `0040524Ah` 除零；
+由资源管理器新建唯一目录，由记事本保存文本，DOS 创建文件，再正常关机。
+第二次启动通过记事本打开原文件、追加并保存，DOS 复制上次文件，并核对实际 FAT 内容。
+首次启动还默认按宿主时间运行五分钟，然后再次通过 DOS 复制文件，证明持续运行后仍能执行读写操作。
+应用截图用于诊断；文件校验和 APM 关机断言才决定持久化/关机检查是否通过。
+快捷键、运行对话框和新建目录重命名分别留出处理时间，避免低吞吐量下输入早于窗口就绪。
+
+仅测试自己的已安装 Windows 98 镜像，可显式跳过其他系统：
+
+```powershell
+.\native\test-os.ps1 -DosImage '' -Win31Image '' -Win98Image 'D:\images\Windows98_8GB.img' `
+  -Win98TimingModes real-full,real-normal,stable-full,stable-normal -Win98SoakSeconds 300
+```
+
+`-Win98TimingModes` 可选择一个或多个模式，`-Win98SoakSeconds 0` 可跳过持续运行检查，
+延长测试可设为 900 等值。`-TimeoutSeconds` 是每个进程的宿主超时，默认 1200 秒；
+延长持续运行时间时也应相应增大超时。
 截图、寄存器、错误日志及 `results.json` 保存在输出目录；图形模式失败时自动保存 `.failure.bmp`。
-Windows 98 默认等待当前测试镜像的 `vnetbios.vxd` 提示并按 Enter；无此提示的镜像请传 `-Win98Warning ''`。
+Windows 98 只在实际出现 `-Win98Warning` 指定的文本提示时按 Enter，默认 `vnetbios.vxd`；
+未出现不会额外等待，也可传 `-Win98Warning ''` 禁用。不会自动忽略其他错误。
 未提供的系统明确标记 `Skipped`，任何已选择系统失败或全部跳过均返回失败。
 每个进程有超时限制，超时仅终止测试自己创建的进程；失败时保留工作盘，不修改源 IMG。
 可用 `-Executable` 选择候选 EXE、`-OutputDirectory` 指定尚不存在的结果目录、`-KeepDisks` 保留成功工作盘。
@@ -493,6 +517,12 @@ Windows 98 默认等待当前测试镜像的 `vnetbios.vxd` 提示并按 Enter�
 `expect-state graphics/text/powered-off` 明确断言显示/关机状态，不能用脚本执行完代替关机成功。
 `key CTRL_DOWN/CTRL_UP` 支持控制键组合；`type-paced <文字>` 每字符推进约 100ms，
 适合 Windows GUI 输入；原有 `type` 保持原来的确定性快速输入行为。
+`type-paced` 和 `wait-realtime` 沿用最近一次 `realtime`/`boot-normal` 的正常或全速选择。
+`boot-normal <毫秒> <normal|full> [预期提示]` 选择 Normal 并等待至少 640×480 的图形模式，
+它不表示桌面已经就绪；脚本另给登录和应用初始化留出时间。
+`reject-fault <向量> <线性地址>` 在指定位置出现指定 CPU 异常时使测试失败，不吞掉客体异常。
+`key END` 提供扩展 End 键，可配合 `CTRL_DOWN/CTRL_UP` 在记事本中追加文本。
+`key A..Z/0..9` 发送原始按键，适合 Ctrl/Alt 快捷键和菜单；`type-paced` 用于输入文本。
 
 ## ISA DMA 底座
 

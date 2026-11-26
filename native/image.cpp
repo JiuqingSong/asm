@@ -10,7 +10,7 @@
 #include <set>
 #include <stdexcept>
 
-// 离线 FAT12/FAT16 映像工具：先在内存副本完成全部修改/校验，再原子发布，不修改挂载中的盘。
+// 离线 FAT12/FAT16 编辑先在内存副本校验再原子发布；回归另提供 FAT12/16/32 流式只读接口。
 namespace asm86::image {
 namespace {
 using Bytes = std::vector<uint8_t>;
@@ -741,5 +741,148 @@ Bytes read(const std::filesystem::path& path, const std::wstring& file) {
         std::copy_n(b.begin() + v.at(c), count, result.begin() + position); position += count;
     }
     return result;
+}
+
+Bytes readSectors(uint32_t sectors, const std::function<bool(uint32_t, uint8_t*)>& reader,
+                  const std::wstring& file, uint32_t maxFileBytes) {
+    auto sector = [&](uint64_t lba) {
+        Bytes bytes(512);
+        if (lba >= sectors) throw std::runtime_error("FAT sector is outside the disk");
+        if (!reader(uint32_t(lba), bytes.data())) throw std::runtime_error("Cannot read FAT disk sector");
+        return bytes;
+    };
+    auto boot = sector(0);
+    auto isBpb = [&](const Bytes& b) {
+        return w(b, 510) == 0xaa55 && w(b, 11) == 512 && b[13] && w(b, 14) &&
+            b[16] && (w(b, 22) || (!w(b, 17) && d(b, 36)));
+    };
+    uint32_t base = 0, volumeSectors = sectors;
+    if (!isBpb(boot)) {
+        if (w(boot, 510) != 0xaa55) throw std::runtime_error("Unformatted disk");
+        bool found = false;
+        for (unsigned at = 446; at < 510; at += 16) {
+            auto type = boot[at + 4];
+            if (type != 1 && type != 4 && type != 6 && type != 0x0e && type != 0x0b && type != 0x0c) continue;
+            if (found) throw std::runtime_error("Multiple FAT primary partitions are not supported");
+            base = d(boot, at + 8); volumeSectors = d(boot, at + 12);
+            if (!base || !volumeSectors || uint64_t(base) + volumeSectors > sectors)
+                throw std::runtime_error("Invalid or out-of-bounds FAT partition");
+            found = true;
+        }
+        if (!found) throw std::runtime_error("No FAT12/FAT16/FAT32 primary partition found");
+        boot = sector(base);
+    }
+    if (!isBpb(boot)) throw std::runtime_error("Invalid FAT BPB");
+    auto total = w(boot, 19) ? uint32_t(w(boot, 19)) : d(boot, 32);
+    unsigned spc = boot[13], fats = boot[16], rootEntries = w(boot, 17);
+    uint32_t fatSectors = w(boot, 22) ? uint32_t(w(boot, 22)) : d(boot, 36);
+    uint64_t rootSectors = (uint64_t(rootEntries) * 32 + 511) / 512;
+    uint64_t metadata = w(boot, 14) + uint64_t(fats) * fatSectors + rootSectors;
+    if ((spc & (spc - 1)) || spc > 128 || fats > 2 || !total || total > volumeSectors || metadata >= total)
+        throw std::runtime_error("Invalid FAT geometry or volume bounds");
+    uint32_t clusters = uint32_t((total - metadata) / spc);
+    unsigned bits = clusters < 4085 ? 12 : clusters < 65525 ? 16 : 32;
+    uint32_t reservedCluster = bits == 12 ? 0xff0 : bits == 16 ? 0xfff0 : 0xffffff0;
+    if (!clusters || uint64_t(clusters) + 2 > reservedCluster ||
+        (uint64_t(clusters + 2) * bits + 7) / 8 > uint64_t(fatSectors) * 512 ||
+        (bits == 32 ? w(boot, 22) || rootEntries || w(boot, 42) : !w(boot, 22) || !rootEntries))
+        throw std::runtime_error("Unsupported FAT layout or undersized allocation table");
+    uint64_t fat = uint64_t(base) + w(boot, 14);
+    uint64_t root = fat + uint64_t(fats) * fatSectors, data = uint64_t(base) + metadata;
+    bool mirrored = bits != 32 || !(w(boot, 40) & 0x80);
+    unsigned activeFat = mirrored ? 0 : w(boot, 40) & 15;
+    if (activeFat >= fats) throw std::runtime_error("Invalid active FAT index");
+    auto get = [&](uint32_t cluster) {
+        // FAT12 项可能跨扇区；FAT32 屏蔽高四位，并遵守活动 FAT/镜像标志。
+        uint64_t offset = bits == 12 ? uint64_t(cluster) * 3 / 2 : uint64_t(cluster) * (bits / 8);
+        auto value = [&](unsigned copy) {
+            auto bytes = sector(fat + uint64_t(copy) * fatSectors + offset / 512);
+            unsigned at = unsigned(offset % 512);
+            if (bits == 12 && at == 511) {
+                auto next = sector(fat + uint64_t(copy) * fatSectors + offset / 512 + 1);
+                bytes.push_back(next[0]);
+            }
+            return bits == 32 ? d(bytes, at) & 0xfffffff : bits == 16 ? uint32_t(w(bytes, at))
+                : cluster & 1 ? uint32_t(w(bytes, at) >> 4) : uint32_t(w(bytes, at) & 0xfff);
+        };
+        auto result = value(activeFat);
+        if (mirrored) for (unsigned copy = 1; copy < fats; ++copy)
+            if (value(copy) != result) throw std::runtime_error("FAT copies disagree on the requested chain");
+        return result;
+    };
+    auto eoc = [&](uint32_t cluster) { return cluster >= reservedCluster + 8; };
+    auto valid = [&](uint32_t cluster) {
+        if (cluster < 2 || cluster >= clusters + 2 || cluster >= reservedCluster)
+            throw std::runtime_error("Invalid FAT cluster chain");
+    };
+    auto mediaPrefix = bits == 12 ? 0xf00u : bits == 16 ? 0xff00u : 0xfffff00u;
+    auto statusMask = bits == 12 ? 0xfffu : bits == 16 ? 0x3fffu : 0x3ffffffu;
+    // FAT16/32 第二项包含清洁关机和 I/O 错误标志，不能把这些状态位当作簇链损坏。
+    if (get(0) != (mediaPrefix | boot[21]) || (get(1) & statusMask) < (statusMask - 7))
+        throw std::runtime_error("Invalid reserved FAT entries");
+    uint32_t directory = bits == 32 ? d(boot, 44) & 0xfffffff : 0;
+    if (bits == 32) valid(directory);
+    auto names = parts(file);
+    if (names.empty()) throw std::runtime_error("Missing file name");
+    Bytes entry;
+    for (size_t component = 0; component < names.size(); ++component) {
+        entry.clear();
+        std::set<uint32_t> seen;
+        uint32_t cluster = directory;
+        bool ended = false;
+        do {
+            if (directory) {
+                valid(cluster);
+                if (!seen.insert(cluster).second) throw std::runtime_error("Cyclic FAT directory chain");
+            }
+            uint64_t first = directory ? data + uint64_t(cluster - 2) * spc : root;
+            unsigned count = directory ? spc : unsigned(rootSectors);
+            for (unsigned s = 0; s < count && entry.empty() && !ended; ++s) {
+                auto bytes = sector(first + s);
+                for (unsigned at = 0; at < 512; at += 32) {
+                    if (!directory && uint64_t(s) * 16 + at / 32 >= rootEntries) { ended = true; break; }
+                    if (!bytes[at]) { ended = true; break; }
+                    if (bytes[at] == 0xe5 || (bytes[at + 11] & 8)) continue;
+                    if (std::equal(names[component].begin(), names[component].end(), bytes.begin() + at)) {
+                        entry.assign(bytes.begin() + at, bytes.begin() + at + 32); break;
+                    }
+                }
+            }
+            if (!directory || ended || !entry.empty()) break;
+            cluster = get(cluster);
+        } while (!eoc(cluster));
+        if (entry.empty()) throw std::runtime_error("File not found: " + display(names[component]));
+        auto firstCluster = uint32_t(w(entry, 26));
+        if (bits == 32) firstCluster |= uint32_t(w(entry, 20) & 0xfff) << 16;
+        else if (w(entry, 20)) throw std::runtime_error("Invalid FAT12/FAT16 directory entry");
+        if (component + 1 < names.size()) {
+            if (!(entry[11] & 16)) throw std::runtime_error("Path component is not a directory");
+            valid(firstCluster); directory = firstCluster;
+        } else directory = firstCluster;
+    }
+    if (entry[11] & 16) throw std::runtime_error("Requested file is a directory");
+    uint32_t length = d(entry, 28);
+    if (length > maxFileBytes || length > uint64_t(clusters) * spc * 512)
+        throw std::runtime_error("File exceeds the verification limit or volume capacity");
+    if (!length && !directory) return {};
+    Bytes result(length);
+    size_t position = 0;
+    std::set<uint32_t> seen;
+    for (uint32_t cluster = directory;;) {
+        valid(cluster);
+        if (!seen.insert(cluster).second) throw std::runtime_error("Cyclic FAT file chain");
+        for (unsigned s = 0; s < spc && position < length; ++s) {
+            auto bytes = sector(data + uint64_t(cluster - 2) * spc + s);
+            auto count = std::min<size_t>(512, length - position);
+            std::copy_n(bytes.begin(), count, result.begin() + position); position += count;
+        }
+        auto next = get(cluster);
+        if (eoc(next)) {
+            if (position != length) throw std::runtime_error("Truncated FAT file chain");
+            return result;
+        }
+        if (position == length) throw std::runtime_error("FAT file chain exceeds its declared size");
+        cluster = next;
+    }
 }
 }

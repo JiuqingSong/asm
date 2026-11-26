@@ -1,11 +1,12 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace asm86::image {
-// 离线工具会整盘加载内存，只处理 <=504 MiB FAT12/16；不要照搬运行时 Disk 的 32 GiB 上限。
+// 文件路径版离线工具整盘加载内存，只处理 <=504 MiB FAT12/16；流式校验接口不受此上限。
 constexpr uint64_t MaxHardBytes = 504ULL * 1024 * 1024;
 constexpr uint64_t CylinderBytes = 16 * 63 * 512;
 struct Entry {
@@ -41,4 +42,8 @@ void put(const std::filesystem::path& path, const std::vector<std::filesystem::p
 Info inspect(const std::filesystem::path& path, const std::wstring& directory = L"\\");
 
 std::vector<uint8_t> read(const std::filesystem::path& path, const std::wstring& file);
+
+// 回归校验按需读取逻辑扇区，支持 FAT12/16/32；不整盘加载，也不修改底盘或差分盘。
+std::vector<uint8_t> readSectors(uint32_t sectors, const std::function<bool(uint32_t, uint8_t*)>& reader,
+                               const std::wstring& file, uint32_t maxFileBytes = 16 * 1024 * 1024);
 }
