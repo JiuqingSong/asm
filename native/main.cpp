@@ -7,6 +7,8 @@
 #include <windowsx.h>
 #include <chrono>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -14,13 +16,19 @@
 
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768 };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
 bool running = false;
 // Execution faults stop the CPU without powering off its diagnostic display.
 bool poweredOn = false;
+bool paused = false;
+std::function<bool()> confirmationDecision;
+auto statsOrigin = ExecutionTiming::HostClock::now();
+uint64_t statsInstructions = 0, statsDisk = 0, statsReads = 0, statsWrites = 0;
+uint64_t activityReads = 0, activityWrites = 0;
+double measuredMips = 0;
 bool rightCtrlDown = false;
 bool fullSpeed = false;
 bool stableTiming = false;
@@ -56,7 +64,15 @@ void title(HWND hwnd) {
     if (mouseCaptured) value += L" | Mouse captured (Right Ctrl releases)";
     if (stableTiming && pc->cpu.model == CpuModel::I486) value += L" | Stable CPU timing";
     if (!poweredOn) value += L" | powered off";
+    else if (paused) value += L" | paused";
     else if (!running) value += L" | stopped";
+    std::wostringstream metrics;
+    metrics << L" | Guest: " << uint64_t(pc->clock / ExecutionTiming::PitHz) << L"s | "
+        << std::fixed << std::setprecision(1) << measuredMips << L" MIPS | Disk R+" << activityReads << L" W+" << activityWrites;
+    value += metrics.str();
+    if (!ModifyMenuW(GetMenu(hwnd), PauseResume, MF_BYCOMMAND | MF_STRING |
+        (poweredOn && (running || paused) ? MF_ENABLED : MF_GRAYED), PauseResume, paused ? L"Resume" : L"Pause"))
+        throw std::runtime_error("Cannot update pause menu");
     if (EnableMenuItem(GetMenu(hwnd), CtrlAltDel, MF_BYCOMMAND | (poweredOn ? MF_ENABLED : MF_GRAYED)) == -1)
         throw std::runtime_error("Cannot update restart menu");
     if (EnableMenuItem(GetMenu(hwnd), DiscardOverlay, MF_BYCOMMAND |
@@ -68,6 +84,24 @@ void title(HWND hwnd) {
         stableTiming && pc->cpu.model == CpuModel::I486 ? L"Full speed (stable CPU timers)" : L"Full speed (real-time timers)"))
         throw std::runtime_error("Cannot update execution speed menu");
     SetWindowTextW(hwnd, value.c_str());
+}
+void resetStats() {
+    statsOrigin = ExecutionTiming::HostClock::now(); statsInstructions = pc->instructions;
+    statsDisk = pc->hard ? pc->hard->identity : 0;
+    statsReads = pc->hard ? pc->hard->readSectors : 0; statsWrites = pc->hard ? pc->hard->writtenSectors : 0;
+    measuredMips = 0; activityReads = activityWrites = 0;
+}
+void updateStats(HWND hwnd) {
+    auto now = ExecutionTiming::HostClock::now();
+    auto seconds = std::chrono::duration<double>(now - statsOrigin).count();
+    if (seconds < 1) return;
+    measuredMips = running && pc->instructions >= statsInstructions ? double(pc->instructions - statsInstructions) / seconds / 1e6 : 0;
+    auto identity = pc->hard ? pc->hard->identity : 0;
+    auto reads = pc->hard ? pc->hard->readSectors : 0, writes = pc->hard ? pc->hard->writtenSectors : 0;
+    activityReads = identity == statsDisk ? reads - statsReads : reads;
+    activityWrites = identity == statsDisk ? writes - statsWrites : writes;
+    statsOrigin = now; statsInstructions = pc->instructions; statsDisk = identity; statsReads = reads; statsWrites = writes;
+    title(hwnd);
 }
 void releaseMouse(HWND hwnd) {
     if (!mouseCaptured) return;
@@ -82,6 +116,13 @@ void releaseKeyboard() {
         pressedKeys[scan] = false;
     }
     if (!running) pc->modifiers(0);
+}
+bool confirmChange(HWND hwnd, const wchar_t* text) {
+    releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
+    if (confirmationDecision) return confirmationDecision();
+    auto answer = MessageBoxW(hwnd, text, L"Asm86 - confirm machine change", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
+    if (answer != IDYES && answer != IDNO) throw std::runtime_error("Cannot show machine confirmation dialog");
+    return answer == IDYES;
 }
 void centerMouse(HWND hwnd) {
     RECT rect{}; GetClientRect(hwnd, &rect);
@@ -178,7 +219,7 @@ void execute(HWND hwnd) {
     if (pc->powerOffRequested) {
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
         if (pc->hard) pc->hard->flush();
-        poweredOn = running = false;
+        poweredOn = running = paused = false; resetStats();
         title(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
         return;
     }
@@ -186,7 +227,7 @@ void execute(HWND hwnd) {
     if (pc->rebootRequested) {
         if (pc->hard) pc->hard->flush();
         pc->boot(pc->floppy ? 0 : 0x80);
-        executionTiming.reset(*pc);
+        executionTiming.reset(*pc); resetStats();
     }
     if (!pc->notice.empty()) {
         auto text = wide(pc->notice); pc->notice.clear();
@@ -224,14 +265,16 @@ void command(HWND hwnd, int id) {
     }
     case DiscardOverlay:
         if (poweredOn || !pc->hard || !pc->hard->hasOverlay()) break;
-        if (MessageBoxW(hwnd, L"Discard all writes in this overlay and return to the base disk?\nThis cannot be undone. The base IMG will not be modified.",
-            L"Discard overlay", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) pc->hard->discardOverlay();
+        if (confirmChange(hwnd, L"Discard all writes in this overlay and return to the base disk?\nThis cannot be undone. The base IMG will not be modified."))
+            pc->hard->discardOverlay();
         break;
-    case NewHard: case NewHard126: case NewHard504: case LoadHard: {
-        if (running) { MessageBoxW(hwnd, L"Power off the machine before replacing the hard disk (Machine > Power off).", L"Hard disk", MB_OK); break; }
+    case NewHard: case NewHard126: case NewHard504: case NewHard2048: case NewHard8192: case NewHard32768: case LoadHard: {
+        if (poweredOn || running) { MessageBoxW(hwnd, L"Power off the machine before replacing the hard disk (Machine > Power off).", L"Hard disk", MB_OK); break; }
         auto p = choose(hwnd, id != LoadHard);
         if (!p.empty()) {
-            if (id != LoadHard) Disk::create(p, id == NewHard504 ? 1024 : id == NewHard126 ? 256 : 64);
+            if (id == NewHard2048 || id == NewHard8192 || id == NewHard32768)
+                Disk::createBytes(p, uint64_t(id == NewHard32768 ? 32 : id == NewHard8192 ? 8 : 2) << 30);
+            else if (id != LoadHard) Disk::create(p, id == NewHard504 ? 1024 : id == NewHard126 ? 256 : 64);
             pc->hard = std::make_unique<Disk>(p, false, false);
             if (preferences) { preferences->hard(pc->hard->path); preferences->overlay({}); }
         }
@@ -239,15 +282,26 @@ void command(HWND hwnd, int id) {
     }
     case BootA: case BootC: case CtrlAltDel:
         if (id == CtrlAltDel && !poweredOn) break;
+        if (poweredOn && !confirmChange(hwnd, L"Restart the machine and discard its current state?\nShut down Windows first to avoid filesystem corruption.")) break;
         releaseMouse(hwnd); releaseKeyboard();
         pc->boot(id == BootA || (id == CtrlAltDel && pc->floppy) ? 0 : 0x80);
-        executionTiming.reset(*pc);
-        poweredOn = running = true; break;
+        executionTiming.reset(*pc); resetStats();
+        poweredOn = running = true; paused = false; break;
+    case PauseResume:
+        if (!poweredOn || (!running && !paused)) break;
+        if (running) {
+            releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
+            running = false; paused = true;
+        } else {
+            executionTiming.reset(*pc); running = true; paused = false;
+        }
+        resetStats(); break;
     case Reset:
+        if (poweredOn && !confirmChange(hwnd, L"Force power off?\nUnsaved guest data may be lost. Prefer shutting down within Windows.")) break;
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
-        poweredOn = running = false; if (pc->hard) pc->hard->flush(); break;
+        poweredOn = running = paused = false; resetStats(); if (pc->hard) pc->hard->flush(); break;
     case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
-        if (running) { MessageBoxW(hwnd, L"Power off the machine before changing the CPU (Machine > Power off).", L"CPU", MB_OK); break; }
+        if (poweredOn || running) { MessageBoxW(hwnd, L"Power off the machine before changing the CPU (Machine > Power off).", L"CPU", MB_OK); break; }
         pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088);
         poweredOn = false;
         if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu486, id, MF_BYCOMMAND))
@@ -281,6 +335,7 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         case WM_TIMER:
             {
             if (running) execute(hwnd);
+            updateStats(hwnd);
             if (!IsIconic(hwnd)) InvalidateRect(hwnd, nullptr, FALSE); return 0;
             }
         case WM_APP:
@@ -353,11 +408,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             catch (...) { EndPaint(hwnd, &paint); throw; }
             EndPaint(hwnd, &paint); return 0;
         }
-        case WM_CLOSE: releaseMouse(hwnd); if (pc->hard) pc->hard->flush(); DestroyWindow(hwnd); return 0;
+        case WM_CLOSE:
+            if (poweredOn && !confirmChange(hwnd, L"Close while the machine is powered on?\nThis forces power off and may lose guest data.")) return 0;
+            releaseMouse(hwnd); releaseKeyboard(); poweredOn = running = paused = false;
+            if (pc->hard) pc->hard->flush(); DestroyWindow(hwnd); return 0;
         case WM_DESTROY: KillTimer(hwnd, 1); PostQuitMessage(0); return 0;
         }
     } catch (const std::exception& e) {
-        releaseMouse(hwnd); running = false; title(hwnd);
+        releaseMouse(hwnd); running = paused = false; resetStats(); title(hwnd);
         MessageBoxW(hwnd, wide(e.what()).c_str(), L"Asm86 - machine stopped", MB_OK | MB_ICONERROR); return 0;
     }
     return DefWindowProcW(hwnd, message, w, l);
@@ -567,14 +625,16 @@ int application(int argc, wchar_t** argv) {
         }
         else if (option == L"--cdrom") pc->cdrom.insert(value);
         else if (option == L"--create-hard") {
-            unsigned cylinders = 64;
+            uint64_t bytes = 64ULL * 1008 * 512;
             if (i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) {
                 std::wstring size = argv[++i];
-                if (size != L"31.5" && size != L"126" && size != L"504")
-                    throw std::runtime_error("Optional --create-hard size must be 31.5, 126 or 504 MiB");
-                cylinders = size == L"504" ? 1024 : size == L"126" ? 256 : 64;
+                if (size == L"31.5" || size == L"126" || size == L"504")
+                    bytes = (size == L"504" ? 1024ULL : size == L"126" ? 256ULL : 64ULL) * 1008 * 512;
+                else if (size == L"1024" || size == L"2048" || size == L"8192" || size == L"32768")
+                    bytes = std::stoull(size) * 1024 * 1024;
+                else throw std::runtime_error("Optional --create-hard size must be 31.5, 126, 504, 1024, 2048, 8192 or 32768 MiB");
             }
-            Disk::create(value, cylinders); hardPath = value;
+            Disk::createBytes(value, bytes); hardPath = value;
             hardSpecified = true;
         }
         else if (option == L"--cpu") {
@@ -673,6 +733,9 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(sizes, MF_STRING, NewHard, L"31.5 MiB...");
     AppendMenuW(sizes, MF_STRING, NewHard126, L"126 MiB...");
     AppendMenuW(sizes, MF_STRING, NewHard504, L"504 MiB...");
+    AppendMenuW(sizes, MF_STRING, NewHard2048, L"2 GiB (sparse)...");
+    AppendMenuW(sizes, MF_STRING, NewHard8192, L"8 GiB (sparse)...");
+    AppendMenuW(sizes, MF_STRING, NewHard32768, L"32 GiB (sparse)...");
     AppendMenuW(disks, MF_POPUP, UINT_PTR(sizes), L"Create C: hard disk");
     AppendMenuW(disks, MF_STRING, LoadHard, L"Open C: hard disk...");
     AppendMenuW(disks, MF_STRING, LoadOverlay, L"Open C: with overlay (base read-only)...");
@@ -684,6 +747,7 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(machine, MF_STRING, BootC, L"Boot / restart from C:");
     AppendMenuW(machine, MF_STRING, CtrlAltDel, L"Ctrl+Alt+Del\tRight Ctrl+Del");
     AppendMenuW(machine, MF_STRING, Reset, L"Power off");
+    AppendMenuW(machine, MF_STRING, PauseResume, L"Pause");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed, L"Full speed (real-time timers)");
     AppendMenuW(machine, MF_STRING | (stableTiming ? MF_CHECKED : MF_UNCHECKED), StableTiming, L"Stable CPU timing (Windows 98)");
@@ -712,9 +776,10 @@ int application(int argc, wchar_t** argv) {
     }
     if (!running) { pc->cpu.ww(0x40, 0x4a, 80); pc->cpu.wb(0x40, 0x60, 0x20); }
     original(hwnd); title(hwnd); ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
-    executionTiming.reset(*pc);
+    executionTiming.reset(*pc); resetStats();
     if (!SetTimer(hwnd, 1, 16, nullptr)) throw std::runtime_error("Cannot start execution timer");
     if (uiTest) {
+        confirmationDecision = [] { return true; };
         if (poweredOn || running) throw std::runtime_error("GUI startup must remain powered off even with --boot");
         auto checkBlackScreen = [&]() {
             RECT area{}; GetClientRect(hwnd, &area);
@@ -1064,8 +1129,10 @@ int application(int argc, wchar_t** argv) {
         running = false;
         std::cout << "CPU selection / XT-AT make-break / focus-loss checks passed\n";
         std::array<std::filesystem::path, 2> resetImages{};
+        std::filesystem::path resetOverlay;
         auto removeResetImages = [&]() {
             pc->floppy.reset(); pc->hard.reset();
+            if (!resetOverlay.empty()) std::filesystem::remove(resetOverlay);
             for (const auto& path : resetImages) if (!path.empty()) std::filesystem::remove(path);
         };
         try {
@@ -1157,13 +1224,66 @@ int application(int argc, wchar_t** argv) {
                         throw std::runtime_error("Explicit boot must clear guest APM shutdown state");
                 }
             }
+            if (fullSpeed) SendMessageW(hwnd, WM_COMMAND, FullSpeed, 0);
+            if (stableTiming) SendMessageW(hwnd, WM_COMMAND, StableTiming, 0);
+            SendMessageW(hwnd, WM_KEYDOWN, 'A', LPARAM(0x1e << 16));
+            SendMessageW(hwnd, WM_COMMAND, PauseResume, 0);
+            auto heldInstructions = pc->instructions; auto heldClock = pc->clock;
+            Sleep(150); SendMessageW(hwnd, WM_TIMER, 1, 0); SendMessageW(hwnd, WM_APP, 0, 0);
+            if (!paused || running || !poweredOn || pressedKeys[0x1e] || pc->instructions != heldInstructions || pc->clock != heldClock)
+                throw std::runtime_error("Pause must release input and freeze both CPU and guest device time");
+            unsigned prompts = 0;
+            confirmationDecision = [&] { ++prompts; return false; };
+            for (int action : {Reset, BootC, CtrlAltDel}) {
+                SendMessageW(hwnd, WM_COMMAND, action, 0);
+                if (!paused || running || !poweredOn || pc->instructions != heldInstructions || pc->clock != heldClock)
+                    throw std::runtime_error("Declining a destructive action must preserve the paused machine");
+            }
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            if (!IsWindow(hwnd) || prompts != 4) throw std::runtime_error("Closing a powered-on machine must honor a declined confirmation");
+            confirmationDecision = [] { return true; };
+            SendMessageW(hwnd, WM_COMMAND, PauseResume, 0);
+            SendMessageW(hwnd, WM_TIMER, 1, 0);
+            if (!running || paused || pc->instructions <= heldInstructions || pc->clock - heldClock > ExecutionTiming::PitHz * 0.05)
+                throw std::runtime_error("Resume must execute without catching up the paused host interval");
+            std::array<uint8_t, 512> bytes{};
+            if (!pc->hard->read(0, bytes.data()) || !pc->hard->write(0, bytes.data())) throw std::runtime_error("Cannot exercise disk activity counters");
+            statsOrigin = ExecutionTiming::HostClock::now() - std::chrono::seconds(1);
+            updateStats(hwnd); GetWindowTextW(hwnd, caption, int(std::size(caption)));
+            if (measuredMips <= 0 || activityReads != 1 || activityWrites != 1 || !std::wcsstr(caption, L"MIPS"))
+                throw std::runtime_error("Runtime status must report measured guest work and actual successful disk I/O");
+            SendMessageW(hwnd, WM_COMMAND, Reset, 0);
+            pc->hard.reset();
+            resetOverlay = std::filesystem::path(resetImages[0].wstring() + L".cow");
+            pc->hard = std::make_unique<Disk>(resetImages[0], false, false, resetOverlay);
+            std::array<uint8_t, 512> baseline{}, modified{}; modified.fill(0x4c);
+            if (!pc->hard->read(7, baseline.data()) || !pc->hard->write(7, modified.data())) throw std::runtime_error("Cannot prepare overlay UI test");
+            SendMessageW(hwnd, WM_COMMAND, BootC, 0); SendMessageW(hwnd, WM_COMMAND, PauseResume, 0);
+            SendMessageW(hwnd, WM_COMMAND, DiscardOverlay, 0);
+            if (!pc->hard->read(7, bytes.data()) || bytes != modified)
+                throw std::runtime_error("A paused but powered-on machine must not allow overlay rollback");
+            SendMessageW(hwnd, WM_COMMAND, Reset, 0);
+            confirmationDecision = [] { return false; };
+            SendMessageW(hwnd, WM_COMMAND, DiscardOverlay, 0);
+            if (!pc->hard->read(7, bytes.data()) || bytes != modified) throw std::runtime_error("Declining overlay discard must preserve its writes");
+            confirmationDecision = [] { return true; };
+            SendMessageW(hwnd, WM_COMMAND, DiscardOverlay, 0);
+            if (!pc->hard->read(7, bytes.data()) || bytes != baseline || std::filesystem::file_size(resetOverlay) != 64)
+                throw std::runtime_error("Confirmed powered-off discard must restore the base disk view");
+            std::cout << "Pause-resume / frozen guest time / no catch-up / measured MIPS-disk I/O / declined destructive actions / guarded overlay rollback checks passed\n";
         } catch (...) { releaseMouse(hwnd); SetCursorPos(savedCursor.x, savedCursor.y); removeResetImages(); throw; }
         if (!SetCursorPos(savedCursor.x, savedCursor.y)) throw std::runtime_error("Cannot restore reset-test cursor");
         std::cout << "Guest APM shutdown / black screen / stopped execution / explicit power-on checks passed\n";
         running = false; removeResetImages();
         std::cout << "Ctrl+Alt+Del menu / Right-Ctrl+Del / capture release / floppy-first / hard-disk fallback / CPU-speed preservation checks passed\n";
         pc = std::move(savedPc);
-        DestroyWindow(hwnd);
+        unsigned acceptedClose = 0;
+        confirmationDecision = [&] { ++acceptedClose; return true; };
+        poweredOn = true;
+        SendMessageW(hwnd, WM_CLOSE, 0, 0);
+        if (IsWindow(hwnd) || acceptedClose != 1 || poweredOn || running)
+            throw std::runtime_error("An accepted powered-on close must flush, power off and close the window");
+        confirmationDecision = {};
     }
     BOOL result;
     while ((result = processMessage(hwnd)) > 0) {}
