@@ -1,7 +1,8 @@
 #pragma once
 #include <cstdint>
 
-// Generated from src/machine/font8x8.ts builtinFont(); no browser font fallback.
+// 从 src/machine/font8x8.ts 的 builtinFont() 生成，不依赖浏览器/宿主字体回退。
+// CP437 每字符 8 个字节、每字节一行点阵（高位在左）；这是字形数据，不是 x86 指令。
 namespace asm86 {
 inline constexpr uint8_t biosFont8x8[] = {
     0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <stdexcept>
 
+// 回归辅助工具：读取底盘+差分盘的实际 FAT 文件内容，不以屏幕回显代替持久化验证。
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path temporary;
     try {
@@ -16,6 +17,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!GetTempFileNameW(folder.c_str(), L"asv", 0, name)) throw std::runtime_error("Cannot create verification snapshot");
         temporary = name;
         {
+            // 合并逻辑扇区到私有临时快照，复用离线 FAT 解析器；绝不修改只读底盘。
             std::ofstream out(temporary, std::ios::binary);
             if (!out) throw std::runtime_error("Cannot open verification snapshot");
             std::array<uint8_t, 512> bytes{};
@@ -27,6 +29,8 @@ int wmain(int argc, wchar_t** argv) {
             if (!out) throw std::runtime_error("Cannot finish verification snapshot");
         }
         auto bytes = asm86::image::read(temporary, argv[3]);
+
+        // 比较 guest file 的内容而非键盘输入日志；错误预期必须返回非零退出码。
         std::string expected;
         for (auto p = argv[4]; *p; ++p) {
             if (*p > 127) throw std::runtime_error("Expected content must be ASCII");

@@ -4,18 +4,25 @@
 #include <string>
 #include <tuple>
 
+// 保护模式语义：段权限、描述符/门、特权栈、任务切换与可重启异常。
 namespace asm86 {
 void Cpu::setModel(CpuModel value) { model = value; mem.resize(value != CpuModel::I8088 ? 1 << 24 : 1 << 20); a20 = false; reset(); }
+
 void Cpu::setFlags(uint16_t value) {
     flags = uint16_t((value & (model == CpuModel::I8088 || (model == CpuModel::I286 && !protectedMode()) ? 0x0fd5 : 0x7fd5))
         | (model == CpuModel::I8088 ? 0xf002 : 2));
 }
+
 [[noreturn]] void Cpu::fault(uint8_t vector, int code) { throw CpuFault{vector, code}; }
+
 void Cpu::requireRing0() const { if (protectedMode() && cpl) fault(13, 0); }
+
 void Cpu::requireIo() const { if (protectedMode() && cpl > unsigned((flags >> 12) & 3)) fault(13, 0); }
+
 uint32_t Cpu::segmentBase(int segment) const {
     return protectedMode() || (hiddenSegments & (1 << segment)) ? segments[segment].base : uint32_t(s[segment]) << 4;
 }
+
 void Cpu::checkSegment(int segment, uint32_t offset, unsigned size, bool write, bool execute) const {
     if (!protectedMode() || virtual8086()) {
         if (supports386() && uint64_t(offset) + size - 1 > segments[segment].limit) fault(segment == SS ? 12 : 13, 0);
@@ -23,16 +30,19 @@ void Cpu::checkSegment(int segment, uint32_t offset, unsigned size, bool write, 
     }
     const auto& d = segments[segment]; uint8_t vector = segment == SS ? 12 : 13;
     if (d.null || !(d.access & 0x80)) fault(vector, 0);
-    // LOADALL may leave a writable data descriptor in the executable CS cache.
+
+    // LOADALL 可能给 CS 隐藏缓存安装可写数据描述符，执行检查不能假设它一定是代码段。
     if (!execute && (write ? ((d.access & 8) || !(d.access & 2)) : ((d.access & 10) == 8))) fault(vector, 0);
     uint64_t end = uint64_t(offset) + size - 1;
     if ((d.access & 12) == 4) { if (offset <= d.limit || end > (d.attributes & 0x40 ? 0xffffffffu : 65535u)) fault(vector, 0); }
     else if (end > d.limit) fault(vector, 0);
 }
+
 uint8_t Cpu::rbS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 1, false);
     return supports386() ? readLinear(segmentBase(segment) + offset) : readPhysical(segmentBase(segment) + offset);
 }
+
 uint16_t Cpu::rwS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 2, false);
     auto base = segmentBase(segment);
@@ -45,11 +55,13 @@ uint16_t Cpu::rwS(int segment, uint32_t offset) {
     }
     return readPhysical(base + offset) | (uint16_t(readPhysical(base + uint16_t(offset + 1))) << 8);
 }
+
 void Cpu::wbS(int segment, uint32_t offset, uint8_t value) {
     checkSegment(segment, offset, 1, true);
     if (supports386()) writeLinear(segmentBase(segment) + offset, value);
     else writePhysical(segmentBase(segment) + offset, value);
 }
+
 void Cpu::wwS(int segment, uint32_t offset, uint16_t value) {
     checkSegment(segment, offset, 2, true); auto base = segmentBase(segment);
     if (supports386()) {
@@ -60,7 +72,10 @@ void Cpu::wwS(int segment, uint32_t offset, uint16_t value) {
     }
     writePhysical(base + offset, uint8_t(value)); writePhysical(base + uint16_t(offset + 1), uint8_t(value >> 8));
 }
+
 Cpu::Descriptor Cpu::descriptor(uint16_t selector, uint8_t vector) {
+    // selector：低 2 位 RPL、bit2 选择 GDT/LDT，其余位给出 8 字节描述符索引。
+    // 同一 8 字节布局既可表示段也可表示门，因此同时提取 gateOffset/gateSelector。
     unsigned index = selector & 0xfff8; Table table = gdtr;
     if (selector & 4) {
         if (!ldtr.selector) fault(vector, selector & 0xfffc);
@@ -82,24 +97,31 @@ Cpu::Descriptor Cpu::descriptor(uint16_t selector, uint8_t vector) {
     }
     return d;
 }
+
 Cpu::Descriptor Cpu::codeDescriptor(uint16_t selector) {
     if (!(selector & 0xfffc)) fault(13, 0);
     auto d = descriptor(selector); if ((d.access & 0x18) != 0x18) fault(13, selector & 0xfffc); return d;
 }
+
 void Cpu::cache(int segment, uint16_t selector, Descriptor d) {
+    // 装载段寄存器时更新描述符 Accessed 位，并保存隐藏缓存，后续寻址不反复读取 GDT。
     if (!(d.access & 1)) { d.access |= 1; writeLinear(d.address + 5, d.access, true); }
     s[segment] = selector; segments[segment] = d; hiddenSegments &= uint8_t(~(1 << segment));
 }
+
 void Cpu::loadCode(uint16_t selector, Descriptor d, unsigned level) {
     cache(CS, uint16_t((selector & 0xfffc) | level), d); cpl = level;
 }
+
 void Cpu::loadVirtualSegment(int segment, uint16_t selector) {
     s[segment] = selector; segments[segment] = {};
     segments[segment].base = uint32_t(selector) << 4;
     segments[segment].access = segment == CS ? 0xfb : 0xf3;
     hiddenSegments &= uint8_t(~(1 << segment));
 }
+
 void Cpu::loadSegment(int segment, uint16_t selector) {
+    // SS 必须是与 CPL/RPL 一致的可写数据段；数据段允许空 selector，但访问时会异常。
     if (virtual8086()) { loadVirtualSegment(segment, selector); return; }
     if (!protectedMode()) {
         s[segment] = selector; segments[segment].base = uint32_t(selector) << 4;
@@ -124,6 +146,7 @@ void Cpu::loadSegment(int segment, uint16_t selector) {
     }
     cache(segment, selector, d);
 }
+
 void Cpu::loadLdt(uint16_t selector, uint8_t vector) {
     if (!(selector & 0xfffc)) { ldtr = {}; return; }
     if (selector & 4) fault(vector, selector & 0xfffc);
@@ -132,10 +155,12 @@ void Cpu::loadLdt(uint16_t selector, uint8_t vector) {
     if (!(d.access & 0x80)) fault(11, selector & 0xfffc);
     ldtr = {selector, d.base, d.limit};
 }
+
 void Cpu::switchStack(unsigned level) {
     bool wide = supports386() && (tr.access & 8);
     unsigned size = wide ? 4 : 2, off = wide ? 4 + level * 8 : 2 + level * 4;
-    // LOADALL can install a valid hidden TSS cache with a zero visible selector.
+
+    // LOADALL 可安装可见 selector 为零的有效 TSS 隐藏缓存，不能仅因 selector=0 拒绝换栈。
     if (off + size + 1 > tr.limit) fault(10, tr.selector & 0xfffc);
     auto sp = readSystem(tr.base + off, size); auto ss = uint16_t(readSystem(tr.base + off + size, 2));
     if (!(ss & 0xfffc)) fault(10, 0);
@@ -146,13 +171,16 @@ void Cpu::switchStack(unsigned level) {
     if (supports386()) { r32(SP, sp); cpl = level; }
     else r[SP] = uint16_t(sp);
 }
+
 void Cpu::nullifyData() {
     for (auto i : {ES, DS, FS, GS})
         if ((segments[i].access & 12) != 12 && unsigned((segments[i].access >> 5) & 3) < cpl) {
             s[i] = 0; segments[i].null = true;
         }
 }
+
 void Cpu::farJump(uint16_t selector, uint32_t offset, bool call) {
+    // CALL/JMP 远转移既可能指向代码段，也可能经过调用门或任务门；跨特权调用复制参数到新栈。
     auto width = supports386() && operand32 ? 4u : 2u;
     if (!protectedMode() || virtual8086()) {
         if (supports386() && offset > 0xffff) fault(13, 0);
@@ -196,6 +224,7 @@ void Cpu::farJump(uint16_t selector, uint32_t offset, bool call) {
     } else level = cpl;
     loadCode(d.gateSelector, target, level); ip = gateOffset;
 }
+
 void Cpu::popFlags(uint16_t value, unsigned oldLevel) {
     if (protectedMode()) {
         if (oldLevel) value = uint16_t((value & ~0x3000) | (flags & 0x3000));
@@ -203,6 +232,7 @@ void Cpu::popFlags(uint16_t value, unsigned oldLevel) {
     }
     setFlags(value);
 }
+
 void Cpu::farReturn(uint16_t adjustment, bool interruptReturn) {
     if (supports386()) { farReturn386(adjustment, interruptReturn); return; }
     if (protectedMode() && interruptReturn && (flags & 0x4000)) { taskSwitch(readWord(tr.base), false, true); return; }
@@ -228,7 +258,10 @@ void Cpu::farReturn(uint16_t adjustment, bool interruptReturn) {
     ip = offset;
     if (interruptReturn) popFlags(value, oldLevel);
 }
+
 void Cpu::protectedInterrupt(uint8_t number, int code, bool software, bool external) {
+    // IDT：任务门、16/32 位中断门、陷阱门；仅软件 INT 检查门 DPL。
+    // 中断门清 IF，陷阱门保留 IF；从 VM86 离开时额外保存四个数据段。
     bool vm = virtual8086();
     unsigned error = number * 8 + 2 + unsigned(external);
     if (unsigned(number) * 8 + 7 > idtr.limit) fault(13, int(error));
@@ -266,6 +299,7 @@ void Cpu::protectedInterrupt(uint8_t number, int code, bool software, bool exter
     if (supports386()) upperFlags &= ~0x10000u;
     if (type == 6 || type == 14) flags &= ~IF;
 }
+
 void Cpu::taskSwitch(uint16_t selector, bool nested, bool returning) {
     if (supports386()) { taskSwitch386(selector, nested, returning); return; }
     if (!(selector & 0xfffc) || (selector & 4)) fault(returning ? 10 : 13, selector & 0xfffc);
@@ -295,7 +329,9 @@ void Cpu::taskSwitch(uint16_t selector, bool nested, bool returning) {
         if (ip > cd.limit) fault(13, 0);
     } catch (const CpuFault& f) { if (f.vector == 13 && f.code > 0) fault(10, f.code); throw; }
 }
+
 void Cpu::loadAll() {
+    // 286 的未公开 0F 05 LOADALL：从物理 800h 区域恢复状态及隐藏段缓存。
     requireRing0();
     msw = uint16_t((msw & 0xfff0) | (readWord(0x806) & 15) | (msw & 1));
     tr.selector = readWord(0x816); setFlags(readWord(0x818)); ip = readWord(0x81a); ldtr.selector = readWord(0x81c);
@@ -311,7 +347,11 @@ void Cpu::loadAll() {
     ldtr.base = l.base; ldtr.limit = l.limit; tr.base = t.base; tr.limit = t.limit;
     hiddenSegments = protectedMode() ? 0 : 15; cpl = protectedMode() ? (segments[CS].access >> 5) & 3 : 0;
 }
+
 void Cpu::execSystem() {
+    // 0F 00 /0 SLDT、/1 STR、/2 LLDT、/3 LTR、/4 VERR、/5 VERW。
+    // 0F 01 /0 SGDT、/1 SIDT、/2 LGDT、/3 LIDT、/4 SMSW、/6 LMSW。
+    // 0F 02 LAR、0F 03 LSL：查询权限/界限，失败通过 ZF 表达；0F 06 CLTS 清 TS。
     auto op = fetch8();
     if (op == 5) { loadAll(); return; }
     if (op == 6) { requireRing0(); msw &= ~8; return; }
@@ -373,34 +413,35 @@ void Cpu::execSystem() {
     }
     flags |= ZF;
 }
+
 void Cpu::exec186(uint8_t op) {
     switch (op) {
-    case 0x60: { auto sp = r[SP]; for (unsigned i = 0; i < 8; ++i) push(i == SP ? sp : r[i]); return; }
-    case 0x61: for (int i = 7; i >= 0; --i) { auto v = pop(); if (i != SP) r[i] = v; } return;
-    case 0x62: {
+    case 0x60: { auto sp = r[SP]; for (unsigned i = 0; i < 8; ++i) push(i == SP ? sp : r[i]); return; } // PUSHA：原 SP 入栈。
+    case 0x61: for (int i = 7; i >= 0; --i) { auto v = pop(); if (i != SP) r[i] = v; } return; // POPA：跳过 SP。
+    case 0x62: { // BOUND r16,m16&16：有符号范围检查。
         modrm(); if (mod == 3) fault(6);
         auto low = int16_t(rwS(eaSeg, eaOff)), high = int16_t(rwS(eaSeg, uint16_t(eaOff + 2)));
         if (int16_t(r[reg]) < low || int16_t(r[reg]) > high) fault(5);
         return;
     }
-    case 0x63: {
+    case 0x63: { // ARPL r/m16,r16：把 selector 的 RPL 至少提升到源 RPL。
         if (!protectedMode() || virtual8086()) fault(6);
         modrm(); auto value = getRM(2); bool change = (value & 3) < (r[reg] & 3);
         if (change) setRM(2, uint16_t((value & ~3) | (r[reg] & 3)));
         flag(ZF, change); return;
     }
-    case 0x68: { auto value = fetch16(); push(value); return; }
-    case 0x6a: { auto value = uint16_t(int16_t(int8_t(fetch8()))); push(value); return; }
-    case 0x69: case 0x6b: {
+    case 0x68: { auto value = fetch16(); push(value); return; } // PUSH imm16。
+    case 0x6a: { auto value = uint16_t(int16_t(int8_t(fetch8()))); push(value); return; } // PUSH 符号扩展 imm8。
+    case 0x69: case 0x6b: { // IMUL r16,r/m16,imm16/imm8。
         modrm(); auto a = int16_t(getRM(2)); auto b = op == 0x69 ? int16_t(fetch16()) : int16_t(int8_t(fetch8()));
         auto result = int32_t(a) * b; r[reg] = uint16_t(result); flag(CF | OF, result != int16_t(r[reg])); return;
     }
-    case 0x6c: case 0x6d: case 0x6e: case 0x6f: string(op); return;
-    case 0xc0: case 0xc1: {
+    case 0x6c: case 0x6d: case 0x6e: case 0x6f: string(op); return; // INS/OUTS 字符串端口传输。
+    case 0xc0: case 0xc1: { // Group 2：移位/旋转，次数直接来自 imm8。
         modrm(); auto count = fetch8(); int size = (op & 1) ? 2 : 1;
         auto result = shift(reg, getRM(size), count, size); setRM(size, result); return;
     }
-    case 0xc8: {
+    case 0xc8: { // ENTER imm16,imm8：分配局部变量并建立嵌套栈帧。
         auto allocation = fetch16(); unsigned level = fetch8() & 31;
         push(r[BP]); auto frame = r[SP];
         if (level) {
@@ -410,11 +451,14 @@ void Cpu::exec186(uint8_t op) {
         }
         auto sp = uint16_t(r[SP] - allocation); checkSegment(SS, sp, 1, true); r[BP] = frame; r[SP] = sp; return;
     }
-    case 0xc9: { auto bp = rwS(SS, r[BP]); r[SP] = uint16_t(r[BP] + 2); r[BP] = bp; return; }
+    case 0xc9: { auto bp = rwS(SS, r[BP]); r[SP] = uint16_t(r[BP] + 2); r[BP] = bp; return; } // LEAVE。
     default: fault(6);
     }
 }
+
 void Cpu::step() {
+    // fault 与 trap 的返回位置不同：指令失败先恢复可见状态，再投递异常。
+    // 异常投递再次失败可能升级为 #DF；投递 #DF 也失败则为三重故障/复位。
     if (model == CpuModel::I8088) { stepInstruction(); return; }
     auto save = [&]() { return std::make_tuple(r, upperR, s, segments, ip, flags, upperFlags, cpl, hiddenSegments); };
     auto restore = [&](const auto& state) {

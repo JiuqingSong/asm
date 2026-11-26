@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 
+// 此窗口是 image-tool.exe 的前端，不持有 VM；耗时命令在单独线程等待，UI 只收结果消息。
 namespace {
 enum { Type=101, Size, Raw, CreatePath, SavePath, Create, ImagePath, OpenPath, Destination,
        Overwrite, Sources, AddFiles, AddFolder, Clear, Import, List, Output,
@@ -27,9 +28,11 @@ std::filesystem::path testRoot;
 std::string testImage;
 std::vector<std::filesystem::path> sources;
 struct Result { DWORD code = 1; std::wstring text; };
+
 std::runtime_error winError(const char* text) {
     return std::runtime_error(std::string(text) + " (Windows error " + std::to_string(GetLastError()) + ")");
 }
+
 std::wstring wide(const std::string& text) {
     if (text.empty()) return {};
     int n = MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), nullptr, 0);
@@ -38,14 +41,18 @@ std::wstring wide(const std::string& text) {
     if (!MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), out.data(), n)) throw winError("Cannot decode command output");
     return out;
 }
+
 std::wstring text(int id) {
     auto h = GetDlgItem(window, id);
     int n = GetWindowTextLengthW(h);
     std::wstring out(size_t(n) + 1, L'\0');
     GetWindowTextW(h, out.data(), n + 1); out.resize(n); return out;
 }
+
 void setText(int id, const std::wstring& value) { SetWindowTextW(GetDlgItem(window, id), value.c_str()); }
+
 std::wstring quote(const std::wstring& arg) {
+    // 按 Windows CRT 命令行规则转义：引号前的反斜杠加倍，尾部反斜杠不能吞掉结束引号。
     std::wstring out = L"\""; unsigned slashes = 0;
     for (auto c : arg) {
         if (c == L'\\') { ++slashes; continue; }
@@ -53,11 +60,14 @@ std::wstring quote(const std::wstring& arg) {
     }
     out.append(slashes * 2, L'\\'); return out + L"\"";
 }
+
 struct Handle {
     HANDLE h = nullptr;
     ~Handle() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
 };
+
 Result execute(const std::vector<std::wstring>& args) {
+    // stdout/stderr 共用管道；必须先持续读管道再等待进程，避免子进程输出填满管道后死锁。
     wchar_t module[32768]{};
     if (!GetModuleFileNameW(nullptr, module, DWORD(std::size(module))) || GetLastError() == ERROR_INSUFFICIENT_BUFFER)
         throw winError("Cannot find application directory");
@@ -91,7 +101,9 @@ Result execute(const std::vector<std::wstring>& args) {
     if (!GetExitCodeProcess(process.h, &result.code)) throw winError("Cannot read command exit code");
     result.text = wide(output); return result;
 }
+
 void state(bool active) {
+    // 执行期间禁用操作与拖入，避免同一映像同时接收多个修改事务。
     busy = active;
     for (int id = Type; id <= InstallMbr; ++id)
         if (id != Output) EnableWindow(GetDlgItem(window, id), !active);
@@ -101,7 +113,9 @@ void state(bool active) {
         SendMessageW(GetDlgItem(window, BootKind), CB_GETCURSEL, 0, 0) == 1);
     DragAcceptFiles(window, !active);
 }
+
 void start(std::vector<std::wstring> args) {
+    // Result 所有权仅在 PostMessage 成功时转给 UI；Completed 中 join 后恢复按钮状态。
     if (busy) return;
     state(true);
     setText(Output, L"Working... Please do not mount or edit the image.");
@@ -113,6 +127,7 @@ void start(std::vector<std::wstring> args) {
         else OutputDebugStringW(L"Image utility: could not deliver command result\n");
     });
 }
+
 void sizes() {
     HWND list = GetDlgItem(window, Size);
     SendMessageW(list, CB_RESETCONTENT, 0, 0);
@@ -127,6 +142,7 @@ void sizes() {
         SendMessageW(list, CB_SETCURSEL, 0, 0);
     }
 }
+
 std::vector<std::filesystem::path> files(bool save, bool multi, bool boot = false) {
     std::vector<wchar_t> buffer(65536);
     OPENFILENAMEW ofn{}; ofn.lStructSize = sizeof(ofn); ofn.hwndOwner = window;
@@ -147,12 +163,14 @@ std::vector<std::filesystem::path> files(bool save, bool multi, bool boot = fals
     else while (*p) { out.push_back(first / p); p += wcslen(p) + 1; }
     return out;
 }
+
 void add(const std::filesystem::path& path) {
     auto absolute = std::filesystem::absolute(path).lexically_normal();
     for (const auto& source : sources) if (source == absolute) return;
     sources.push_back(absolute);
     SendMessageW(GetDlgItem(window, Sources), LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(absolute.c_str()));
 }
+
 void create() {
     auto path = text(CreatePath);
     if (path.empty()) throw std::runtime_error("Choose a new image path first");
@@ -162,6 +180,7 @@ void create() {
     if (SendMessageW(GetDlgItem(window, Raw), BM_GETCHECK, 0, 0) == BST_CHECKED) args.push_back(L"--raw");
     start(std::move(args));
 }
+
 void import() {
     if (text(ImagePath).empty() || sources.empty()) throw std::runtime_error("Select an image and add files or folders first");
     std::vector<std::wstring> args{L"put", text(ImagePath), L"--dest", text(Destination)};
@@ -170,7 +189,9 @@ void import() {
     for (const auto& p : sources) args.push_back(p.wstring());
     start(std::move(args));
 }
+
 void bootAction(bool importing) {
+    // 默认为 code-only；完整覆盖 BPB/分区表需显式勾选并确认，不把修复代码变成重分区。
     if (text(ImagePath).empty() || text(BootFile).empty())
         throw std::runtime_error("Select the image above and a boot sector file path first");
     auto kind = SendMessageW(GetDlgItem(window, BootKind), CB_GETCURSEL, 0, 0);
@@ -189,6 +210,7 @@ void bootAction(bool importing) {
     }
     start(std::move(args));
 }
+
 void installMbr() {
     if (text(ImagePath).empty()) throw std::runtime_error("Select the hard disk image above first");
     if (!testing && MessageBoxW(window,
@@ -198,6 +220,7 @@ void installMbr() {
         L"Install MBR code", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
     start({L"boot-install-mbr", text(ImagePath)});
 }
+
 HWND control(const wchar_t* cls, const wchar_t* label, DWORD style, int x, int y, int width, int height, int id = 0) {
     HWND h = CreateWindowExW(cls == std::wstring(L"EDIT") ? WS_EX_CLIENTEDGE : 0, cls, label,
         WS_CHILD | WS_VISIBLE | style, x, y, width, height, window,
@@ -205,6 +228,7 @@ HWND control(const wchar_t* cls, const wchar_t* label, DWORD style, int x, int y
     if (!h) throw winError("Cannot create control");
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE); return h;
 }
+
 void layout() {
     control(L"STATIC", L"Create image (FAT data disk, not bootable; existing files are never replaced)", 0, 14, 12, 745, 22);
     auto type = control(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_TABSTOP, 14, 40, 170, 220, Type);
@@ -252,7 +276,9 @@ void layout() {
         ES_MULTILINE | ES_READONLY | WS_VSCROLL | ES_AUTOVSCROLL | WS_TABSTOP, 14, 640, 746, 150, Output);
     DragAcceptFiles(window, TRUE);
 }
+
 void startTest() {
+    // 构造真实 Unicode DROPFILES 多字符串列表，检查递归导入、容量失败回滚和引导区保留。
     std::cout << "GUI test: preparing multi-source drag/drop\n" << std::flush;
     wchar_t temp[MAX_PATH]{}, path[MAX_PATH]{};
     if (!GetTempPathW(MAX_PATH, temp) || !GetTempFileNameW(temp, L"a86", 0, path)) throw winError("Cannot create GUI test directory");
@@ -282,6 +308,7 @@ void startTest() {
     setText(CreatePath, image); setText(ImagePath, image); setText(Destination, L"\\DATA");
     create();
 }
+
 LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     try {
         if (msg == WM_CREATE) { window = hwnd; layout(); if (testing) PostMessageW(hwnd, WM_APP + 2, 0, 0); return 0; }
@@ -409,6 +436,7 @@ LRESULT CALLBACK proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 }
+
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     int argc = 0;
     auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);

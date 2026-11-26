@@ -1,11 +1,14 @@
 #include "serial.h"
 #include <algorithm>
 
+// COM1 的 8250 UART 与 Microsoft 三字节串口鼠标；字节按串行传输时间排队，而非瞬间送达。
 namespace asm86 {
 namespace { constexpr double MouseByteClocks = 1193182.0 * 9 / 1200; }
+
 unsigned SerialMouse::divisor() const {
     unsigned value = (unsigned(dlm) << 8) | dll; return value ? value : 65536;
 }
+
 void SerialMouse::reset() {
     dll = 12; dlm = ier = mcr = scratch = rbr = delta = buttons = lastButtons = 0;
     lcr = 3; lsr = 0x60; msr = 0x30;
@@ -14,26 +17,33 @@ void SerialMouse::reset() {
     if (irqLine && setIrq) setIrq(false);
     irqLine = false;
 }
+
 uint8_t SerialMouse::interruptId() const {
+    // UART 中断优先级：线路错误 > 接收可读 > 发送空 > Modem 状态变化；IIR=1 表示无中断。
     if ((ier & 4) && (lsr & 0x1e)) return 6;
     if ((ier & 1) && (lsr & 1)) return 4;
     if ((ier & 2) && txInterrupt) return 2;
     if ((ier & 8) && delta) return 0;
     return 1;
 }
+
 void SerialMouse::updateIrq() {
     bool raised = (mcr & 8) && interruptId() != 1;
     if (raised != irqLine) { irqLine = raised; if (setIrq) setIrq(raised); }
 }
+
 void SerialMouse::schedule() {
     nextEvent = queue.empty() ? std::numeric_limits<double>::infinity() : queue.front().at;
     if (txPending) nextEvent = std::min(nextEvent, txDone);
 }
+
 void SerialMouse::receive(uint8_t value) {
     if (lsr & 1) lsr |= 2;
     else { rbr = value; lsr |= 1; }
 }
+
 void SerialMouse::packet(double now) {
+    // 鼠标包不是机器码：首字节 01LRyyxx，后两字节为 x/y 低 6 位；位移分拆到 -128..127。
     if (!queue.empty() || !identified || (mcr & 0x13) != 3 || divisor() != 96) return;
     if (!pendingX && !pendingY && buttons == lastButtons) return;
     int x = int(std::max<int64_t>(-128, std::min<int64_t>(127, pendingX)));
@@ -45,6 +55,7 @@ void SerialMouse::packet(double now) {
     };
     for (unsigned i = 0; i < 3; ++i) queue.push_back({now + MouseByteClocks * (i + 1), bytes[i]});
 }
+
 void SerialMouse::advance(double now) {
     if (txPending && now >= txDone) {
         txPending = false; lsr |= 0x60; txInterrupt = true;
@@ -60,13 +71,16 @@ void SerialMouse::advance(double now) {
     }
     schedule(); updateIrq();
 }
+
 void SerialMouse::motion(int dx, int dy, uint8_t value, double now) {
     advance(now); buttons = value & 3;
     if (identified && !(mcr & 16)) { pendingX += dx; pendingY += dy; packet(now); }
     else { pendingX = pendingY = 0; lastButtons = buttons; }
     schedule();
 }
+
 uint8_t SerialMouse::input(unsigned offset, double now) {
+    // offset 0/1 在 LCR.DLAB=1 时变为 DLL/DLM，否则是接收数据/IER；读状态有确认副作用。
     advance(now);
     uint8_t value = 0;
     switch (offset) {
@@ -83,7 +97,9 @@ uint8_t SerialMouse::input(unsigned offset, double now) {
     }
     updateIrq(); return value;
 }
+
 void SerialMouse::output(unsigned offset, uint8_t value, double now) {
+    // MCR 的 DTR/RTS 电平变化触发鼠标识别字节 4Dh（'M'）；loopback 则走 UART 回环。
     advance(now);
     switch (offset) {
     case 0:

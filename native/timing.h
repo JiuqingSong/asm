@@ -5,6 +5,7 @@
 #include <cmath>
 
 namespace asm86 {
+// 宿主稳态时钟与客体 PIT 时钟之间的桥梁；正常档限速，Full speed 消耗尽可能多的宿主执行时间。
 class ExecutionTiming {
 public:
     using HostClock = std::chrono::steady_clock;
@@ -15,12 +16,14 @@ public:
             : model == CpuModel::I286 ? 2000000.0 : PitHz / 3.6;
     }
     void reset(const Pc& pc, HostClock::time_point now = HostClock::now()) {
+        // 暂停恢复/速度切换后重建基准，不能补跑暂停期间的宿主时间。
         hostOrigin = now; guestOrigin = pc.clock; fraction = 0; stableIdle = false;
     }
     double target(HostClock::time_point now) const {
         return guestOrigin + std::chrono::duration<double>(now - hostOrigin).count() * PitHz;
     }
     void advance(Pc& pc, bool fullSpeed, HostClock::time_point now, bool stableTiming = false) {
+        // 每小片先推进外设再执行 CPU；fraction 保存限速档不足一条指令的余量。
         if (pc.powerOffRequested) return;
         if (stableTiming && pc.cpu.model == CpuModel::I486) {
             advanceStable(pc, fullSpeed, now);
@@ -37,6 +40,7 @@ public:
         pc.runCpu(budget);
     }
     void run(Pc& pc, bool fullSpeed, HostClock::duration quantum = std::chrono::milliseconds(8), bool stableTiming = false) {
+        // 每次最多占用一个 quantum，返回窗口消息循环，避免 Full speed 饿死菜单/输入。
         const auto start = HostClock::now(), deadline = start + quantum;
         const auto until = target(start);
         do {
@@ -45,6 +49,7 @@ public:
     }
 private:
     void advanceStable(Pc& pc, bool fullSpeed, HostClock::time_point now) {
+        // 稳定 486 档：忙碌时按实际指令量推进时间；HLT/BIOS 等待时改用宿主时间唤醒设备。
         if (pc.cpu.halted || pc.cpu.waiting) {
             if (!stableIdle) { reset(pc, now); stableIdle = true; }
             auto next = std::max(pc.clock, std::min(target(now), pc.clock + PitHz / 4000));
@@ -67,7 +72,8 @@ private:
         pc.runCpu(budget);
         if (pc.powerOffRequested) return;
         pc.advanceClock(pc.clock + double(pc.instructions - before) * PitHz / Stable486Rate);
-        // Idle time follows the host from this point, without catching up a CPU stall or a fast-forwarded guest.
+
+        // 从空闲边界重新跟随宿主，避免把之前 CPU 停顿或超前执行的时间补偿到客体。
         if (pc.cpu.halted || pc.cpu.waiting) { reset(pc, now); stableIdle = true; }
     }
     HostClock::time_point hostOrigin = HostClock::now();

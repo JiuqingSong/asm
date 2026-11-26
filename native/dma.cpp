@@ -1,13 +1,16 @@
 #include "dma.h"
 #include <stdexcept>
 
+// 两片 8237：通道 0..3 按字节，5..7 按字；通道 4 是级联，不可用于外设数据。
 namespace asm86 {
 void DmaController::reset(bool at) {
     address.fill(0); count.fill(0); baseAddress.fill(0); baseCount.fill(0);
     mode.fill(0); page.fill(0); command.fill(0); request.fill(0); high.fill(false);
     mask = 255; terminal = 0; cascaded = at;
 }
+
 uint8_t DmaController::input(uint16_t port) {
+    // 地址/计数共用控制器级的低/高字节触发器；读状态清对应 Terminal Count 位。
     if (port >= 0x80 && port <= 0x8f) return page[port - 0x80];
     if (port >= 0xc0 && (port & 1)) return 255;
     unsigned controller = port >= 0xc0, reg = controller ? (port - 0xc0) / 2 : port;
@@ -24,6 +27,7 @@ uint8_t DmaController::input(uint16_t port) {
     if (reg == 15) return uint8_t(0xf0 | ((mask >> (controller * 4)) & 15));
     return 255;
 }
+
 void DmaController::output(uint16_t port, uint8_t value) {
     if (port >= 0x80 && port <= 0x8f) { page[port - 0x80] = value; return; }
     if (port >= 0xc0 && (port & 1)) return;
@@ -37,14 +41,14 @@ void DmaController::output(uint16_t port, uint8_t value) {
     }
     auto bit = uint8_t(1 << (base + (value & 3)));
     switch (reg) {
-    case 8: command[controller] = value; break;
+    case 8: command[controller] = value; break; // Command。
     case 9:
         if (value & 4) request[controller] |= uint8_t(1 << (value & 3));
         else request[controller] &= uint8_t(~(1 << (value & 3)));
         break;
-    case 10: if (value & 4) mask |= bit; else mask &= uint8_t(~bit); break;
-    case 11: mode[base + (value & 3)] = value; break;
-    case 12: high[controller] = false; break;
+    case 10: if (value & 4) mask |= bit; else mask &= uint8_t(~bit); break; // 单通道屏蔽。
+    case 11: mode[base + (value & 3)] = value; break; // 模式、方向、递增/递减、自动重载。
+    case 12: high[controller] = false; break; // 清低/高字节触发器。
     case 13:
         high[controller] = false; mask |= uint8_t(15 << base); command[controller] = request[controller] = 0;
         terminal &= uint8_t(~(15 << base)); break;
@@ -52,7 +56,10 @@ void DmaController::output(uint16_t port, uint8_t value) {
     case 15: mask = uint8_t((mask & ~(15 << base)) | ((value & 15) << base)); break;
     }
 }
+
 DmaResult DmaController::transfer(unsigned channel, uint8_t* data, unsigned length, DmaDirection direction) {
+    // DMA 使用真实总线地址，必须绕过 CPU 的分页/A20，但仍保留 MMIO；方向以设备为参照。
+    // 地址在 16 位计数器内回绕，不向页寄存器进位；计数 N 实际传输 N+1 个单位。
     if (channel >= 8 || channel == 4) throw std::runtime_error("Invalid peripheral DMA channel");
     if ((mask & (1 << channel)) || (command[channel / 4] & 4)
         || (channel < 4 && cascaded && ((mask & 0x10) || (command[1] & 4) || (mode[4] & 0xc0) != 0xc0))) return {};
@@ -75,6 +82,7 @@ DmaResult DmaController::transfer(unsigned channel, uint8_t* data, unsigned leng
         if (count[channel]-- == 0) { result.terminal = true; break; }
     }
     if (result.terminal) {
+        // TC 后非自动重载通道被屏蔽；自动重载恢复最初编程的地址与计数。
         terminal |= uint8_t(1 << channel);
         request[channel / 4] &= uint8_t(~(1 << (channel & 3)));
         if (setting & 0x10) { address[channel] = baseAddress[channel]; count[channel] = baseCount[channel]; }

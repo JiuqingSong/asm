@@ -10,13 +10,16 @@
 #include <set>
 #include <stdexcept>
 
+// 离线 FAT12/FAT16 映像工具：先在内存副本完成全部修改/校验，再原子发布，不修改挂载中的盘。
 namespace asm86::image {
 namespace {
 using Bytes = std::vector<uint8_t>;
 using Name = std::array<uint8_t, 11>;
+
 std::runtime_error error(const char* text) {
     return std::runtime_error(std::string(text) + " (Windows error " + std::to_string(GetLastError()) + ")");
 }
+
 struct File {
     HANDLE h;
     File(const std::filesystem::path& path, DWORD access, DWORD share, DWORD disposition)
@@ -40,6 +43,7 @@ struct File {
         }
     }
 };
+
 Bytes load(File& f, uint64_t limit) {
     auto n = f.size();
     if (n > limit) throw std::runtime_error("File exceeds the supported capacity");
@@ -47,6 +51,7 @@ Bytes load(File& f, uint64_t limit) {
     f.transfer(data.data(), data.size(), false);
     return data;
 }
+
 File editableImage(const std::filesystem::path& path) {
     DWORD attrs = GetFileAttributesW(path.c_str());
     if (attrs == INVALID_FILE_ATTRIBUTES) throw error("Cannot inspect image");
@@ -54,7 +59,8 @@ File editableImage(const std::filesystem::path& path) {
         throw std::runtime_error("Read-only images, symbolic links and junctions cannot be modified");
     return File(path, GENERIC_READ | GENERIC_WRITE | DELETE, FILE_SHARE_READ | FILE_SHARE_DELETE, OPEN_EXISTING);
 }
-// Hold the original open without write sharing until the atomic rename completes.
+
+// 原文件保持无写共享句柄，直到同目录临时文件完成刷新并原子替换。
 void publish(const std::filesystem::path& path, Bytes& data, bool replace) {
     wchar_t temp[MAX_PATH]{};
     auto parent = std::filesystem::absolute(path).parent_path();
@@ -65,7 +71,7 @@ void publish(const std::filesystem::path& path, Bytes& data, bool replace) {
             f.transfer(data.data(), data.size(), true);
             if (!FlushFileBuffers(f.h)) throw error("Cannot flush staged image");
             if (replace) {
-                // POSIX replacement keeps the locked old file alive for its open handle.
+                // POSIX 替换允许旧文件继续由锁定句柄持有，新路径一次性指向完整新文件。
                 auto target = std::filesystem::absolute(path).make_preferred().wstring();
                 if (target.rfind(L"\\\\?\\", 0) == 0) target = L"\\??\\" + target.substr(4);
                 else target = target.rfind(L"\\\\", 0) == 0 ? L"\\??\\UNC\\" + target.substr(2) : L"\\??\\" + target;
@@ -92,10 +98,15 @@ void publish(const std::filesystem::path& path, Bytes& data, bool replace) {
         throw;
     }
 }
+
 uint16_t w(const Bytes& b, size_t o) { return uint16_t(b.at(o) | unsigned(b.at(o + 1)) << 8); }
+
 uint32_t d(const Bytes& b, size_t o) { return w(b, o) | uint32_t(w(b, o + 2)) << 16; }
+
 void sw(Bytes& b, size_t o, uint16_t v) { b.at(o) = uint8_t(v); b.at(o + 1) = uint8_t(v >> 8); }
+
 void sd(Bytes& b, size_t o, uint32_t v) { sw(b, o, uint16_t(v)); sw(b, o + 2, uint16_t(v >> 16)); }
+
 Name name83(const std::wstring& text) {
     Name result{}; result.fill(' ');
     auto dot = text.find(L'.');
@@ -115,11 +126,13 @@ Name name83(const std::wstring& text) {
     if (base == L"." || base == L"..") throw std::runtime_error("Relative parent components are not allowed");
     return result;
 }
+
 std::string display(const Name& n) {
     std::string a(n.begin(), n.begin() + 8), b(n.begin() + 8, n.end());
     a.erase(a.find_last_not_of(' ') + 1); b.erase(b.find_last_not_of(' ') + 1);
     return a + (b.empty() ? "" : "." + b);
 }
+
 std::vector<Name> parts(const std::wstring& path) {
     std::vector<Name> result;
     size_t start = 0;
@@ -131,13 +144,16 @@ std::vector<Name> parts(const std::wstring& path) {
     }
     return result;
 }
+
 struct Volume {
+    // 所有偏移为映像字节偏移；base 是分区起点，fat/root/data 是各区域起点。
     Bytes& b;
     size_t base = 0, fat = 0, root = 0, data = 0, fatBytes = 0;
     uint32_t clusters = 0, clusterBytes = 0;
     uint16_t rootEntries = 0;
     unsigned fats = 0, bits = 0;
     explicit Volume(Bytes& bytes) : b(bytes) {
+        // 先区分软盘式 BPB 与 MBR 分区，再由实际簇数判定 FAT12/16，不信任卷标字符串。
         if (b.size() < 512 || b.size() % 512 || b.size() > MaxHardBytes)
             throw std::runtime_error("Image must contain 512-byte sectors and be at most 504 MiB");
         uint32_t volumeSectors = uint32_t(b.size() / 512);
@@ -184,10 +200,12 @@ struct Volume {
         validate();
     }
     uint32_t get(uint32_t c) const {
+        // FAT12 两项共享三个字节，奇偶簇分别取高/低 12 位；FAT16 每项一个小端字。
         size_t at = fat + (bits == 16 ? c * 2 : c * 3 / 2);
         return bits == 16 ? w(b, at) : (c & 1 ? w(b, at) >> 4 : w(b, at) & 0xfff);
     }
     void set(uint32_t c, uint32_t v) {
+        // 修改所有 FAT 副本，并保留相邻 FAT12 项共享的半字节。
         for (unsigned i = 0; i < fats; ++i) {
             size_t at = fat + i * fatBytes + (bits == 16 ? c * 2 : c * 3 / 2);
             if (bits == 16) sw(b, at, uint16_t(v));
@@ -197,6 +215,7 @@ struct Volume {
     bool eoc(uint32_t c) const { return c >= (bits == 16 ? 0xfff8u : 0xff8u); }
     size_t at(uint32_t c) const { return data + size_t(c - 2) * clusterBytes; }
     std::vector<uint32_t> chain(uint32_t c) const {
+        // 校验界限、保留簇和环，不能让坏 FAT 把遍历变成无限循环。
         std::vector<uint32_t> out;
         std::set<uint32_t> seen;
         if (!c) return out;
@@ -209,6 +228,7 @@ struct Volume {
         }
     }
     std::vector<size_t> slots(uint32_t dir) const {
+        // FAT12/16 根目录大小固定且不在簇链中；子目录可以沿簇链增长。
         std::vector<size_t> out;
         if (!dir) {
             for (unsigned i = 0; i < rootEntries; ++i) out.push_back(root + i * 32);
@@ -235,6 +255,7 @@ struct Volume {
         return std::numeric_limits<size_t>::max();
     }
     void validate() const {
+        // 全树检查交叉簇链、重复名字、目录深度及文件长度；不自动修复损坏的原盘。
         std::vector<bool> owned(clusters + 2);
         auto claim = [&](uint32_t c) {
             auto links = chain(c);
@@ -278,7 +299,7 @@ struct Volume {
         for (size_t i = 0; i < all.size(); ++i) {
             auto o = all[i];
             if (!b[o] || b[o] == 0xe5) {
-                // Preserve the end-of-directory sentinel if a deleted stale entry follows it.
+                // 复用目录结束项时仍保留后续 00h 哨兵，避免旧的删除项后数据重新暴露。
                 if (!b[o] && i + 1 < all.size()) b[all[i + 1]] = 0;
                 return o;
             }
@@ -344,7 +365,8 @@ struct Volume {
         if (o != std::numeric_limits<size_t>::max()) {
             if (!overwrite) throw std::runtime_error("File already exists: " + display(n) + " (use --overwrite explicitly)");
             if (b[o + 11] & (16 | 1 | 2 | 4)) throw std::runtime_error("Cannot overwrite a directory, read-only, hidden or system file: " + display(n));
-            // Avoid leaving long-name aliases attached to newly replaced 8.3 entries.
+
+            // 此工具只支持 8.3；不能覆盖带 LFN 别名的条目后留下失配的长文件名。
             auto all = slots(dir);
             auto it = std::find(all.begin(), all.end(), o);
             if (it != all.begin() && b[*(it - 1) + 11] == 0x0f && b[*(it - 1)] != 0xe5)
@@ -366,6 +388,7 @@ constexpr Floppy floppies[] = {
     {320,2,0xff,112,1,8,2}, {360,2,0xfd,112,2,9,2},
     {720,2,0xf9,112,3,9,2}, {1200,1,0xf9,224,7,15,2}, {1440,1,0xf0,224,9,18,2}
 };
+
 size_t bootOffset(const Bytes& b, BootSector sector, unsigned partition) {
     if (b.size() < 512 || b.size() % 512 || b.size() > MaxHardBytes)
         throw std::runtime_error("Image must contain 512-byte sectors and be at most 504 MiB");
@@ -394,6 +417,7 @@ size_t bootOffset(const Bytes& b, BootSector sector, unsigned partition) {
         throw std::runtime_error("Selected partition is empty or outside image bounds");
     return size_t(start) * 512;
 }
+
 size_t bootHeader(const Bytes& b) {
     unsigned spc = b[13], fats = b[16], roots = w(b, 17), fat = w(b, 22), reserved = w(b, 14);
     uint32_t total = w(b, 19) ? w(b, 19) : d(b, 32);
@@ -411,34 +435,116 @@ size_t bootHeader(const Bytes& b) {
         throw std::runtime_error("Unsupported boot jump or BPB layout; code must start after the preserved header");
     return header;
 }
+
 void nonboot(Bytes& b, size_t at) {
-    // Data disks deliberately contain no DOS system files or borrowed DOS boot code.
-    const uint8_t code[] = {0xfa,0x31,0xc0,0x8e,0xd8,0x8e,0xd0,0xbc,0x00,0x7c,0xfb,
-        0xbe,0x80,0x7c,0xac,0x84,0xc0,0x74,0x09,0xb4,0x0e,0xbb,0x07,0x00,0xcd,0x10,0xeb,0xf2,
-        0x31,0xc0,0xcd,0x16,0xcd,0x19,0xeb,0xfe};
+    // 数据盘不附带 DOS 系统文件；这段自有 16 位代码仅输出提示并等待换引导盘。
+    const uint8_t code[] = {
+        0xfa,                // CLI：初始化栈时屏蔽中断。
+        0x31,0xc0,           // XOR AX,AX。
+        0x8e,0xd8,           // MOV DS,AX：提示字符串采用绝对 0000:7C80。
+        0x8e,0xd0,           // MOV SS,AX。
+        0xbc,0x00,0x7c,      // MOV SP,7C00h：设置引导栈。
+        0xfb,                // STI：恢复中断。
+        0xbe,0x80,0x7c,      // MOV SI,7C80h：提示文本地址。
+        0xac,                // LODSB：取下一字符。
+        0x84,0xc0,           // TEST AL,AL：检查零结束。
+        0x74,0x09,           // JZ 等待键盘。
+        0xb4,0x0e,           // MOV AH,0Eh：BIOS 电传打字输出。
+        0xbb,0x07,0x00,      // MOV BX,0007h：第 0 页、灰字黑底。
+        0xcd,0x10,           // INT 10h：输出 AL。
+        0xeb,0xf2,           // JMP 字符循环。
+        0x31,0xc0,           // XOR AX,AX：INT 16h/AH=0 等待按键。
+        0xcd,0x16,           // INT 16h。
+        0xcd,0x19,           // INT 19h：重新引导。
+        0xeb,0xfe            // JMP $：若 BIOS 意外返回，留在此处。
+    };
+
+    // EB 3C 是从扇区起点跳到偏移 3Eh 的短 JMP，90 是 NOP，跳过 BPB。
     b[at] = 0xeb; b[at + 1] = 0x3c; b[at + 2] = 0x90;
     std::copy(std::begin(code), std::end(code), b.begin() + at + 62);
     const char message[] = "Non-system data disk. Insert a DOS boot disk and press a key.\r\n";
     std::copy(std::begin(message), std::end(message), b.begin() + at + 128);
     sw(b, at + 510, 0xaa55);
 }
+
 void mbrCode(Bytes& b) {
-    // Relocate to 0000:0600, select one active entry, derive 16/63 CHS from its LBA,
-    // then read and jump to its VBR at 0000:7C00. These are self-authored 8088 instructions.
+    // 自有 8088 MBR：移到 0000:0600 后选唯一活动分区，将 LBA 按 16/63 几何转成 CHS，
+    // 再将分区 VBR 读到 0000:7C00。跳转和消息地址固定，不能改动字节数。
     const uint8_t code[] = {
-        0xfa,0x31,0xc0,0x8e,0xd8,0x8e,0xc0,0x8e,0xd0,0xbc,0x00,0x7c,0xfc,0xfb,0xbe,0x00,
-        0x7c,0xbf,0x00,0x06,0xb9,0x00,0x01,0xf3,0xa5,0xea,0x1e,0x06,0x00,0x00,0x88,0x16,
-        0xb0,0x07,0xbd,0xbe,0x07,0xb9,0x04,0x00,0x31,0xf6,0x80,0x7e,0x00,0x00,0x75,0x03,
-        0xe9,0x12,0x00,0x80,0x7e,0x00,0x80,0x74,0x03,0xe9,0x7b,0x00,0x85,0xf6,0x74,0x03,
-        0xe9,0x74,0x00,0x89,0xee,0x83,0xc5,0x10,0xe2,0xe0,0x85,0xf6,0x75,0x03,0xe9,0x66,
-        0x00,0x80,0x7c,0x04,0x00,0x75,0x03,0xe9,0x5d,0x00,0x8b,0x44,0x08,0x8b,0x54,0x0a,
-        0x89,0xc3,0x09,0xd3,0x75,0x03,0xe9,0x4e,0x00,0x83,0xfa,0x0f,0x76,0x03,0xe9,0x46,
-        0x00,0xbb,0x3f,0x00,0xf7,0xf3,0x89,0xd1,0x41,0x31,0xd2,0xbb,0x10,0x00,0xf7,0xf3,
-        0x3d,0xff,0x03,0x76,0x03,0xe9,0x2f,0x00,0x88,0xd6,0x8a,0x16,0xb0,0x07,0x88,0xc5,
-        0xd0,0xcc,0xd0,0xcc,0x08,0xe1,0xbb,0x00,0x7c,0xb8,0x01,0x02,0xcd,0x13,0x73,0x03,
-        0xe9,0x14,0x00,0x81,0x3e,0xfe,0x7d,0x55,0xaa,0x74,0x03,0xe9,0x09,0x00,0x8a,0x16,
-        0xb0,0x07,0xea,0x00,0x7c,0x00,0x00,0xbe,0xd0,0x06,0xbb,0x07,0x00,0xac,0x84,0xc0,
-        0x75,0x03,0xe9,0x07,0x00,0xb4,0x0e,0xcd,0x10,0xe9,0xf1,0xff,0xfa,0xf4,0xeb,0xfd,
+        0xfa,0x31,0xc0,       // CLI / XOR AX,AX：原子设置段/栈。
+        0x8e,0xd8,0x8e,0xc0, // MOV DS,AX / MOV ES,AX：复制源/目标均在第零段。
+        0x8e,0xd0,           // MOV SS,AX。
+        0xbc,0x00,0x7c,      // MOV SP,7C00h。
+        0xfc,0xfb,           // CLD / STI：向前复制，恢复中断。
+        0xbe,0x00,0x7c,      // MOV SI,7C00h：原 MBR。
+        0xbf,0x00,0x06,      // MOV DI,0600h：重定位目标。
+        0xb9,0x00,0x01,      // MOV CX,0100h：512 字节=256 字。
+        0xf3,0xa5,           // REP MOVSW：复制 MBR 和分区表。
+        0xea,0x1e,0x06,0x00,0x00, // JMP FAR 0000:061Eh：开始执行重定位副本。
+
+        0x88,0x16,0xb0,0x07, // MOV [07B0h],DL：保存 BIOS 引导盘号。
+        0xbd,0xbe,0x07,      // MOV BP,07BEh：重定位后分区表（0600h+446）。
+        0xb9,0x04,0x00,      // MOV CX,4：四个主分区槽。
+        0x31,0xf6,           // XOR SI,SI：尚未找到活动分区。
+        0x80,0x7e,0x00,0x00, // CMP BYTE [BP],0：非活动槽。
+        0x75,0x03,           // JNE 检查活动标志。
+        0xe9,0x12,0x00,      // JMP 下一分区槽。
+        0x80,0x7e,0x00,0x80, // CMP BYTE [BP],80h：活动标志必须恰好为 80h。
+        0x74,0x03,           // JE 检查是否重复活动。
+        0xe9,0x7b,0x00,      // JMP 错误输出。
+        0x85,0xf6,0x74,0x03, // TEST SI,SI / JE 保存活动槽。
+        0xe9,0x74,0x00,      // JMP 错误输出：发现第二个活动分区。
+        0x89,0xee,           // MOV SI,BP：记住活动分区。
+        0x83,0xc5,0x10,      // ADD BP,10h：分区项长 16 字节。
+        0xe2,0xe0,           // LOOP 扫描分区。
+        0x85,0xf6,0x75,0x03, // TEST SI,SI / JNE 检查分区类型。
+        0xe9,0x66,0x00,      // JMP 错误输出：没有活动分区。
+        0x80,0x7c,0x04,0x00, // CMP BYTE [SI+4],0：类型为零是空分区。
+        0x75,0x03,           // JNE 读取起始 LBA。
+        0xe9,0x5d,0x00,      // JMP 错误输出。
+
+        0x8b,0x44,0x08,      // MOV AX,[SI+8]：LBA 低字。
+        0x8b,0x54,0x0a,      // MOV DX,[SI+0Ah]：LBA 高字，合成 DX:AX。
+        0x89,0xc3,0x09,0xd3, // MOV BX,AX / OR BX,DX：起始 LBA 不能为零。
+        0x75,0x03,           // JNE 检查 LBA 范围。
+        0xe9,0x4e,0x00,      // JMP 错误输出。
+        0x83,0xfa,0x0f,      // CMP DX,0Fh：限制 DIV 的商与传统磁盘地址范围。
+        0x76,0x03,           // JBE 执行 CHS 转换。
+        0xe9,0x46,0x00,      // JMP 错误输出。
+        0xbb,0x3f,0x00,      // MOV BX,63：每道扇区数。
+        0xf7,0xf3,           // DIV BX：DX:AX/63，AX 为道号，DX 为扇区零基余数。
+        0x89,0xd1,0x41,      // MOV CX,DX / INC CX：CL 为 1 基扇区号。
+        0x31,0xd2,           // XOR DX,DX：下一次除法使用 16 位道号。
+        0xbb,0x10,0x00,      // MOV BX,16：磁头数。
+        0xf7,0xf3,           // DIV BX：AX 为柱面，DX 为磁头。
+        0x3d,0xff,0x03,      // CMP AX,03FFh：柱面必须 <=1023。
+        0x76,0x03,           // JBE 编码 INT 13h 参数。
+        0xe9,0x2f,0x00,      // JMP 错误输出。
+        0x88,0xd6,           // MOV DH,DL：磁头号移到 DH。
+        0x8a,0x16,0xb0,0x07, // MOV DL,[07B0h]：恢复盘号。
+        0x88,0xc5,           // MOV CH,AL：柱面低 8 位。
+        0xd0,0xcc,0xd0,0xcc, // ROR AH,1 两次：柱面高 2 位移到 CL 高位位置。
+        0x08,0xe1,           // OR CL,AH：合成柱面/扇区字段。
+        0xbb,0x00,0x7c,      // MOV BX,7C00h：ES:BX 为 VBR 缓冲区。
+        0xb8,0x01,0x02,      // MOV AX,0201h：AH=读扇区，AL=1。
+        0xcd,0x13,           // INT 13h：读取分区引导扇区。
+        0x73,0x03,           // JNC 检查签名。
+        0xe9,0x14,0x00,      // JMP 错误输出：BIOS 读失败。
+        0x81,0x3e,0xfe,0x7d,0x55,0xaa, // CMP WORD [7DFEh],AA55h：校验 VBR 签名。
+        0x74,0x03,           // JE 启动分区。
+        0xe9,0x09,0x00,      // JMP 错误输出。
+        0x8a,0x16,0xb0,0x07, // MOV DL,[07B0h]：向 VBR 传递原盘号。
+        0xea,0x00,0x7c,0x00,0x00, // JMP FAR 0000:7C00：交出控制权。
+
+        0xbe,0xd0,0x06,      // MOV SI,06D0h：重定位后的错误字符串。
+        0xbb,0x07,0x00,      // MOV BX,7：第零显示页、文本属性。
+        0xac,0x84,0xc0,      // LODSB / TEST AL,AL：逐字符读取到零结束。
+        0x75,0x03,           // JNE 输出字符。
+        0xe9,0x07,0x00,      // JMP 停机。
+        0xb4,0x0e,           // MOV AH,0Eh：电传打字功能。
+        0xcd,0x10,           // INT 10h。
+        0xe9,0xf1,0xff,      // JMP 字符循环。
+        0xfa,0xf4,0xeb,0xfd, // CLI / HLT / JMP HLT：错误时不继续执行磁盘数据。
     };
     const char message[] = "Cannot load active partition boot sector.\r\n";
     std::fill_n(b.begin(), 440, 0);
@@ -446,7 +552,9 @@ void mbrCode(Bytes& b) {
     std::copy(std::begin(message), std::end(message), b.begin() + sizeof(code));
     sw(b, 510, 0xaa55);
 }
+
 Bytes formatted(uint64_t size, bool floppy) {
+    // 软盘使用固定 FAT12 布局；硬盘在 LBA63 建 FAT16 卷，迭代求 FAT 大小及每簇扇区数。
     Bytes b(static_cast<size_t>(size));
     uint32_t total = uint32_t(size / 512), base = floppy ? 0 : 63;
     uint16_t roots = 512, fatSectors = 0, spc = 1, spt = 63, heads = 16;
@@ -497,8 +605,9 @@ Bytes formatted(uint64_t size, bool floppy) {
     return b;
 }
 }
+
 uint64_t hardSize(const std::wstring& text) {
-    // Decimal parsing is exact: 1 cylinder = 0.4921875 MiB; avoid floating-point rounding.
+    // 精确十进制解析：每柱面 0.4921875 MiB，避免浮点舍入创建不完整柱面。
     uint64_t scaled = 0, scale = 1; bool dot = false; unsigned digits = 0;
     if (text.empty()) throw std::runtime_error("Missing hard disk size in MiB");
     for (wchar_t c : text) {
@@ -513,10 +622,12 @@ uint64_t hardSize(const std::wstring& text) {
         throw std::runtime_error("Hard size must use whole 16-head/63-sector cylinders and be at most 504 MiB (e.g. 31.5, 63, 126, 252, 504)");
     return bytes;
 }
+
 uint64_t floppySize(const std::wstring& text) {
     for (const auto& f : floppies) if (text == std::to_wstring(f.kib)) return f.kib * 1024ULL;
     throw std::runtime_error("Floppy size in KiB must be 160, 180, 320, 360, 720, 1200 or 1440");
 }
+
 void create(const std::filesystem::path& path, uint64_t bytes, bool floppy, bool raw) {
     bool valid = floppy ? std::any_of(std::begin(floppies), std::end(floppies), [&](auto f) { return f.kib * 1024ULL == bytes; })
         : bytes && bytes <= MaxHardBytes && bytes % CylinderBytes == 0;
@@ -525,6 +636,7 @@ void create(const std::filesystem::path& path, uint64_t bytes, bool floppy, bool
     Bytes b = raw ? Bytes(static_cast<size_t>(bytes)) : formatted(bytes, floppy);
     publish(path, b, false);
 }
+
 void put(const std::filesystem::path& path, const std::vector<std::filesystem::path>& sources,
          const std::wstring& destination, bool overwrite) {
     if (sources.empty()) throw std::runtime_error("At least one source file or directory is required");
@@ -543,6 +655,7 @@ void put(const std::filesystem::path& path, const std::vector<std::filesystem::p
     volume.validate();
     publish(path, b, true);
 }
+
 void exportBoot(const std::filesystem::path& path, const std::filesystem::path& output,
                 BootSector sector, unsigned partition) {
     if (std::filesystem::exists(output)) throw std::runtime_error("Export destination already exists; export never overwrites files");
@@ -552,6 +665,7 @@ void exportBoot(const std::filesystem::path& path, const std::filesystem::path& 
     Bytes boot(b.begin() + offset, b.begin() + offset + 512);
     publish(output, boot, false);
 }
+
 void installMbr(const std::filesystem::path& path) {
     auto original = editableImage(path);
     auto b = load(original, MaxHardBytes);
@@ -567,8 +681,10 @@ void installMbr(const std::filesystem::path& path) {
     mbrCode(b);
     publish(path, b, true);
 }
+
 void importBoot(const std::filesystem::path& path, const std::filesystem::path& input,
                 BootSector sector, unsigned partition, bool full) {
+    // 默认只移植代码：MBR 保留磁盘标识/分区表，VBR 保留原 BPB；full 是显式整扇区替换。
     Bytes source;
     {
         File file(input, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
@@ -595,6 +711,7 @@ void importBoot(const std::filesystem::path& path, const std::filesystem::path& 
     }
     publish(path, b, true);
 }
+
 Info inspect(const std::filesystem::path& path, const std::wstring& directory) {
     File input(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
     Bytes b = load(input, MaxHardBytes);
@@ -607,6 +724,7 @@ Info inspect(const std::filesystem::path& path, const std::wstring& directory) {
     }
     return info;
 }
+
 Bytes read(const std::filesystem::path& path, const std::wstring& file) {
     File input(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING);
     Bytes b = load(input, MaxHardBytes);

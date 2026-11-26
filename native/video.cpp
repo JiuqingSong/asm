@@ -4,16 +4,23 @@
 #include <stdexcept>
 #include <string>
 
+// VGA 的端口/平面/锁存器模型：客体可直接改寄存器，显示尺寸不能只依赖最近 BIOS 模式号。
 namespace asm86 {
 Vga::Vga() { setMode(3); }
+
 unsigned Vga::width() const { return graphics() ? (unsigned(crtc[1]) + 1) * (indexed256() ? 4 : 8) : 640; }
+
 unsigned Vga::height() const {
     if (!graphics()) return 400;
     unsigned lines = (unsigned(crtc[0x12]) | ((crtc[7] & 2) << 7) | ((crtc[7] & 0x40) << 3)) + 1;
     return std::max(1u, lines / ((crtc[9] & 31) + 1) / (crtc[9] & 0x80 ? 2 : 1));
 }
+
 unsigned Vga::charHeight() const { return mode == 0x10 ? 14 : mode == 0x12 || !graphics() ? 16 : 8; }
+
 void Vga::setMode(uint8_t value, bool clear) {
+    // 0..3 文本；0D 320×200、0E 640×200、10 640×350、12 640×480 四平面 16 色；
+    // 13 为 320×200×256 色。以下数组是 VGA 寄存器/颜色数据，不是 x86 机器码。
     if (value > 3 && value != 0x0d && value != 0x0e && value != 0x10 && value != 0x12 && value != 0x13)
         throw std::runtime_error("Unsupported native VGA mode " + std::to_string(value));
     mode = value;
@@ -86,7 +93,9 @@ void Vga::setMode(uint8_t value, bool clear) {
         }
     }
 }
+
 int Vga::offset(uint32_t address) const {
+    // GC6 选择 A0000 的 128/64 KiB、B0000 或 B8000 的 32 KiB CPU 访问窗口。
     if (address < 0xa0000 || address >= 0xc0000) return -1;
     switch ((gc[6] >> 2) & 3) {
     case 0: return int(address - 0xa0000);
@@ -95,7 +104,10 @@ int Vga::offset(uint32_t address) const {
     default: return address >= 0xb8000 ? int(address - 0xb8000) : -1;
     }
 }
+
 uint8_t Vga::read(uint32_t address) {
+    // 每次读取装入四个 latch；chain4 按低地址位选平面，奇偶模式分开字符/属性。
+    // Read Mode 1 用 Color Compare/Don't Care 逐平面比较，返回八个像素的匹配位。
     int off = offset(address); if (off < 0) return 255;
     bool chain4 = seq[4] & 8, oddEven = !(seq[4] & 4);
     unsigned index = (chain4 ? off >> 2 : oddEven ? off >> 1 : off) & 65535;
@@ -106,7 +118,10 @@ uint8_t Vga::read(uint32_t address) {
         if (gc[7] & (1 << p)) result &= gc[2] & (1 << p) ? latch[p] : uint8_t(~latch[p]);
     return result;
 }
+
 void Vga::write(uint32_t address, uint8_t value) {
+    // Write Mode 0：旋转输入/SetReset；1：直接复制 latch；2：低四位扩成各平面；
+    // 3：旋转输入生成位掩码，SetReset 决定颜色。最后与 latch 按逻辑运算和 Bit Mask 合成。
     int off = offset(address); if (off < 0) return;
     bool chain4 = seq[4] & 8, oddEven = !(seq[4] & 4);
     unsigned index = (chain4 ? off >> 2 : oddEven ? off >> 1 : off) & 65535;
@@ -128,7 +143,9 @@ void Vga::write(uint32_t address, uint8_t value) {
         planes[p][index] = data;
     }
 }
+
 uint8_t Vga::pixel(unsigned x, unsigned y) const {
+    // BIOS 像素访问：256 色每个平面交错一个像素；16 色四平面同一 bit 合成颜色号。
     if (x >= width() || y >= height()) throw std::runtime_error("VGA pixel is outside the display");
     if (indexed256()) {
         unsigned off = (y * (crtc[0x13] * 2) + x / 4 + ((unsigned(crtc[12]) << 8) | crtc[13])) & 65535;
@@ -139,6 +156,7 @@ uint8_t Vga::pixel(unsigned x, unsigned y) const {
     for (unsigned p = 0; p < 4; ++p) result |= uint8_t(((planes[p][off] >> (7 - (x & 7))) & 1) << p);
     return result;
 }
+
 void Vga::pixel(unsigned x, unsigned y, uint8_t value, bool exclusiveOr) {
     if (x >= width() || y >= height()) throw std::runtime_error("VGA pixel is outside the display");
     if (indexed256()) {
@@ -154,15 +172,19 @@ void Vga::pixel(unsigned x, unsigned y, uint8_t value, bool exclusiveOr) {
         else byte = uint8_t(value & (1 << p) ? byte | mask : byte & ~mask);
     }
 }
+
 uint8_t Vga::paletteIndex(uint8_t value) const {
     auto palette = attr[value & attr[0x12] & 15], select = attr[0x14];
     return uint8_t(((select & 12) << 4) | ((attr[0x10] & 0x80) ? ((select & 3) << 4) | (palette & 15) : palette & 63));
 }
+
 uint32_t Vga::color(uint8_t index) const {
     unsigned off = (index & pelMask) * 3;
     return (uint32_t(dac[off] * 255 / 63) << 16) | (uint32_t(dac[off + 1] * 255 / 63) << 8) | (dac[off + 2] * 255 / 63);
 }
+
 void Vga::renderGraphics(std::vector<uint32_t>& pixels) const {
+    // 一帧预计算调色板，按每四个/八个像素展开平面；不逐像素重算端口状态。
     if (!graphics()) throw std::runtime_error("A graphics frame requires a graphics video mode");
     const auto columns = width(), rows = height();
     pixels.resize(columns * rows);
@@ -195,7 +217,10 @@ void Vga::renderGraphics(std::vector<uint32_t>& pixels) const {
         }
     }
 }
+
 uint8_t Vga::input(uint16_t port) {
+    // 3C4/5 Sequencer；3CE/F GC；3B4/5 或 3D4/5 CRTC；3C7..9 DAC。
+    // 读取 3DA/3BA 复位属性控制器索引/数据触发器；这是客体设模序列必需的副作用。
     switch (port) {
     case 0x3c0: return attrAddress;
     case 0x3c1: return (attrAddress & 31) < attr.size() ? attr[attrAddress & 31] : 0;
@@ -217,7 +242,9 @@ uint8_t Vga::input(uint16_t port) {
     }
     return 255;
 }
+
 bool Vga::output(uint16_t port, uint8_t value) {
+    // 3C0 同端口交替写属性索引/数据；DAC 的 R/G/B 每三次读写才推进颜色索引。
     switch (port) {
     case 0x3c0:
         if (!attrData) attrAddress = value & 63;

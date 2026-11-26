@@ -7,6 +7,7 @@
 #include <vector>
 
 namespace asm86 {
+// 枚举顺序与 x86 寄存器编码一致，不可随意调整；AH..BH 复用 AX..BX 的高字节。
 enum { AX, CX, DX, BX, SP, BP, SI, DI };
 enum { ES, CS, SS, DS, FS, GS };
 enum : uint16_t { CF=1, PF=4, AF=16, ZF=64, SF=128, TF=256, IF=512, DF=1024, OF=2048 };
@@ -15,6 +16,8 @@ struct CpuFault { uint8_t vector; int code; };
 
 class Cpu {
 public:
+
+    // 架构可见状态：通用/段寄存器、控制寄存器、描述符表和 x87。
     CpuModel model = CpuModel::I8088;
     Fpu fpu;
     bool hasFpu() const { return model == CpuModel::I486; }
@@ -33,6 +36,8 @@ public:
     uint32_t ip = 0;
     uint16_t flags = 0xf002;
     bool halted = false, waiting = false, repContinue = false;
+
+    // 设备桥接：CPU 只执行 IN/OUT、MMIO 和 IRQ 协议，具体外设由 Pc 绑定。
     std::function<uint8_t(uint16_t)> in;
     std::function<void(uint16_t, uint8_t)> out;
     std::function<uint32_t(uint16_t, unsigned)> inWide;
@@ -50,7 +55,8 @@ public:
     uint16_t rw(uint16_t seg, uint16_t off) const;
     void wb(uint16_t seg, uint16_t off, uint8_t value);
     void ww(uint16_t seg, uint16_t off, uint16_t value);
-    // Firmware real-mode pointers still use the current guest page tables.
+
+    // BIOS 的 segment:offset 参数仍是客体地址，必须经过当前页表（含 VM86 重映射）。
     uint8_t rbF(uint16_t seg, uint16_t off);
     uint16_t rwF(uint16_t seg, uint16_t off);
     void wbF(uint16_t seg, uint16_t off, uint8_t value);
@@ -76,6 +82,8 @@ public:
     uint32_t inputPort(uint16_t port, unsigned size);
     void outputPort(uint16_t port, uint32_t value, unsigned size);
     bool protectedMode() const { return msw & 1; }
+
+    // readPhysical/writePhysical 保留 CPU 的 A20 行为；readBus/writeBus 专供 DMA 总线访问。
     uint8_t readPhysical(uint32_t address) const;
     uint8_t readBus(uint32_t address) const;
     uint16_t readWord(uint32_t address) const;
@@ -91,14 +99,19 @@ public:
     void reset();
     void stackedFlag(uint16_t mask, bool value);
 private:
+
+    // 段寄存器的隐藏缓存保存描述符基址、界限和权限；可见 selector 本身不足以寻址。
     struct Segment { uint32_t base = 0, limit = 0xffff; uint8_t access = 0x93, attributes = 0; bool null = false; };
     struct Descriptor : Segment { uint32_t address = 0, gateOffset = 0; uint16_t gateSelector = 0; uint8_t parameters = 0; };
     std::array<Segment, 6> segments{};
-    // BIOS code and the 16-bit cores keep using the same low-word register bank.
+
+    // 32 位寄存器拆成上下两半，保证 BIOS 和 16 位核心仍共用同一份低字寄存器。
     std::array<uint16_t, 8> upperR{};
     std::array<uint32_t, 8> debugRegisters{};
     uint32_t upperFlags = 0;
     uint8_t hiddenSegments = 0;
+
+    // 单条指令的译码暂存：ModR/M、有效地址、前缀、起始 IP 和默认操作数宽度。
     int mod = 0, reg = 0, rm = 0, eaSeg = DS, overrideSeg = -1;
     uint32_t eaOff = 0, startIp = 0;
     uint8_t rep = 0;

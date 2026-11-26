@@ -6,6 +6,7 @@
 #include <string>
 
 namespace asm86 {
+// 当前用户注册表持久化；测试可传独立 subkey，不能污染用户正在使用的映像/速度选择。
 class Preferences {
     HKEY key = nullptr;
     static void checked(LSTATUS status, const char* operation) {
@@ -13,6 +14,7 @@ class Preferences {
             throw std::runtime_error(std::string(operation) + " (Windows error " + std::to_string(status) + ")");
     }
     DWORD number(const wchar_t* name, DWORD fallback) const {
+        // 仅“值不存在”采用首次运行默认值；类型/权限/读取错误不能被默默当成默认设置。
         DWORD value = 0, bytes = sizeof(value);
         auto status = RegGetValueW(key, nullptr, name, RRF_RT_REG_DWORD, nullptr, &value, &bytes);
         if (status == ERROR_FILE_NOT_FOUND) return fallback;
@@ -24,6 +26,7 @@ class Preferences {
             "Cannot save native preferences");
     }
     std::filesystem::path imagePath(const wchar_t* name) const {
+        // REG_SZ 字节数、终止零和嵌入零都要验证，避免坏设置成为意外截断的磁盘路径。
         std::wstring value(32768, L'\0'); DWORD bytes = DWORD(value.size() * sizeof(wchar_t));
         auto status = RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, value.data(), &bytes);
         if (status == ERROR_FILE_NOT_FOUND) return {};

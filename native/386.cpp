@@ -2,23 +2,31 @@
 #include <limits>
 #include <stdexcept>
 
+// 386/486 扩展：32 位寄存器、两级分页、VM86、宽栈及 0F 操作码。
 namespace asm86 {
 uint32_t Cpu::r32(int i) const { return r[i] | (uint32_t(upperR[i]) << 16); }
+
 void Cpu::r32(int i, uint32_t value) { r[i] = uint16_t(value); upperR[i] = uint16_t(value >> 16); }
+
 uint32_t Cpu::eflags() const { return flags | upperFlags; }
+
 void Cpu::setEflags(uint32_t value) {
     setFlags(uint16_t(value));
     upperFlags = value & (model == CpuModel::I486 ? 0x270000u : supports386() ? 0x30000u : 0);
 }
+
 uint32_t Cpu::fetch32() { return fetchWide(4); }
+
 void Cpu::writeDword(uint32_t address, uint32_t value) { writeWord(address, uint16_t(value)); writeWord(address + 2, uint16_t(value >> 16)); }
 template<bool Operand>
 uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Operand, bool*, bool> access) {
+    // 线性地址拆成 10 位页目录索引、10 位页表索引、12 位页内偏移；仅支持 4 KiB 页。
     if (!supports386() || !(msw & 0x80000000u)) {
         if constexpr (Operand) *access = true;
         return address;
     }
-    // Both specializations fit the register ABI; scalar walks need no operand guard or out-parameter.
+
+    // 标量/操作数两种模板避免热路径不必要的输出参数；操作数版本还报告能否复用连续映射。
     bool supervisor = false;
     if constexpr (!Operand) supervisor = access;
     const bool user = !supervisor && (cpl == 3 || virtual8086());
@@ -26,6 +34,8 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
         cr2 = address; fault(14, (present ? 1 : 0) | (write ? 2 : 0) | (user ? 4 : 0));
     };
     auto directory = (cr3 & 0xfffff000u) + (address >> 22) * 4;
+
+    // PDE/PTE 的 P、R/W、U/S 联合决定访问权限；成功访问还要更新 A/D 位。
     bool ordinary = false;
     if constexpr (Operand) ordinary = !onWrite && (!mmioWrite || mmioRead) && physicalRam(directory, 4);
     auto pde = readDword(directory);
@@ -42,19 +52,24 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
     if (updated != pte) writeDword(table, updated);
     return (pte & 0xfffff000u) | (address & 4095);
 }
+
 uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
     return translatePage<false>(address, write, supervisor);
 }
+
 bool Cpu::translateOperand(uint32_t address, unsigned size, bool write, std::array<uint32_t, 4>& physical) {
     bool stable = false;
     bool singlePage = (address & 4095) <= 4096 - size;
     physical[0] = singlePage ? translatePage<true>(address, write, &stable) : translate(address, write, false);
-    // Reuse only this operand's walk: MMIO page tables and write observers may change the next byte's mapping.
+
+    // 只在本次操作数内复用页表遍历；MMIO 页表或写入观察器可能使下一字节的映射改变。
     for (unsigned i = 1; i < size; ++i)
         physical[i] = stable ? physical[0] + i : translate(address + i, write, false);
     return stable;
 }
+
 uint32_t Cpu::fetchWide(unsigned size) {
+    // 单页、段界限内、普通 RAM 才批量取指；否则逐字节访问以保留异常及 MMIO 顺序。
     auto linear = segmentBase(CS) + ip;
     const auto& code = segments[CS];
     if (supports386() && ip - startIp <= 15 - size && uint64_t(ip) + size - 1 <= code.limit
@@ -77,23 +92,32 @@ uint32_t Cpu::fetchWide(unsigned size) {
     for (unsigned i = 0; i < size; ++i) value |= uint32_t(fetch8()) << (i * 8);
     return value;
 }
+
 uint8_t Cpu::readLinear(uint32_t address, bool supervisor) { return readPhysical(translate(address, false, supervisor)); }
+
 void Cpu::writeLinear(uint32_t address, uint8_t value, bool supervisor) { writePhysical(translate(address, true, supervisor), value); }
+
 void Cpu::checkAlignment(uint32_t address, unsigned size) const {
     if (model == CpuModel::I486 && protectedMode() && cpl == 3 && (msw & 0x40000)
         && (upperFlags & 0x40000) && (address & (size - 1))) fault(17, 0);
 }
+
 uint8_t Cpu::rbF(uint16_t seg, uint16_t off) { return readLinear((uint32_t(seg) << 4) + off); }
+
 uint16_t Cpu::rwF(uint16_t seg, uint16_t off) { return rbF(seg, off) | (uint16_t(rbF(seg, uint16_t(off + 1))) << 8); }
+
 void Cpu::wbF(uint16_t seg, uint16_t off, uint8_t value) { writeLinear((uint32_t(seg) << 4) + off, value); }
+
 void Cpu::wwF(uint16_t seg, uint16_t off, uint16_t value) {
     auto base = uint32_t(seg) << 4;
     auto low = translate(base + off, true, false), high = translate(base + uint16_t(off + 1), true, false);
     writePhysical(low, uint8_t(value)); writePhysical(high, uint8_t(value >> 8));
 }
+
 uint32_t Cpu::offsetPlus(uint32_t offset, unsigned delta) const {
     return supports386() ? offset + delta : uint16_t(offset + delta);
 }
+
 uint32_t Cpu::readSegment(int segment, uint32_t offset, unsigned size) {
     if (size == 1) return rbS(segment, offset);
     if (size == 2) return rwS(segment, offset);
@@ -107,7 +131,9 @@ uint32_t Cpu::readSegment(int segment, uint32_t offset, unsigned size) {
     for (unsigned i = 0; i < size; ++i) value |= uint32_t(readPhysical(physical[i])) << (i * 8);
     return value;
 }
+
 void Cpu::writeSegment(int segment, uint32_t offset, uint32_t value, unsigned size) {
+    // 先翻译整个操作数，再写入：跨页第二页出错时不能已经改掉第一页。
     if (size == 1) { wbS(segment, offset, uint8_t(value)); return; }
     if (size == 2) { wwS(segment, offset, uint16_t(value)); return; }
     if (size != 4) throw std::runtime_error("Invalid CPU memory operand size");
@@ -117,33 +143,42 @@ void Cpu::writeSegment(int segment, uint32_t offset, uint32_t value, unsigned si
     checkAlignment(segmentBase(segment) + offset, size);
     for (unsigned i = 0; i < size; ++i) writePhysical(physical[i], uint8_t(value >> (i * 8)));
 }
+
 uint32_t Cpu::stackPointer() const {
+    // 栈地址宽度由 SS.B 决定，与指令的操作数宽度独立。
     return supports386() && (segments[SS].attributes & 0x40) ? r32(SP) : r[SP];
 }
+
 void Cpu::stackPointer(uint32_t value) {
     if (supports386() && (segments[SS].attributes & 0x40)) r32(SP, value);
     else r[SP] = uint16_t(value);
 }
+
 void Cpu::pushValue(uint32_t value, unsigned size) {
     auto sp = stackPointer() - size;
     if (!supports386() || !(segments[SS].attributes & 0x40)) sp = uint16_t(sp);
     writeSegment(SS, sp, value, size); stackPointer(sp);
 }
+
 uint32_t Cpu::popValue(unsigned size) {
     auto sp = stackPointer(), value = readSegment(SS, sp, size);
     stackPointer(sp + size); return value;
 }
+
 uint32_t Cpu::readSystem(uint32_t address, unsigned size) {
     uint32_t value = 0;
     for (unsigned i = 0; i < size; ++i) value |= uint32_t(readLinear(address + i, true)) << (i * 8);
     return value;
 }
+
 void Cpu::writeSystem(uint32_t address, uint32_t value, unsigned size) {
     std::array<uint32_t, 4> physical{};
     for (unsigned i = 0; i < size; ++i) physical[i] = translate(address + i, true, true);
     for (unsigned i = 0; i < size; ++i) writePhysical(physical[i], uint8_t(value >> (i * 8)));
 }
+
 void Cpu::checkIo(uint16_t port, unsigned size) {
+    // CPL/IOPL 不允许直接 I/O 时，查 386 TSS 的逐端口权限位图，任意被禁止字节都触发 #GP。
     if (!protectedMode()) return;
     if (!virtual8086() && cpl <= unsigned((flags >> 12) & 3)) return;
     if (!supports386() || !(tr.access & 8) || tr.limit < 103) fault(13, 0);
@@ -152,6 +187,7 @@ void Cpu::checkIo(uint16_t port, unsigned size) {
     auto bits = readSystem(tr.base + offset, 2);
     if (bits & (((1u << size) - 1) << (port & 7))) fault(13, 0);
 }
+
 void Cpu::validateStackPush(unsigned count, unsigned size) {
     if (!supports386()) return;
     auto sp = stackPointer();
@@ -161,7 +197,9 @@ void Cpu::validateStackPush(unsigned count, unsigned size) {
         for (unsigned i = 0; i < size; ++i) translate(segmentBase(SS) + sp + i, true, false);
     }
 }
+
 void Cpu::farReturn386(uint16_t adjustment, bool interruptReturn) {
+    // RETF/IRET 根据目标特权级恢复栈；32 位 IRET 还可从 ring 0 返回 VM86 九字段栈帧。
     bool vm = virtual8086();
     if (vm && interruptReturn) requireIo();
     if (!vm && protectedMode() && interruptReturn && (flags & 0x4000)) {
@@ -222,7 +260,9 @@ void Cpu::farReturn386(uint16_t adjustment, bool interruptReturn) {
         if (size == 4) upperFlags = (upperFlags & ~mask) | (value & mask);
     }
 }
+
 void Cpu::taskSwitch386(uint16_t selector, bool nested, bool returning) {
+    // 任务切换兼容 286/386 TSS 布局；Busy 位、backlink、NT 和 CR3 随任务一起维护。
     uint8_t vector = returning ? 10 : 13;
     if (!(selector & 0xfffc) || (selector & 4)) fault(vector, selector & 0xfffc);
     auto d = descriptor(selector, vector); unsigned type = d.access & 31;
@@ -281,6 +321,7 @@ void Cpu::taskSwitch386(uint16_t selector, bool nested, bool returning) {
     } catch (const CpuFault& f) { if (f.vector == 13) fault(10, f.code); throw; }
     if (ip > segments[CS].limit) fault(13, 0);
 }
+
 uint32_t Cpu::alu32(int op, uint32_t a, uint32_t b) {
     auto carry = ((op == 2 || op == 3) && (flags & CF)) ? 1u : 0u;
     uint32_t result;
@@ -298,6 +339,7 @@ uint32_t Cpu::alu32(int op, uint32_t a, uint32_t b) {
     szp(uint16_t(result), 2); flag(ZF, !result); flag(SF, (result & 0x80000000u) != 0);
     return result;
 }
+
 uint32_t Cpu::shift32(int op, uint32_t value, unsigned count) {
     count &= 31; if (!count) return value;
     if (op == 6) op = 4;
@@ -320,6 +362,7 @@ uint32_t Cpu::shift32(int op, uint32_t value, unsigned count) {
     if (op >= 4) { szp(uint16_t(value), 2); flag(ZF, !value); flag(SF, (value >> 31) != 0); }
     return value;
 }
+
 void Cpu::muldiv32(int op) {
     auto source = getRM(4);
     if (op == 4 || op == 5) {
@@ -341,7 +384,10 @@ void Cpu::muldiv32(int op) {
         r32(AX, uint32_t(quotient)); r32(DX, uint32_t(numerator % divisor));
     }
 }
+
 void Cpu::string386(uint8_t op) {
+    // 66 控制元素宽度，67 控制 ECX/ESI/EDI 或 CX/SI/DI；REP 每个元素均可重启。
+    // 6C/6D INS、6E/6F OUTS、A4/A5 MOVS、A6/A7 CMPS、AA/AB STOS、AC/AD LODS、AE/AF SCAS。
     unsigned size = op & 1 ? (operand32 ? 4 : 2) : 1;
     auto count = address32 ? r32(CX) : r[CX];
     if (rep && !count) return;
@@ -379,13 +425,17 @@ void Cpu::string386(uint8_t op) {
         if (more) { ip = startIp; repContinue = true; }
     }
 }
+
 void Cpu::system386() {
+    // 以下 op 是 0F 后的第二字节；不能按独立单字节操作码解释。
     auto op = fetch8(); int size = operand32 ? 4 : 2;
     if (op == 8 || op == 9) {
+        // 0F 08 INVD / 0F 09 WBINVD：本模拟器无数据缓存，仅验证 486 和 ring 0 权限。
         if (model != CpuModel::I486 || lockPrefix) fault(6);
-        requireRing0(); return; // No emulated data cache needs writeback or invalidation.
+        requireRing0(); return;
     }
     if (op == 0xa2) {
+        // 0F A2 CPUID：报告本模拟器声明的 486/FPU 能力，不能透传宿主特性。
         if (model != CpuModel::I486 || lockPrefix) fault(6);
         auto leaf = r32(AX);
         r32(AX, leaf == 0 ? 1 : leaf == 1 ? 0x400 : 0);
@@ -395,12 +445,14 @@ void Cpu::system386() {
         return;
     }
     if (op >= 0xc8 && op <= 0xcf) {
+        // 0F C8..CF BSWAP r32：反转四字节顺序。
         if (model != CpuModel::I486 || lockPrefix) fault(6);
         auto value = r32(op & 7);
         r32(op & 7, (value << 24) | ((value & 0xff00) << 8) | ((value >> 8) & 0xff00) | (value >> 24));
         return;
     }
     if (op == 0xb0 || op == 0xb1 || op == 0xc0 || op == 0xc1) {
+        // 0F B0/B1 CMPXCHG r/m,r；0F C0/C1 XADD r/m,r。内存形式允许 LOCK。
         if (model != CpuModel::I486) fault(6);
         modrm(); int width = op & 1 ? size : 1;
         if (lockPrefix && mod == 3) fault(6);
@@ -418,6 +470,7 @@ void Cpu::system386() {
         return;
     }
     if (op == 0x21 || op == 0x23) {
+        // 0F 21 MOV r32,DRn / 0F 23 MOV DRn,r32；GD 触发调试异常，未实现的断点显式报错。
         requireRing0(); modrm(); if (mod != 3 || reg == 4 || reg == 5) fault(6);
         if (debugRegisters[7] & 0x2000) { debugRegisters[6] |= 0x2000; fault(1); }
         if (op == 0x21) r32(rm, debugRegisters[reg]);
@@ -431,6 +484,7 @@ void Cpu::system386() {
         return;
     }
     if (op == 0x20 || op == 0x22) {
+        // 0F 20 MOV r32,CRn / 0F 22 MOV CRn,r32：CR0 模式、CR2 故障地址、CR3 页目录。
         requireRing0(); modrm(); if (mod != 3 || (reg != 0 && reg != 2 && reg != 3)) fault(6);
         if (op == 0x20) r32(rm, reg == 0 ? msw : reg == 2 ? cr2 : cr3);
         else {
@@ -443,9 +497,10 @@ void Cpu::system386() {
         }
         return;
     }
-    if (op == 5) fault(6);
-    if (op == 6) { requireRing0(); msw &= ~8u; return; }
+    if (op == 5) fault(6); // 286 LOADALL 的 0F 05 在此 386 核心不支持。
+    if (op == 6) { requireRing0(); msw &= ~8u; return; } // 0F 06 CLTS：清除 CR0.TS。
     if (op == 1) {
+        // 0F 01 /0 SGDT、/1 SIDT、/2 LGDT、/3 LIDT、/4 SMSW、/6 LMSW、/7 INVLPG（486）。
         modrm();
         if (reg == 7 && model == CpuModel::I486 && mod != 3) {
             if (lockPrefix) fault(6);
@@ -470,6 +525,7 @@ void Cpu::system386() {
         --ip; execSystem(); return;
     }
     if (op >= 0x80 && op <= 0x8f) {
+        // 0F 80..8F Jcc rel16/rel32：有符号相对跳转，取指宽度由操作数属性决定。
         auto displacement = fetch(size);
         if (cond(op & 15)) {
             auto target = operand32 ? ip + displacement : uint16_t(ip + displacement);
@@ -477,10 +533,13 @@ void Cpu::system386() {
         }
         return;
     }
+
+    // 0F 90..9F SETcc r/m8；0F A0/A1 PUSH/POP FS，0F A8/A9 PUSH/POP GS。
     if (op >= 0x90 && op <= 0x9f) { modrm(); setRM(1, cond(op & 15)); return; }
     if (op == 0xa0 || op == 0xa8) { pushValue(s[op == 0xa0 ? FS : GS], unsigned(size)); return; }
     if (op == 0xa1 || op == 0xa9) { auto value = popValue(unsigned(size)); loadSegment(op == 0xa1 ? FS : GS, uint16_t(value)); return; }
     if (op == 0xb2 || op == 0xb4 || op == 0xb5) {
+        // 0F B2 LSS / B4 LFS / B5 LGS：从内存远指针同时装载通用寄存器和段。
         if (lockPrefix) fault(6);
         modrm(); if (mod == 3) fault(6);
         auto value = readSegment(eaSeg, eaOff, size);
@@ -491,23 +550,28 @@ void Cpu::system386() {
         return;
     }
     if (op == 0xb6 || op == 0xb7 || op == 0xbe || op == 0xbf) {
+        // 0F B6/B7 MOVZX，BE/BF MOVSX：将字节/字零扩展或符号扩展到目标宽度。
         modrm(); auto value = getRM(op & 1 ? 2 : 1);
         if (op & 8) value = op & 1 ? uint32_t(int32_t(int16_t(value))) : uint32_t(int32_t(int8_t(value)));
         setReg(size, reg, value); return;
     }
     if (op == 0xaf) {
+        // 0F AF IMUL r,r/m：双操作数有符号乘法，仅保留目标宽度结果并报告截断。
         modrm(); auto result = size == 4 ? int64_t(int32_t(getReg(size, reg))) * int32_t(getRM(size))
             : int64_t(int16_t(getReg(size, reg))) * int16_t(getRM(size));
         setReg(size, reg, uint32_t(result));
         flag(CF | OF, result != (size == 4 ? int64_t(int32_t(uint32_t(result))) : int64_t(int16_t(uint16_t(result))))); return;
     }
     if (op == 0xbc || op == 0xbd) {
+        // 0F BC BSF / BD BSR：扫描最低/最高置位位置；源为零时置 ZF。
         modrm(); auto value = getRM(size); flag(ZF, !value); if (!value) return;
         unsigned bit = op == 0xbc ? 0 : unsigned(size * 8 - 1);
         while (!(value & (1u << bit))) { if (op == 0xbc) ++bit; else --bit; }
         setReg(size, reg, bit); return;
     }
     if (op == 0xa3 || op == 0xab || op == 0xb3 || op == 0xbb || op == 0xba) {
+        // 0F A3 BT、AB BTS、B3 BTR、BB BTC；BA /4..7 为立即数位号版本。
+        // 内存位串的寄存器位号可越过当前字，先调整有效地址，再更新 CF 和目标位。
         modrm(); bool immediate = op == 0xba;
         if (immediate && reg < 4) fault(6);
         auto index = immediate ? uint32_t(fetch8()) : getReg(size, reg);
@@ -523,6 +587,7 @@ void Cpu::system386() {
         return;
     }
     if (op == 0xa4 || op == 0xa5 || op == 0xac || op == 0xad) {
+        // 0F A4/A5 SHLD，AC/AD SHRD：从第二寄存器补入位，次数来自 imm8/CL。
         modrm(); auto source = getReg(size, reg), value = getRM(size);
         unsigned count = (op & 1 ? reg8(1) : fetch8()) & 31;
         if (!count) return;
@@ -542,13 +607,16 @@ void Cpu::system386() {
     }
     fault(6);
 }
+
 bool Cpu::exec386(uint8_t op) {
+    // 先承接需要宽度/保护检查的共同指令，剩余 16 位形式退回基础核心。
     if (op == 0x0f) { system386(); return true; }
     if (op == 0xcd) {
         auto number = fetch8(); if (virtual8086()) requireIo();
         interrupt(number, -1, true); return true;
     }
     if (op == 0x9c || op == 0x9d) {
+        // PUSHF[D]/POPF[D]：VM86 受 IOPL 限制，压栈时不暴露 VM/RF 位。
         if (virtual8086()) requireIo();
         unsigned size = operand32 ? 4 : 2;
         if (op == 0x9c) pushValue(eflags() & ~0x30000u, size);
@@ -577,6 +645,7 @@ bool Cpu::exec386(uint8_t op) {
     }
     if (op == 0x8d) { modrm(); if (mod == 3) fault(6); setReg(operand32 ? 4 : 2, reg, eaOff); return true; }
     if (op == 0x8f) {
+        // POP [ESP+...] 的目标地址以出栈后的 ESP 计算，而非译码时的旧 ESP。
         modrm(); if (reg) fault(6);
         auto oldSp = r32(SP), value = popValue(operand32 ? 4 : 2);
         if (eaUsesSp) eaOff += r32(SP) - oldSp;
@@ -590,6 +659,7 @@ bool Cpu::exec386(uint8_t op) {
         ip = target; return true;
     }
     if (op == 0xc8) {
+        // ENTER imm16,imm8：建立栈帧并复制嵌套帧链；C9 LEAVE 则恢复 BP/EBP。
         auto allocation = fetch16(); unsigned level = fetch8() & 31, size = operand32 ? 4 : 2;
         pushValue(getReg(int(size), BP), size); auto frame = stackPointer(), bp = getReg(int(size), BP);
         if (level) {
@@ -621,6 +691,8 @@ bool Cpu::exec386(uint8_t op) {
         return true;
     }
     if (!operand32) return false;
+
+    // 以下只处理 32 位操作数版本：编码与基础核心相同，寄存器/栈元素宽度改为 4 字节。
     if (op < 0x40 && (op & 7) < 6 && (op & 1)) {
         int kind = (op >> 3) & 7;
         if ((op & 7) >= 4) { auto value = alu32(kind, r32(AX), fetch32()); if (kind != 7) r32(AX, value); }
@@ -641,64 +713,64 @@ bool Cpu::exec386(uint8_t op) {
     if (op >= 0xb8 && op <= 0xbf) { r32(op & 7, fetch32()); return true; }
     if (op >= 0x91 && op <= 0x97) { auto value = r32(AX); r32(AX, r32(op & 7)); r32(op & 7, value); return true; }
     switch (op) {
-    case 0x60: { auto sp = r32(SP); for (unsigned i = 0; i < 8; ++i) pushValue(i == SP ? sp : r32(i), 4); break; }
-    case 0x61: for (int i = 7; i >= 0; --i) { auto value = popValue(4); if (i != SP) r32(i, value); } break;
-    case 0x62: {
+    case 0x60: { auto sp = r32(SP); for (unsigned i = 0; i < 8; ++i) pushValue(i == SP ? sp : r32(i), 4); break; } // PUSHAD：保存原 ESP。
+    case 0x61: for (int i = 7; i >= 0; --i) { auto value = popValue(4); if (i != SP) r32(i, value); } break; // POPAD：跳过 ESP 槽。
+    case 0x62: { // BOUND r32,m32&32：检查有符号上下界，越界触发 #BR。
         modrm(); if (mod == 3) fault(6);
         auto low = int32_t(readSegment(eaSeg, eaOff, 4)), high = int32_t(readSegment(eaSeg, offsetPlus(eaOff, 4), 4));
         if (int32_t(r32(reg)) < low || int32_t(r32(reg)) > high) fault(5);
         break;
     }
-    case 0x68: { auto value = fetch32(); pushValue(value, 4); break; }
-    case 0x6a: { auto value = uint32_t(int32_t(int8_t(fetch8()))); pushValue(value, 4); break; }
-    case 0x69: case 0x6b: {
+    case 0x68: { auto value = fetch32(); pushValue(value, 4); break; } // PUSH imm32。
+    case 0x6a: { auto value = uint32_t(int32_t(int8_t(fetch8()))); pushValue(value, 4); break; } // PUSH 符号扩展 imm8。
+    case 0x69: case 0x6b: { // IMUL r32,r/m32,imm32/imm8。
         modrm(); auto a = int32_t(getRM(4)), b = op == 0x69 ? int32_t(fetch32()) : int32_t(int8_t(fetch8()));
         auto result = int64_t(a) * b; r32(reg, uint32_t(result)); flag(CF | OF, result != int64_t(int32_t(uint32_t(result)))); break;
     }
-    case 0x81: case 0x83: {
+    case 0x81: case 0x83: { // Group 1：ALU r/m32,imm32/符号扩展 imm8。
         modrm(); auto a = getRM(4), b = op == 0x83 ? uint32_t(int32_t(int8_t(fetch8()))) : fetch32();
         auto value = alu32(reg, a, b); if (reg != 7) setRM(4, value); break;
     }
-    case 0x85: modrm(); alu32(4, getRM(4), r32(reg)); break;
-    case 0x87: { modrm(); auto a = getRM(4), b = r32(reg); setRM(4, b); r32(reg, a); break; }
-    case 0x89: modrm(); setRM(4, r32(reg)); break;
-    case 0x8b: modrm(); r32(reg, getRM(4)); break;
-    case 0x98: r32(AX, uint32_t(int32_t(int16_t(r[AX])))); break;
-    case 0x99: r32(DX, r32(AX) & 0x80000000u ? 0xffffffffu : 0); break;
-    case 0x9a: case 0xea: { auto offset = fetch32(); auto selector = fetch16(); farJump(selector, offset, op == 0x9a); break; }
-    case 0xa9: alu32(4, r32(AX), fetch32()); break;
-    case 0xc1: case 0xd1: case 0xd3: {
+    case 0x85: modrm(); alu32(4, getRM(4), r32(reg)); break; // TEST r/m32,r32。
+    case 0x87: { modrm(); auto a = getRM(4), b = r32(reg); setRM(4, b); r32(reg, a); break; } // XCHG r/m32,r32。
+    case 0x89: modrm(); setRM(4, r32(reg)); break; // MOV r/m32,r32。
+    case 0x8b: modrm(); r32(reg, getRM(4)); break; // MOV r32,r/m32。
+    case 0x98: r32(AX, uint32_t(int32_t(int16_t(r[AX])))); break; // CWDE：AX 符号扩展到 EAX。
+    case 0x99: r32(DX, r32(AX) & 0x80000000u ? 0xffffffffu : 0); break; // CDQ：EAX 符号扩展到 EDX:EAX。
+    case 0x9a: case 0xea: { auto offset = fetch32(); auto selector = fetch16(); farJump(selector, offset, op == 0x9a); break; } // CALL/JMP ptr16:32。
+    case 0xa9: alu32(4, r32(AX), fetch32()); break; // TEST EAX,imm32。
+    case 0xc1: case 0xd1: case 0xd3: { // Group 2：移位/旋转 r/m32，次数来自 imm8/1/CL。
         modrm(); auto value = getRM(4); auto count = op == 0xc1 ? fetch8() : op == 0xd1 ? 1 : reg8(1);
         setRM(4, shift32(reg, value, unsigned(count))); break;
     }
-    case 0xc2: { auto adjustment = fetch16(); auto target = popValue(4); checkSegment(CS, target, 1, false, true); ip = target; stackPointer(stackPointer() + adjustment); break; }
+    case 0xc2: { auto adjustment = fetch16(); auto target = popValue(4); checkSegment(CS, target, 1, false, true); ip = target; stackPointer(stackPointer() + adjustment); break; } // RET imm16，弹出 EIP。
     case 0xc3: { auto target = popValue(4); checkSegment(CS, target, 1, false, true); ip = target; break; }
-    case 0xc4: case 0xc5: {
+    case 0xc4: case 0xc5: { // LES/LDS r32,m16:32。
         modrm(); if (mod == 3) fault(6);
         auto value = readSegment(eaSeg, eaOff, 4); auto selector = uint16_t(readSegment(eaSeg, offsetPlus(eaOff, 4), 2));
         loadSegment(op == 0xc4 ? ES : DS, selector); r32(reg, value); break;
     }
-    case 0xc7: { modrm(); if (reg) fault(6); auto value = fetch32(); setRM(4, value); break; }
-    case 0xca: { auto adjustment = fetch16(); farReturn(adjustment, false); break; }
-    case 0xcb: farReturn(0, false); break;
-    case 0xcf: farReturn(0, true); break;
-    case 0xe5: case 0xed: {
+    case 0xc7: { modrm(); if (reg) fault(6); auto value = fetch32(); setRM(4, value); break; } // MOV r/m32,imm32。
+    case 0xca: { auto adjustment = fetch16(); farReturn(adjustment, false); break; } // RETF imm16。
+    case 0xcb: farReturn(0, false); break; // RETF。
+    case 0xcf: farReturn(0, true); break; // IRETD。
+    case 0xe5: case 0xed: { // IN EAX,imm8/DX；IDE 数据端口按完整双字传输。
         auto port = op == 0xe5 ? uint16_t(fetch8()) : r[DX]; checkIo(port, 4);
         r32(AX, inputPort(port, 4)); break;
     }
-    case 0xe7: case 0xef: {
+    case 0xe7: case 0xef: { // OUT imm8/DX,EAX。
         auto port = op == 0xe7 ? uint16_t(fetch8()) : r[DX]; checkIo(port, 4);
         outputPort(port, r32(AX), 4);
         break;
     }
-    case 0xf7:
+    case 0xf7: // Group 3：TEST/NOT/NEG/MUL/IMUL/DIV/IDIV r/m32。
         modrm();
         if (reg < 2) { auto a = getRM(4), b = fetch32(); alu32(4, a, b); }
         else if (reg == 2) setRM(4, ~getRM(4));
         else if (reg == 3) setRM(4, alu32(5, 0, getRM(4)));
         else muldiv32(reg);
         break;
-    case 0xff:
+    case 0xff: // Group 5：INC/DEC、近/远 CALL/JMP、PUSH，按 32 位栈元素处理。
         modrm();
         if (reg < 2) { auto carry = flags & CF; auto value = alu32(reg ? 5 : 0, getRM(4), 1); setRM(4, value); flags = uint16_t((flags & ~CF) | carry); }
         else if (reg == 2) { auto offset = getRM(4); checkSegment(CS, offset, 1, false, true); pushValue(ip, 4); ip = offset; }
@@ -714,7 +786,9 @@ bool Cpu::exec386(uint8_t op) {
     }
     return true;
 }
+
 void Cpu::setControl0(uint32_t value) {
+    // 禁止 PG=1、PE=0 以及 486 的非法缓存位组合；切模式保留必要的隐藏段缓存。
     if ((value & 0x80000001u) == 0x80000000u) fault(13, 0);
     if (model == CpuModel::I486 && (value & 0x60000000u) == 0x20000000u) fault(13, 0);
     if (!(msw & 1) && (value & 1)) {

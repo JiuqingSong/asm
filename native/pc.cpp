@@ -10,15 +10,19 @@
 #include <wincrypt.h>
 #include <winioctl.h>
 
+// 整机连接层：CPU 总线 ↔ 外设、原始/差分磁盘、BIOS 服务及 ROM 中实际执行的客体代码。
 namespace asm86 {
 static std::atomic<uint64_t> nextDiskIdentity{0};
 static constexpr uint16_t font16Offset = 0x8000;
 static constexpr uint16_t font8Offset = 0x9000;
 static constexpr uint16_t font14Offset = 0x9800;
+
 static std::runtime_error osError(const char* operation) {
     return std::runtime_error(std::string(operation) + " (Windows error " + std::to_string(GetLastError()) + ")");
 }
+
 static uint32_t floppyPayloadSectors(HANDLE file, uint32_t sectors) {
+    // 部分软盘映像在有效扇区后附带 1024 字节元数据；只有 BPB 和尾注都匹配才剥离。
     uint32_t payload = sectors >= 2 ? sectors - 2 : 0;
     if (payload != 320 && payload != 360 && payload != 640 && payload != 720 &&
         payload != 1440 && payload != 2400 && payload != 2880) return sectors;
@@ -43,6 +47,7 @@ static uint32_t floppyPayloadSectors(HANDLE file, uint32_t sectors) {
         return sectors;
     return payload;
 }
+
 static std::runtime_error biosError(Cpu& c, uint8_t number) {
     auto off = c.rwS(SS, c.r[SP]), seg = c.rwS(SS, uint16_t(c.r[SP] + 2));
     std::ostringstream message;
@@ -52,26 +57,88 @@ static std::runtime_error biosError(Cpu& c, uint8_t number) {
     for (int i = -12; i < 8; ++i) message << ' ' << unsigned(c.rbF(seg, uint16_t(off + i)));
     return std::runtime_error(message.str());
 }
+
 static void installVideoFirmware(Cpu& cpu) {
-    // VM86 monitors must observe mode programming, font uploads and clears as guest instructions.
+    // INT 10h/AH=00 的设模必须由客体 IN/OUT、显存写入完成，VM86 监控器才能更新其 VGA 缓存。
+    // 表中跳转偏移是固定的；只增加注释/换行，不能插入或删除任何机器码字节。
+    // F1 10 是解释器私有 BIOS 陷阱，CF 才是标准 IRET；其余字节均是 16 位 x86 指令。
     const uint8_t handler[] = {
-        0x80,0xfc,0x00,0x74,0x03,0xf1,0x10,0xcf,0xf1,0x10,0x50,0x53,0x51,0x52,0x56,0x1e,
-        0x06,0x57,0x0e,0x1f,0xfc,0x30,0xff,0x88,0xc3,0x80,0xe3,0x7f,0xd1,0xe3,0x8b,0xb7,
-        0x00,0x20,0xad,0x91,0xba,0xda,0x03,0xec,0xad,0x92,0xac,0xee,0xe2,0xfa,0x89,0xe3,
-        0x36,0x8b,0x47,0x0e,0x88,0xc3,0x24,0x7f,0x3c,0x0d,0x72,0x11,0xf6,0xc3,0x80,0x75,
-        0x71,0xb8,0x00,0xa0,0x8e,0xc0,0x31,0xc0,0xb9,0x00,0x80,0xeb,0x61,0xba,0xc4,0x03,
-        0xb8,0x02,0x04,0xef,0xb8,0x04,0x06,0xef,0xba,0xce,0x03,0xb8,0x05,0x00,0xef,0xb8,
-        0x06,0x04,0xef,0xb8,0x04,0x02,0xef,0xb8,0x00,0xa0,0x8e,0xc0,0xbe,0x00,0x80,0x31,
-        0xff,0xbb,0x00,0x01,0xb9,0x10,0x00,0xf3,0xa4,0x83,0xc7,0x10,0x4b,0x75,0xf5,0xba,
-        0xc4,0x03,0xb8,0x02,0x03,0xef,0xb8,0x04,0x02,0xef,0xba,0xce,0x03,0xb8,0x04,0x00,
-        0xef,0xb8,0x05,0x10,0xef,0xb8,0x06,0x0e,0xef,0x89,0xe3,0x36,0x8b,0x47,0x0e,0xa8,
-        0x80,0x75,0x0f,0xb8,0x00,0xb8,0x8e,0xc0,0xb8,0x20,0x07,0xb9,0x00,0x40,0x31,0xff,
-        0xf3,0xab,0x5f,0x07,0x1f,0x5e,0x5a,0x59,0x5b,0x58,0xcf
+        0x80,0xfc,0x00,       // CMP AH,00h：区分设模与其他 INT 10h 服务。
+        0x74,0x03,           // JE 0008h：设模进入客体 VGA 编程流程。
+        0xf1,0x10,           // BIOS_TRAP 10h：其他服务交给 C++ video()。
+        0xcf,                // IRET：返回调用者。
+        0xf1,0x10,           // BIOS_TRAP 10h：先更新 BIOS 模式/BDA，再执行实际端口操作。
+        0x50,0x53,0x51,0x52, // PUSH AX/BX/CX/DX：保存调用者通用寄存器。
+        0x56,0x1e,0x06,0x57, // PUSH SI/DS/ES/DI：保存索引和段寄存器。
+        0x0e,0x1f,           // PUSH CS / POP DS：DS 指向 ROM 中的模式配置表。
+        0xfc,                // CLD：字符串读取/写入均向前。
+        0x30,0xff,           // XOR BH,BH：模式号扩成 BX。
+        0x88,0xc3,           // MOV BL,AL：保存模式参数。
+        0x80,0xe3,0x7f,      // AND BL,7Fh：bit7 是保留显存标志，不属于模式编号。
+        0xd1,0xe3,           // SHL BX,1：每个模式表指针占 2 字节。
+        0x8b,0xb7,0x00,0x20, // MOV SI,[BX+2000h]：取模式端口序列地址。
+        0xad,0x91,           // LODSW / XCHG AX,CX：配置条目数放入 CX。
+        0xba,0xda,0x03,0xec, // MOV DX,03DAh / IN AL,DX：复位属性控制器索引/数据触发器。
+        0xad,0x92,           // LODSW / XCHG AX,DX：读取本条 16 位端口号。
+        0xac,0xee,           // LODSB / OUT DX,AL：读取并写入本条 8 位寄存器值。
+        0xe2,0xfa,           // LOOP 0028h：遍历三字节端口/数值条目。
+
+        0x89,0xe3,           // MOV BX,SP：定位保存的 AX（相对栈顶 +0Eh）。
+        0x36,0x8b,0x47,0x0e, // MOV AX,SS:[BX+0Eh]：恢复原始模式/保留显存参数。
+        0x88,0xc3,           // MOV BL,AL：保留 bit7 以便后续判断。
+        0x24,0x7f,           // AND AL,7Fh：提取模式号。
+        0x3c,0x0d,0x72,0x11, // CMP AL,0Dh / JB 004Dh：文本模式进入字体上传流程。
+        0xf6,0xc3,0x80,      // TEST BL,80h：图形模式是否要求保留显存。
+        0x75,0x71,           // JNE 00B2h：保留时跳过清屏。
+        0xb8,0x00,0xa0,      // MOV AX,0A000h：图形显存段。
+        0x8e,0xc0,           // MOV ES,AX。
+        0x31,0xc0,           // XOR AX,AX：图形清屏填充值为零。
+        0xb9,0x00,0x80,      // MOV CX,8000h：清除 32768 个字。
+        0xeb,0x61,           // JMP 00AEh：共用 REP STOSW 清屏。
+
+        0xba,0xc4,0x03,      // MOV DX,03C4h：Sequencer 索引/数据端口。
+        0xb8,0x02,0x04,0xef, // MOV AX,0402h / OUT DX,AX：Map Mask=04h，选择字体平面 2。
+        0xb8,0x04,0x06,0xef, // MOV AX,0604h / OUT DX,AX：临时关闭奇偶寻址。
+        0xba,0xce,0x03,      // MOV DX,03CEh：Graphics Controller 索引/数据端口。
+        0xb8,0x05,0x00,0xef, // MOV AX,0005h / OUT DX,AX：字体写入采用直接模式。
+        0xb8,0x06,0x04,0xef, // MOV AX,0406h / OUT DX,AX：映射 A000h 字体窗口。
+        0xb8,0x04,0x02,0xef, // MOV AX,0204h / OUT DX,AX：Read Map Select=2。
+        0xb8,0x00,0xa0,      // MOV AX,0A000h。
+        0x8e,0xc0,           // MOV ES,AX：字体目标段。
+        0xbe,0x00,0x80,      // MOV SI,8000h：ROM 中的 8×16 字体。
+        0x31,0xff,           // XOR DI,DI：字体平面起点。
+        0xbb,0x00,0x01,      // MOV BX,0100h：256 个字符。
+        0xb9,0x10,0x00,      // MOV CX,0010h：每个字符复制 16 行。
+        0xf3,0xa4,           // REP MOVSB：复制当前字符点阵。
+        0x83,0xc7,0x10,      // ADD DI,10h：每字符槽 32 字节，跳过未使用的后 16 字节。
+        0x4b,0x75,0xf5,      // DEC BX / JNE 0074h：继续下一个字符。
+        0xba,0xc4,0x03,      // MOV DX,03C4h：恢复文本 Sequencer。
+        0xb8,0x02,0x03,0xef, // MOV AX,0302h / OUT DX,AX：允许字符/属性平面 0、1。
+        0xb8,0x04,0x02,0xef, // MOV AX,0204h / OUT DX,AX：恢复奇偶寻址。
+        0xba,0xce,0x03,      // MOV DX,03CEh：恢复文本 GC。
+        0xb8,0x04,0x00,0xef, // MOV AX,0004h / OUT DX,AX：Read Map Select=0。
+        0xb8,0x05,0x10,0xef, // MOV AX,1005h / OUT DX,AX：文本奇偶读取模式。
+        0xb8,0x06,0x0e,0xef, // MOV AX,0E06h / OUT DX,AX：文本显存窗口 B800h。
+
+        0x89,0xe3,           // MOV BX,SP。
+        0x36,0x8b,0x47,0x0e, // MOV AX,SS:[BX+0Eh]：再次读取原模式参数。
+        0xa8,0x80,0x75,0x0f, // TEST AL,80h / JNE 00B2h：文本保留显存时也跳过清屏。
+        0xb8,0x00,0xb8,      // MOV AX,0B800h。
+        0x8e,0xc0,           // MOV ES,AX：文本显存段。
+        0xb8,0x20,0x07,      // MOV AX,0720h：空格字符 20h、灰字黑底属性 07h。
+        0xb9,0x00,0x40,      // MOV CX,4000h：填充文本显存。
+        0x31,0xff,           // XOR DI,DI：共用清屏入口。
+        0xf3,0xab,           // REP STOSW：写入 CX 个 AX。
+        0x5f,0x07,0x1f,0x5e, // POP DI/ES/DS/SI：与保存顺序相反。
+        0x5a,0x59,0x5b,0x58, // POP DX/CX/BX/AX。
+        0xcf                 // IRET：恢复调用者 CS:IP 和 FLAGS。
     };
     std::copy(std::begin(handler), std::end(handler), cpu.mem.begin() + 0xf0900);
     cpu.ww(0, 0x10 * 4, 0x900);
     auto profile = std::make_unique<Vga>();
     uint16_t address = 0x2028;
+
+    // 每个模式存放：条目数 WORD，随后重复 {port WORD,value BYTE}；上面的 LODS/OUT 循环消费它。
     for (uint8_t mode : {0, 1, 2, 3, 0x0d, 0x0e, 0x10, 0x12, 0x13}) {
         profile->setMode(mode);
         cpu.ww(0xf000, uint16_t(0x2000 + mode * 2), address);
@@ -105,19 +172,24 @@ static void installVideoFirmware(Cpu& cpu) {
     }
     cpu.ww(0, 0x43 * 4, font16Offset); cpu.ww(0, 0x43 * 4 + 2, 0xf000);
 }
+
 static void diskIo(HANDLE file, uint64_t offset, uint8_t* data, DWORD size, bool writing) {
     LARGE_INTEGER position{}; position.QuadPart = int64_t(offset); DWORD done = 0;
     if (!SetFilePointerEx(file, position, nullptr, FILE_BEGIN)) throw osError("Disk seek failed");
     auto ok = writing ? WriteFile(file, data, size, &done, nullptr) : ReadFile(file, data, size, &done, nullptr);
     if (!ok || done != size) throw osError(writing ? "Disk write failed" : "Disk read failed");
 }
+
 static uint32_t diskWord(const uint8_t* p) {
     return p[0] | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;
 }
+
 static void diskWord(uint8_t* p, uint32_t value) {
     for (unsigned i = 0; i < 4; ++i) p[i] = uint8_t(value >> (i * 8));
 }
+
 static uint32_t diskCrc(const uint8_t* data, unsigned size) {
+    // IEEE CRC32 的反射多项式；记录校验覆盖 LBA 和 512 字节数据，不包含尾部 CRC 自身。
     uint32_t value = 0xffffffffu;
     for (unsigned i = 0; i < size; ++i) {
         value ^= data[i];
@@ -125,6 +197,7 @@ static uint32_t diskCrc(const uint8_t* data, unsigned size) {
     }
     return ~value;
 }
+
 static std::array<uint8_t, 32> diskHash(HANDLE file, uint64_t size) {
     HCRYPTPROV provider = 0; HCRYPTHASH hash = 0;
     if (!CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT))
@@ -148,9 +221,12 @@ static std::array<uint8_t, 32> diskHash(HANDLE file, uint64_t size) {
     }
     CryptDestroyHash(hash); CryptReleaseContext(provider, 0); return result;
 }
+
 Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::filesystem::path& overlay)
     : readOnly(ro), path(p), identity(++nextDiskIdentity), differential(overlay) {
     if (!overlay.empty() && (floppy || ro)) throw std::runtime_error("Overlays require a writable guest hard disk");
+
+    // 差分模式对客体可写，对宿主底盘却只读；共享标志还阻止其他可写句柄破坏底盘。
     file = CreateFileW(p.c_str(), GENERIC_READ | (ro || !overlay.empty() ? 0 : GENERIC_WRITE), FILE_SHARE_READ,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) throw osError("Cannot open disk image");
@@ -185,7 +261,10 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::file
         CloseHandle(file); throw;
     }
 }
+
 void Disk::openOverlay() {
+    // 64 字节头：magic[8]、version[4]、sectors[4]、base SHA256[32]、保留[16]。
+    // 后续每条 520 字节：LBA[4]、data[512]、CRC32[4]；同 LBA 最后一条覆盖旧记录。
     std::array<uint8_t, 64> expected{};
     const char magic[] = "ASM86COW";
     std::copy(magic, magic + 8, expected.begin());
@@ -218,6 +297,7 @@ void Disk::openOverlay() {
     }
     overlayEnd = uint64_t(size.QuadPart);
 }
+
 void Disk::discardOverlay() {
     if (!hasOverlay()) throw std::runtime_error("No disk overlay is attached");
     LARGE_INTEGER end{}; end.QuadPart = 64;
@@ -225,15 +305,19 @@ void Disk::discardOverlay() {
         throw osError("Cannot discard overlay writes");
     overlayIndex.clear(); overlayEnd = 64; changed = true; flush();
 }
+
 Disk::~Disk() {
     if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
 }
+
 void Disk::create(const std::filesystem::path& p, unsigned cylinders) {
     if (cylinders < 1 || cylinders > 1024) throw std::runtime_error("Hard disk creation requires 1..1024 cylinders");
     createBytes(p, uint64_t(cylinders) * 16 * 63 * 512);
 }
+
 void Disk::createBytes(const std::filesystem::path& p, uint64_t bytes) {
+    // CREATE_NEW 保证不覆盖；大盘只建立稀疏文件长度，空洞读取为零，不分配整盘内存。
     if (bytes < 16 * 63 * 512 || bytes > MaxHardBytes || bytes % 512 ||
         (bytes <= 504ULL * 1024 * 1024 && bytes % (16 * 63 * 512)))
         throw std::runtime_error("Invalid raw hard disk size (maximum 32 GiB; small disks require complete cylinders)");
@@ -251,7 +335,9 @@ void Disk::createBytes(const std::filesystem::path& p, uint64_t bytes) {
     }
     CloseHandle(h);
 }
+
 int Disk::biosHeads() const {
+    // 传统 INT 13h 只有 10 位柱面，通过增加逻辑磁头数覆盖较大范围；更高地址走 EDD/LBA。
     int result = heads;
     if (heads == 16) {
         while (result < 128 && sectors / unsigned(result * spt) > 1024) result *= 2;
@@ -259,8 +345,11 @@ int Disk::biosHeads() const {
     }
     return result;
 }
+
 int Disk::biosCylinders() const { return std::min(1024, int(sectors / unsigned(biosHeads() * spt))); }
+
 bool Disk::transfer(uint32_t lba, uint8_t* data, bool writing) {
+    // ATA 与 BIOS 共用此扇区入口；差分读先查最新记录，未命中才读底盘。
     if (lba >= sectors || (writing && readOnly)) return false;
     if (hasOverlay()) {
         if (writing) {
@@ -279,14 +368,17 @@ bool Disk::transfer(uint32_t lba, uint8_t* data, bool writing) {
     diskIo(file, uint64_t(lba) * 512, data, 512, writing);
     return true;
 }
+
 bool Disk::read(uint32_t lba, uint8_t* p) {
     if (!transfer(lba, p, false)) return false;
     ++readSectors; return true;
 }
+
 bool Disk::write(uint32_t lba, const uint8_t* p) {
     if (!transfer(lba, const_cast<uint8_t*>(p), true)) return false;
     ++writtenSectors; return true;
 }
+
 void Disk::flush() {
     if (!readOnly && !FlushFileBuffers(hasOverlay() ? overlayFile : file)) throw osError("Disk flush failed");
 }
@@ -338,14 +430,23 @@ Pc::Pc() {
         else pic[1].pending &= uint8_t(~0x20);
     };
 }
+
 void Pc::setModel(CpuModel model) { cpu.setModel(model); keys.clear(); resetAt(); }
+
 unsigned Pc::columns() const { return cpu.rw(0x40, 0x4a); }
+
 unsigned Pc::activePage() const { return cpu.rb(0x40, 0x62) & 7; }
+
 unsigned Pc::cursor() const { return cpu.rw(0x40, uint16_t(0x50 + activePage() * 2)); }
+
 unsigned Pc::biosColumns() { return cpu.rwF(0x40, 0x4a); }
+
 unsigned Pc::biosPage() { return cpu.rbF(0x40, 0x62) & 7; }
+
 unsigned Pc::biosCursor() { return cpu.rwF(0x40, uint16_t(0x50 + biosPage() * 2)); }
+
 void Pc::boot(uint8_t drive) {
+    // 重建 BIOS ROM/IVT/BDA 与设备复位状态，再将引导扇区载入 0000:7C00。
     Disk* d = drive == 0 ? floppy.get() : drive == 0x80 ? hard.get() : nullptr;
     if (!d) throw std::runtime_error("No image mounted in the selected boot drive");
     std::array<uint8_t, 512> sector{};
@@ -363,40 +464,67 @@ void Pc::boot(uint8_t drive) {
     for (unsigned n = 0; n < 256; ++n) {
         uint16_t off = uint16_t(0x1000 + n * 8);
         cpu.ww(0, uint16_t(n * 4), off); cpu.ww(0, uint16_t(n * 4 + 2), 0xf000);
+
+        // F1 nn / CF：解释器 BIOS_TRAP nn 后 IRET；INT 16h 前加 FB（STI）允许等待键盘时响应 IRQ。
         cpu.wb(0xf000, off, 0xf1); cpu.wb(0xf000, off + 1, uint8_t(n)); cpu.wb(0xf000, off + 2, 0xcf);
         if (n == 0x16) {
             cpu.wb(0xf000, off, 0xfb); cpu.wb(0xf000, off + 1, 0xf1);
             cpu.wb(0xf000, off + 2, uint8_t(n)); cpu.wb(0xf000, off + 3, 0xcf);
         }
     }
-    // A nonzero INT 4Fh makes Windows probe a resident CAM SCSI provider.
+
+    // INT 4Fh 非零会让 Windows 探测驻留 CAM SCSI 提供者，因此明确置空。
     cpu.ww(0, 0x4f * 4, 0); cpu.ww(0, 0x4f * 4 + 2, 0);
     installVideoFirmware(cpu);
     cpu.ww(0, 0x1c * 4, 0x0700); cpu.ww(0, 0x1c * 4 + 2, 0xf000); cpu.wb(0xf000, 0x700, 0xcf);
-    // Windows calls this optional debugger hook even without a resident debugger.
+
+    // INT 1Ch/68h 都指向 CF（IRET）空处理器；Windows 无调试器时也可能调用 68h。
     cpu.ww(0, 0x68 * 4, 0x0700); cpu.ww(0, 0x68 * 4 + 2, 0xf000);
-    const uint8_t timer[] = {0x50, 0xf1, 0x08, 0xcd, 0x1c, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf};
+    const uint8_t timer[] = {
+        0x50,            // PUSH AX。
+        0xf1,0x08,       // BIOS_TRAP 08h：维护 BIOS 时钟滴答。
+        0xcd,0x1c,       // INT 1Ch：调用客体时钟回调。
+        0xb0,0x20,       // MOV AL,20h：PIC 非特定 EOI。
+        0xe6,0x20,       // OUT 20h,AL：确认 IRQ0。
+        0x58,0xcf        // POP AX / IRET。
+    };
     std::copy(std::begin(timer), std::end(timer), cpu.mem.begin() + 0xf0800);
     cpu.ww(0, 8 * 4, 0x800);
-    const uint8_t keyboard[] = {0x50, 0xe4, 0x60, 0xf1, 0x09, 0xb0, 0x20, 0xe6, 0x20, 0x58, 0xcf};
+    const uint8_t keyboard[] = {
+        0x50,            // PUSH AX。
+        0xe4,0x60,       // IN AL,60h：读取键盘扫描码并确认控制器输出。
+        0xf1,0x09,       // BIOS_TRAP 09h：更新 BIOS 键盘缓冲区。
+        0xb0,0x20,       // MOV AL,20h。
+        0xe6,0x20,       // OUT 20h,AL：确认 IRQ1。
+        0x58,0xcf        // POP AX / IRET。
+    };
     std::copy(std::begin(keyboard), std::end(keyboard), cpu.mem.begin() + 0xf0820);
     cpu.ww(0, 9 * 4, 0x820);
-    // Unowned COM1 interrupts can arrive after a mouse driver restores the BIOS vector.
-    const uint8_t serial[] = {0x50,0xe4,0x21,0x0c,0x10,0xe6,0x21,0xb0,0x20,0xe6,0x20,0x58,0xcf};
+
+    // 鼠标驱动恢复 BIOS 向量后可能仍有 COM1 中断；屏蔽 IRQ4 防止无人处理的中断风暴。
+    const uint8_t serial[] = {
+        0x50,            // PUSH AX。
+        0xe4,0x21,       // IN AL,21h：读取主 PIC 屏蔽字。
+        0x0c,0x10,       // OR AL,10h：屏蔽 IRQ4。
+        0xe6,0x21,       // OUT 21h,AL。
+        0xb0,0x20,       // MOV AL,20h。
+        0xe6,0x20,       // OUT 20h,AL：发送 EOI。
+        0x58,0xcf        // POP AX / IRET。
+    };
     std::copy(std::begin(serial), std::end(serial), cpu.mem.begin() + 0xf0840);
     cpu.ww(0, 0x0c * 4, 0x840);
-    // Floppy read/write/verify/format turn on the drive motor through a guest OUT to the DOR, like a real BIOS.
-    // Win9x HSFLOP maps BIOS drives to FDC units by trapping this write; without it no floppy drive is found
-    // and HSFLOP's no-drive error path later writes through a null pointer into the INT 1Ah vector.
+
+    // 软盘 BIOS 通过真正的客体 OUT 打开电机。Win9x HSFLOP 捕获 DOR 写入以关联 BIOS 盘号和 FDC。
+    // 缺少此动作会走无驱动器错误路径，后续空指针写入可破坏 INT 1Ah 向量。
     const uint8_t disk[] = {
-        0x80,0xfa,0x01, 0x77,0x1a,        // cmp dl,1 / ja trap
-        0x80,0xfc,0x02, 0x72,0x15,        // cmp ah,2 / jb trap
-        0x80,0xfc,0x05, 0x77,0x10,        // cmp ah,5 / ja trap
-        0x50, 0x52, 0xb0,0x1c,            // push ax / push dx / mov al,1Ch (motor A, select A)
-        0x08,0xd2, 0x74,0x02, 0xb0,0x2d,  // or dl,dl / jz out / mov al,2Dh (motor B, select B)
-        0xba,0xf2,0x03, 0xee,             // out: mov dx,3F2h / out dx,al
-        0x5a, 0x58,                       // pop dx / pop ax
-        0xf1,0x13, 0xcf};                 // trap: INT 13h service / iret
+        0x80,0xfa,0x01, 0x77,0x1a,        // CMP DL,1 / JA trap：只处理软盘 A/B 的电机。
+        0x80,0xfc,0x02, 0x72,0x15,        // CMP AH,2 / JB trap：排除非读写服务。
+        0x80,0xfc,0x05, 0x77,0x10,        // CMP AH,5 / JA trap：仅读/写/校验/格式化。
+        0x50, 0x52, 0xb0,0x1c,            // PUSH AX / PUSH DX / MOV AL,1Ch：选 A、启动电机 A。
+        0x08,0xd2, 0x74,0x02, 0xb0,0x2d,  // OR DL,DL / JZ out / MOV AL,2Dh：非零盘号选 B。
+        0xba,0xf2,0x03, 0xee,             // MOV DX,3F2h / OUT DX,AL：写 FDC DOR。
+        0x5a, 0x58,                       // POP DX / POP AX：恢复 BIOS 参数。
+        0xf1,0x13, 0xcf};                 // BIOS_TRAP 13h / IRET：执行磁盘服务并返回。
     std::copy(std::begin(disk), std::end(disk), cpu.mem.begin() + 0xf0860);
     cpu.ww(0, 0x13 * 4, 0x860);
     cpu.ww(0x40, 0, 0x3f8); cpu.wb(0x40, 0x7c, 1);
@@ -409,6 +537,9 @@ void Pc::boot(uint8_t drive) {
     auto now = std::time(nullptr); std::tm local{}; localtime_s(&local, &now);
     auto ticks = uint32_t((local.tm_hour * 3600 + local.tm_min * 60 + local.tm_sec) * (1193182.0 / 65536));
     cpu.ww(0x40, 0x6c, uint16_t(ticks)); cpu.ww(0x40, 0x6e, uint16_t(ticks >> 16));
+
+    // DPT 是数据，不是机器码：步进/卸载、加载、停转等待、N=2（512 字节）、每道扇区数、
+    // 读写 gap、DTL、格式化 gap、填充值 F6h、磁头稳定等待、电机启动等待。
     const uint8_t dpt[] = {0xdf, 2, 0x25, 2, 18, 0x1b, 0xff, 0x6c, 0xf6, 15, 8};
     std::copy(std::begin(dpt), std::end(dpt), cpu.mem.begin() + 0xfefc7);
     cpu.ww(0, 0x1e * 4, 0xefc7); cpu.ww(0, 0x1e * 4 + 2, 0xf000);
@@ -420,9 +551,9 @@ void Pc::boot(uint8_t drive) {
     const char date[] = "11/08/82";
     std::copy(date, date + 8, cpu.mem.begin() + 0xffff5);
     cpu.mem[0xffffe] = at() ? 0xfc : 0xfe;
-    const uint8_t reset[] = {0xea, 0x00, 0x06, 0x00, 0xf0};
+    const uint8_t reset[] = {0xea, 0x00, 0x06, 0x00, 0xf0}; // JMP FAR F000:0600（EA、offset16、segment16）。
     std::copy(std::begin(reset), std::end(reset), cpu.mem.begin() + 0xffff0);
-    cpu.wb(0xf000, 0x600, 0xf1); cpu.wb(0xf000, 0x601, 0x19);
+    cpu.wb(0xf000, 0x600, 0xf1); cpu.wb(0xf000, 0x601, 0x19); // BIOS_TRAP 19h：重新引导。
     for (unsigned i = 0; i < 0x4000; i += 2) cpu.ww(0xb800, uint16_t(i), 0x0720);
     std::copy(sector.begin(), sector.end(), cpu.mem.begin() + 0x7c00);
     if (at()) std::copy(cpu.mem.begin() + 0xf0000, cpu.mem.begin() + 0x100000, cpu.mem.begin() + 0xff0000);
@@ -430,23 +561,30 @@ void Pc::boot(uint8_t drive) {
     cpu.ip = 0x7c00; cpu.r[SP] = 0x7c00;
     cpu.r[DX] = drive; cpu.setFlags(0x0202);
 }
+
 void Pc::run(unsigned budget, double untilClock) {
+    // 兼容脚本的步数驱动：运行一步推进 3.6 个 PIT tick，闲置轮询推进 256 tick 以等待设备唤醒。
     for (unsigned i = 0; i < budget && !rebootRequested && !powerOffRequested && clock < untilClock; ++i) {
         stepCpu();
         advanceClock(clock + ((cpu.halted || cpu.waiting) ? 256.0 : 3.6));
     }
 }
+
 void Pc::stepCpu() {
     cpu.step(); ++instructions;
     if (pendingReset) resetCpu();
 }
+
 void Pc::runCpu(unsigned budget) {
+    // 实时前端单独推进设备时钟；此入口只跑 CPU，遇 HLT/BIOS 等待立即让出而不自行快进时间。
     for (unsigned i = 0; i < budget && !rebootRequested && !powerOffRequested; ++i) {
         stepCpu();
         if (cpu.halted || cpu.waiting) break;
     }
 }
+
 void Pc::advanceClock(double target) {
+    // 全部设备共用单调 PIT 时钟；到期事件集中推进，无需每种设备启动宿主线程。
     if (!std::isfinite(target) || target < clock) throw std::runtime_error("Invalid device clock target");
     clock = target;
     if (clock >= serialMouse.nextEvent) serialMouse.advance(clock);
@@ -461,7 +599,9 @@ void Pc::advanceClock(double target) {
     if (at() && clock >= cdrom.nextEvent) cdrom.advance(clock);
     if (clock >= fdc.nextEvent) fdc.advance(clock);
 }
+
 int Pc::acknowledge() {
+    // AT 从片 PIC 通过主片 IRQ2 级联；CPU 收到的是最终向量，不是 IRQ 线号。
     if (at() && pic[1].next() >= 0) pic[0].raise(2);
     int line = pic[0].take();
     if (line < 0) return -1;
@@ -472,6 +612,7 @@ int Pc::acknowledge() {
     }
     return pic[0].base + line;
 }
+
 uint8_t Pc::input(uint16_t p) {
     if (FloppyController::owns(p)) return fdc.input(p, clock);
     if ((at() || p < 0xc0) && DmaController::owns(p)) return dma.input(p);
@@ -508,8 +649,9 @@ uint8_t Pc::input(uint16_t p) {
         return crtcIndex == 14 ? uint8_t(cell >> 8) : crtcIndex == 15 ? uint8_t(cell) : vga.input(p);
     }
     if (p == 0x201) return 255;
-    return 255; // Unpopulated ISA bus reads high.
+    return 255; // 未安装设备的 ISA 端口读为全 1。
 }
+
 void Pc::output(uint16_t p, uint8_t v) {
     if (FloppyController::owns(p)) { fdc.output(p, v, clock); return; }
     if ((at() || p < 0xc0) && DmaController::owns(p)) { dma.output(p, v); return; }
@@ -557,10 +699,13 @@ void Pc::output(uint16_t p, uint8_t v) {
         }
     }
 }
+
 void Pc::key(uint8_t scan, uint8_t ascii) {
     keys.push_back(uint16_t((uint16_t(scan) << 8) | ascii)); keyboardIrq();
 }
+
 void Pc::modifiers(uint8_t value) { cpu.wb(0x40, 0x17, value); }
+
 static uint8_t keyboardAscii(uint8_t scan, uint8_t flags) {
     static constexpr char plain[] = "\0\0331234567890-=\b\tqwertyuiop[]\r\0asdfghjkl;'`\0\\zxcvbnm,./\0*\0 ";
     static constexpr char shifted[] = "\0\033!@#$%^&*()_+\b\tQWERTYUIOP{}\r\0ASDFGHJKL:\"~\0|ZXCVBNM<>?\0*\0 ";
@@ -576,8 +721,9 @@ static uint8_t keyboardAscii(uint8_t scan, uint8_t flags) {
     }
     return ch;
 }
+
 void Pc::keyboard() {
-    // The ROM reads port 60h so a VM86 monitor can supply its virtual scan code.
+    // ROM 已执行 IN 60h，AL 是 monitor 可接管的虚拟扫描码，不能在宿主再次直接读键盘队列。
     auto scan = cpu.reg8(0);
     auto ascii = keyboardRead && uint8_t(keyboardLatch >> 8) == scan
         ? uint8_t(keyboardLatch) : keyboardAscii(scan, cpu.rbF(0x40, 0x17));
@@ -607,6 +753,7 @@ void Pc::keyboard() {
     if (next != cpu.rwF(0x40, 0x1a)) { cpu.wwF(0x40, tail, value); cpu.wwF(0x40, 0x1c, next); }
     keyboardIrq();
 }
+
 std::string Pc::text() const {
     std::string result; unsigned cols = std::min(columns(), 80u), base = activePage() * 4096;
     for (unsigned y = 0; y < 25; ++y) {
@@ -615,22 +762,27 @@ std::string Pc::text() const {
     }
     return result;
 }
+
 bool Pc::biosGraphics() { return cpu.rbF(0x40, 0x49) >= 0x0d; }
+
 unsigned Pc::biosCharacterHeight() {
     unsigned height = cpu.rwF(0x40, 0x85);
     if (!height || height > 32) throw std::runtime_error("Invalid graphics BIOS character height");
     return height;
 }
+
 unsigned Pc::biosRows() {
     if (!biosGraphics()) return 25;
     unsigned rows = std::min(unsigned(cpu.rbF(0x40, 0x84)) + 1, vga.height() / biosCharacterHeight());
     if (!rows) throw std::runtime_error("Graphics BIOS character height exceeds the display");
     return rows;
 }
+
 uint8_t Pc::glyphByte(uint8_t ch, unsigned row) {
     auto offset = cpu.rwF(0, 0x43 * 4), segment = cpu.rwF(0, 0x43 * 4 + 2);
     return cpu.rbF(segment, uint16_t(offset + ch * biosCharacterHeight() + row));
 }
+
 void Pc::drawGlyph(unsigned column, unsigned row, uint8_t ch, uint8_t color) {
     unsigned height = biosCharacterHeight(), left = column * 8, top = row * height;
     if (left + 8 > vga.width() || top + height > vga.height())
@@ -644,6 +796,7 @@ void Pc::drawGlyph(unsigned column, unsigned row, uint8_t ch, uint8_t color) {
         }
     }
 }
+
 uint8_t Pc::readGlyph(unsigned column, unsigned row) {
     unsigned height = biosCharacterHeight(), left = column * 8, top = row * height;
     if (left + 8 > vga.width() || top + height > vga.height())
@@ -668,8 +821,9 @@ uint8_t Pc::readGlyph(unsigned column, unsigned row) {
         }
         if (matches && ink >= 0 && background >= 0 && ink != background) return uint8_t(ch);
     }
-    return 0; // Pixels not matching any current font glyph have no BIOS character.
+    return 0; // 像素不匹配当前任何字体字形时，BIOS 无法还原字符。
 }
+
 void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, unsigned lines, uint8_t attr, bool down, unsigned page) {
     bool graphics = biosGraphics();
     unsigned cols = std::min(biosColumns(), graphics ? vga.width() / 8 : 80u); if (!cols) return;
@@ -701,6 +855,7 @@ void Pc::scroll(unsigned top, unsigned left, unsigned bottom, unsigned right, un
         }
     }
 }
+
 void Pc::put(uint8_t ch, uint8_t attr, unsigned page, bool writeAttribute) {
     bool graphics = biosGraphics();
     if (page == 8) page = biosPage();
@@ -724,6 +879,7 @@ void Pc::put(uint8_t ch, uint8_t attr, unsigned page, bool writeAttribute) {
     if (y >= rows) { scroll(0, 0, rows - 1, cols - 1, 1, graphics ? 0 : attr, false, page); y = rows - 1; }
     cpu.wwF(0x40, uint16_t(0x50 + page * 2), uint16_t((y << 8) | x));
 }
+
 bool Pc::video() {
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4), al = c.reg8(0), bh = c.reg8(7), bl = c.reg8(3);
     unsigned page = bh & 7, cols = biosColumns();
@@ -862,16 +1018,19 @@ bool Pc::video() {
     }
     case 0x1a: c.reg8(0, 0x1a); r[BX] = 8; return true;
     case 0x1b: c.reg8(0, 0); return true;
-    case 0x4f: r[AX] = 0x014f; return true; // VBE/SVGA extensions, including monitor DDC, are unavailable.
-    case 0x6f: r[BX] = 0; return true; // Video Seven extensions are absent.
-    case 0xef: return true; // No MSHERC hook; preserve the caller's non-Hercules sentinel.
+    case 0x4f: r[AX] = 0x014f; return true; // 尚无 VBE/SVGA（含 DDC），返回 VBE 失败状态。
+    case 0x6f: r[BX] = 0; return true; // 无 Video Seven 扩展。
+    case 0xef: return true; // 无 MSHERC 驻留接口，保留调用者的非 Hercules 哨兵。
     case 0xfa:
-        if (!r[BX]) return true; // No EGA Register Interface Library driver.
+        if (!r[BX]) return true; // 无 EGA Register Interface Library 驻留驱动。
         break;
     }
     throw biosError(c, 0x10);
 }
+
 bool Pc::disk() {
+    // INT 13h：00/0D 复位、01 状态、02/03 读写、04 校验、05 格式化、08 几何。
+    // 扩展 41 检测、42/43 LBA 读写、44 校验、47 寻道、48 参数；状态通过 AH 和栈上的 CF 返回。
     auto& c = cpu; auto& r = c.r; uint8_t drive = c.reg8(2), ah = c.reg8(4);
     bool hd = drive & 0x80; Disk* d = drive == 0 ? floppy.get() : drive == 0x80 ? hard.get() : nullptr;
     auto status = [&](uint8_t code) {
@@ -914,6 +1073,7 @@ bool Pc::disk() {
         status(0); return true;
     }
     if (hd && (ah == 0x42 || ah == 0x43 || ah == 0x44 || ah == 0x47)) {
+        // DS:SI 指向 16 字节 DAP：大小/保留、count16、offset16:segment16、LBA64。
         auto ds = c.s[DS], si = r[SI];
         if (si > 0xfff0 || c.rbF(ds, si) != 16 || c.rbF(ds, uint16_t(si + 1))) { status(1); return true; }
         auto count = c.rwF(ds, uint16_t(si + 2));
@@ -929,6 +1089,7 @@ bool Pc::disk() {
         std::vector<uint8_t> data(unsigned(count) * 512);
         auto address = (uint32_t(segment) << 4) + offset;
         if (ah == 0x43) {
+            // 完整读取客体缓冲区后才落盘，避免第二页故障造成半次磁盘写入。
             for (unsigned i = 0; i < data.size(); ++i) data[i] = c.readLinear(address + i);
         }
         for (unsigned i = 0; i < count; ++i) {
@@ -967,6 +1128,7 @@ bool Pc::disk() {
     if (ah == 3 || ah == 5) d->flush();
     status(0); c.reg8(0, uint8_t(count)); return true;
 }
+
 bool Pc::apm() {
     auto& c = cpu; auto& r = c.r;
     auto result = [&](uint8_t error) {
@@ -994,7 +1156,7 @@ bool Pc::apm() {
     case 4:
         if (r[BX]) return result(9);
         apmConnected = false; apmVersion = 0x0100; return result(0);
-    case 5: case 6: return result(0); // CPU idle/busy without clock throttling.
+    case 5: case 6: return result(0); // APM CPU idle/busy 成功，但不改模拟时钟速率。
     case 7:
         if (r[BX] != 1) return result(9);
         if (!apmEnabled) return result(1);
@@ -1028,15 +1190,19 @@ bool Pc::apm() {
     default: return result(0x0c);
     }
 }
+
 bool Pc::bios(uint8_t n) {
+    // n 是私有 ROM 陷阱传来的 BIOS 中断号；CF/ZF 返回值写调用者栈帧，最终由 IRET 恢复。
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4);
-    // HP-HIL installation probes leave BX unchanged on a standard PC/AT.
+
+    // 标准 PC/AT 未装 HP-HIL 接口，探测必须保留 BX 而不能误宣告设备存在。
     if (r[AX] == 0x6f00 && (n == 0x14 || n == 0x16 || n == 0x17)) return true;
-    if (n == 0x68 && ah == 0x43) return true; // No resident extender with the F386h signature.
-    if (n == 0x67 && r[AX] == 0xde00) { c.reg8(4, 0x84); return true; } // No resident VCPI provider.
-    if (n == 0x5c && c.rbF(c.s[ES], r[BX]) == 0x7f) return true; // NetBIOS presence probe; no provider installed.
+    if (n == 0x68 && ah == 0x43) return true; // 没有返回 F386h 签名的驻留扩展器。
+    if (n == 0x67 && r[AX] == 0xde00) { c.reg8(4, 0x84); return true; } // 未安装 VCPI 提供者。
+    if (n == 0x5c && c.rbF(c.s[ES], r[BX]) == 0x7f) return true; // NetBIOS 安装探测：保持“无提供者”。
     switch (n) {
     case 8: {
+        // IRQ0 累加 BDA 0040:006C 的双字 tick；一天 1800B0h tick，溢出累加午夜计数。
         uint32_t ticks = c.rwF(0x40, 0x6c) | (uint32_t(c.rwF(0x40, 0x6e)) << 16);
         if (++ticks >= 0x1800b0) { ticks = 0; c.wbF(0x40, 0x70, uint8_t(c.rbF(0x40, 0x70) + 1)); }
         c.wwF(0x40, 0x6c, uint16_t(ticks)); c.wwF(0x40, 0x6e, uint16_t(ticks >> 16)); return true;
@@ -1047,6 +1213,8 @@ bool Pc::bios(uint8_t n) {
     case 0x12: r[AX] = 640; return true;
     case 0x13: return disk();
     case 0x14:
+
+        // AH=0 初始化 UART、1 发送、2 接收、3 状态；DX=0 是 COM1，AL 高三位编码波特率。
         if (r[DX] || c.reg8(4) > 3) { c.reg8(4, 0x80); return true; }
         switch (c.reg8(4)) {
         case 0: {
@@ -1065,6 +1233,8 @@ bool Pc::bios(uint8_t n) {
         }
         c.reg8(4, input(0x3fd)); c.reg8(0, input(0x3fe)); return true;
     case 0x15:
+
+        // 53h=APM，88h=扩展内存 KiB，24h=A20，87h=按描述符拷贝 CX 个字的扩展内存块。
         if (ah == 0x53) return apm();
         if (ah == 0x88) { r[AX] = at() ? 15360 : 0; c.stackedFlag(CF, false); }
         else if (at() && ah == 0x24 && c.reg8(0) <= 3) {
@@ -1096,6 +1266,8 @@ bool Pc::bios(uint8_t n) {
         else { c.reg8(4, 0x86); c.stackedFlag(CF, true); }
         return true;
     case 0x16: {
+        // BDA 1Ah/1Ch 是键盘环形队列头/尾，范围 1Eh..3Dh，每项为 scan:ASCII。
+        // 阻塞读队列为空时返回 false，由解释器保留陷阱位置等待 IRQ，而不是伪造一个零键。
         auto head = c.rwF(0x40, 0x1a), tail = c.rwF(0x40, 0x1c);
         if (ah == 0 || ah == 0x10) {
             if (head == tail) return false;
@@ -1105,9 +1277,11 @@ bool Pc::bios(uint8_t n) {
         if (ah == 1 || ah == 0x11) { c.stackedFlag(ZF, head == tail); if (head != tail) r[AX] = c.rwF(0x40, head); return true; }
         if (ah == 2) { c.reg8(0, c.rbF(0x40, 0x17)); return true; }
         if (ah == 3) return true;
-        // DOS probes for third-party keyboard extensions; an XT BIOS leaves AX unchanged.
+
+        // DOS 探测第三方键盘扩展；XT BIOS 应保持 AX 不变。
         if (ah == 0x92 || ah == 0xa2) return true;
-        // No ETen Chinese keyboard extension or QBASIC-compatible resident TSR.
+
+        // 未安装倚天中文键盘扩展或 QBASIC 兼容驻留 TSR，不宣告其存在。
         if (r[AX] == 0xdb00 || r[AX] == 0x55fe) return true;
         if (ah == 0x12) { r[AX] = c.rbF(0x40, 0x17); return true; }
         if (ah == 5) {
@@ -1119,6 +1293,7 @@ bool Pc::bios(uint8_t n) {
     case 0x17: c.reg8(4, 1); return true;
     case 0x19: rebootRequested = true; return true;
     case 0x1a: {
+        // AH=0/1 读写 BDA tick；AH=2/4 取宿主本地时间/日期并编码成 BIOS BCD 字段。
         auto bcd = [](int v) { return uint8_t((v / 10) * 16 + v % 10); };
         auto now = std::time(nullptr); std::tm t{}; localtime_s(&t, &now);
         if (ah == 0) { r[CX] = c.rwF(0x40, 0x6e); r[DX] = c.rwF(0x40, 0x6c); c.reg8(0, c.rbF(0x40, 0x70)); c.wbF(0x40, 0x70, 0); }
@@ -1130,7 +1305,7 @@ bool Pc::bios(uint8_t n) {
     }
     case 0x1b: case 0x1c: case 0x23: case 0x24: return true;
     case 0x18: throw std::runtime_error("Guest invoked INT 18h: no bootable system");
-    case 0x2f: return true; // No resident multiplex services in the firmware.
+    case 0x2f: return true; // 固件不提供驻留 multiplex 服务。
     case 0x33: if (r[AX] == 0) r[AX] = 0; return true;
     default: throw biosError(c, n);
     }

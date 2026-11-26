@@ -10,27 +10,36 @@
 
 namespace {
 using Bytes = std::vector<uint8_t>;
+
 void require(bool condition, const char* text) { if (!condition) throw std::runtime_error(text); }
+
 void fails(const std::function<void()>& action, const std::string& message) {
+    // 不仅要求失败，还核对具体错误；成功返回或错误原因不符都应让测试失败。
     try { action(); }
     catch (const std::exception& e) {
         require(std::string(e.what()).find(message) != std::string::npos, e.what()); return;
     }
     throw std::runtime_error("Expected operation to fail: " + message);
 }
+
 Bytes bytes(const std::filesystem::path& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("Cannot open test fixture");
     return Bytes(std::istreambuf_iterator<char>(f), {});
 }
+
 void write(const std::filesystem::path& path, const Bytes& data) {
     std::ofstream f(path, std::ios::binary);
     f.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
     if (!f) throw std::runtime_error("Cannot write test fixture");
 }
+
 uint16_t word(const Bytes& b, size_t o) { return uint16_t(b[o] | unsigned(b[o + 1]) << 8); }
+
 uint32_t integer(const Bytes& b, size_t o) { return word(b, o) | uint32_t(word(b, o + 2)) << 16; }
+
 void layout(const std::filesystem::path& path, bool floppy, uint64_t size) {
+    // 独立按原始扇区字段检查容量/CHS/BPB/FAT 镜像，不只相信工具自己的 inspect 输出。
     auto b = bytes(path);
     require(b.size() == size, "Exact image capacity");
     size_t base = floppy ? 0 : 63 * 512;
@@ -49,7 +58,9 @@ void layout(const std::filesystem::path& path, bool floppy, uint64_t size) {
     require(std::equal(b.begin() + fat, b.begin() + fat + fatSize, b.begin() + fat + fatSize), "FAT mirrors");
 }
 }
+
 int main() {
+    // 所有测试介质均在本次临时目录内；byte-for-byte 比较证明失败操作没有部分写入原盘。
     using namespace asm86::image;
     std::filesystem::path root;
     try {
@@ -84,6 +95,8 @@ int main() {
         fails([&] { inspect(raw); }, "Unformatted");
 
         std::filesystem::create_directories(root / L"TREE" / L"SUB");
+
+        // 覆盖多簇/空文件/目录扩展及整个多源导入事务的晚期失败。
         Bytes payload(5000);
         for (size_t i = 0; i < payload.size(); ++i) payload[i] = uint8_t(i * 37);
         write(root / L"TREE" / L"SUB" / L"DATA.BIN", payload);
@@ -129,13 +142,15 @@ int main() {
         put(hard, {root / L"TREE"}, L"\\INSTALL", false);
         require(read(hard, L"\\INSTALL\\TREE\\SUB\\DATA.BIN") == payload, "FAT16 import persists");
         auto h = bytes(hard);
-        std::fill(h.begin(), h.begin() + 440, 0x90); // Existing boot code must survive imports.
+        std::fill(h.begin(), h.begin() + 440, 0x90); // 90h 是 NOP；这里是保留性探针，不实际执行。
         write(hard, h);
         put(hard, {root / L"NOTE.TXT"}, L"\\INSTALL", false);
         auto after = bytes(hard);
         require(std::equal(h.begin(), h.begin() + 512, after.begin()), "Existing MBR preserved byte-for-byte");
         require(std::equal(h.begin() + 63 * 512, h.begin() + 64 * 512, after.begin() + 63 * 512), "Existing VBR preserved byte-for-byte");
         auto bootFile = root / L"BOOT.BIN";
+
+        // 单独验证 code-only 的保护边界：OEM/BPB、磁盘标识、分区表和其它扇区逐字节不变。
         exportBoot(floppy, bootFile, BootSector::Floppy);
         auto boot = bytes(bootFile), floppyBefore = bytes(floppy);
         require(boot == Bytes(floppyBefore.begin(), floppyBefore.begin() + 512), "Floppy export is exactly the original 512 bytes");
@@ -210,6 +225,8 @@ int main() {
         require(bytes(hard) == secondSlot, "Out-of-bounds partition rejected before modification");
 
         Bytes full(512);
+
+        // full 允许任意数据（不要求可执行指令）；仍只准改变所选的一个 512 字节扇区。
         for (size_t i = 0; i < full.size(); ++i) full[i] = uint8_t(i * 17);
         write(bootFile, full);
         write(hard, hardExpected);

@@ -1,4 +1,4 @@
-// Included by fpu.cpp; the fixed-point implementation shares its translation unit.
+// 由 fpu.cpp 包含，共用一个翻译单元；超越运算采用 256 位小数定点数，不依赖宿主浮点舍入。
 #include "fpu-math.h"
 #include <algorithm>
 #include <stdexcept>
@@ -12,6 +12,7 @@ Integer Integer::unsignedValue(uint64_t n) {
     }
     return r;
 }
+
 Integer::Integer(int64_t n) {
     uint64_t magnitude = n < 0 ? uint64_t(0) - uint64_t(n) : uint64_t(n);
     if (magnitude) {
@@ -20,6 +21,7 @@ Integer::Integer(int64_t n) {
     }
     negative = n < 0;
 }
+
 Integer Integer::hex(const char* text) {
     Integer r;
     for (; *text; ++text) {
@@ -28,23 +30,29 @@ Integer Integer::hex(const char* text) {
     }
     return r;
 }
+
 void Integer::normalize() {
     while (!words.empty() && !words.back()) words.pop_back();
     if (words.empty()) negative = false;
 }
+
 unsigned Integer::length() const {
     if (words.empty()) return 0;
     unsigned n = unsigned(words.size() - 1) * 32;
     for (uint32_t v = words.back(); v; v >>= 1) ++n;
     return n;
 }
+
 uint64_t Integer::low() const {
     uint64_t n = words.empty() ? 0 : words[0];
     if (words.size() > 1) n |= uint64_t(words[1]) << 32;
     return negative ? uint64_t(0) - n : n;
 }
+
 Integer Integer::abs() const { Integer r = *this; r.negative = false; return r; }
+
 Integer Integer::operator-() const { Integer r = *this; if (r) r.negative = !r.negative; return r; }
+
 int Integer::magnitudeCompare(const Integer& a, const Integer& b) {
     if (a.words.size() != b.words.size()) return a.words.size() < b.words.size() ? -1 : 1;
     for (size_t i = a.words.size(); i-- > 0;) {
@@ -52,12 +60,15 @@ int Integer::magnitudeCompare(const Integer& a, const Integer& b) {
     }
     return 0;
 }
+
 bool Integer::operator==(const Integer& b) const { return negative == b.negative && words == b.words; }
+
 bool Integer::operator<(const Integer& b) const {
     if (negative != b.negative) return negative;
     int cmp = magnitudeCompare(*this, b);
     return negative ? cmp > 0 : cmp < 0;
 }
+
 Integer Integer::operator<<(unsigned n) const {
     if (!*this) return {};
     Integer r;
@@ -74,7 +85,9 @@ Integer Integer::operator<<(unsigned n) const {
     r.normalize();
     return r;
 }
+
 Integer Integer::operator>>(unsigned n) const {
+    // 负数若丢弃非零低位，绝对值需多加一，才能得到算术右移向负无穷取整的结果。
     unsigned full = n / 32, part = n % 32;
     Integer r;
     bool discarded = false;
@@ -93,6 +106,7 @@ Integer Integer::operator>>(unsigned n) const {
     if (r) r.negative = negative;
     return r;
 }
+
 Integer Integer::operator+(const Integer& b) const {
     Integer r;
     if (negative == b.negative) {
@@ -119,7 +133,9 @@ Integer Integer::operator+(const Integer& b) const {
     r.normalize();
     return r;
 }
+
 Integer Integer::operator-(const Integer& b) const { return *this + -b; }
+
 Integer Integer::operator*(const Integer& b) const {
     if (!*this || !b) return {};
     Integer r;
@@ -135,7 +151,9 @@ Integer Integer::operator*(const Integer& b) const {
     r.normalize();
     return r;
 }
+
 void Integer::divide(const Integer& a, const Integer& b, Integer& q, Integer& r) {
+    // 绝对值长除法逐位试减；商符号为异或，余数符号跟随被除数，除法向零截断。
     if (!b) throw std::domain_error("x87 integer division by zero");
     r = a.abs(); q = {};
     Integer divisor = b.abs();
@@ -154,25 +172,39 @@ void Integer::divide(const Integer& a, const Integer& b, Integer& q, Integer& r)
     q.normalize(); if (q) q.negative = a.negative != b.negative;
     if (r) r.negative = a.negative;
 }
+
 Integer Integer::operator/(const Integer& b) const { Integer q, r; divide(*this, b, q, r); return q; }
+
 Integer Integer::operator%(const Integer& b) const { Integer q, r; divide(*this, b, q, r); return r; }
 
 static const Integer ONE = Integer(1) << 256;
+
+// PI/LN2 是乘以 2^256 后的数值常量，不是指令或客体内存地址。
 static const Integer PI = Integer::hex("3243f6a8885a308d313198a2e03707344a4093822299f31d0082efa98ec4e6c89");
+
 static const Integer LN2 = Integer::hex("b17217f7d1cf79abc9e3b39803f2f6af40f343267298b62d8a0d175b8baafa2b");
+
 static Integer mul(const Integer& a, const Integer& b) { return (a * b) >> 256; }
+
 static Integer div(const Integer& a, const Integer& b) { return (a << 256) / b; }
+
 unsigned exponent(Float80 a) { return a.signExponent & 0x7fff; }
+
 bool nan(Float80 a) { return exponent(a) == 0x7fff && (a.significand & 0x7fffffffffffffffull); }
+
 bool unsupported(Float80 a) { return exponent(a) && !(a.significand >> 63); }
+
 bool sign(Float80 a) { return (a.signExponent & 0x8000) != 0; }
+
 Integer fixed(Float80 a) {
     int shift = int(exponent(a) ? exponent(a) : 1) - 16383 - 63 + 256;
     Integer n = Integer::unsignedValue(a.significand);
     n = shift >= 0 ? n << unsigned(shift) : n >> unsigned(-shift);
     return sign(a) ? -n : n;
 }
+
 FloatResult fromFixed(const Integer& value, uint16_t control, int precision) {
+    // 按 x87 PC（24/53/64 位）和 RC（最近偶数/向下/向上/向零）舍入，再生成 80 位格式及异常位。
     if (!value) return {{}, 0};
     const bool negative = value.negative;
     Integer m = value.abs();
@@ -200,7 +232,9 @@ FloatResult fromFixed(const Integer& value, uint16_t control, int precision) {
     }
     return {{m.low(), uint16_t(exp | (negative ? 0x8000 : 0))}, uint16_t(flags | (up ? 0x200 : 0))};
 }
+
 static Integer logFixed(const Integer& x) {
+    // ln(x)=2*(z+z^3/3+...)，z=(x-1)/(x+1)；归一化后加快收敛。
     Integer z = div(x - ONE, x + ONE), z2 = mul(z, z), power = z, sum = z;
     for (int k = 3; k < 1200; k += 2) {
         power = mul(power, z2);
@@ -210,7 +244,9 @@ static Integer logFixed(const Integer& x) {
     }
     return sum * Integer(2);
 }
+
 static Integer atanFixed(Integer x) {
+    // 先用倒数/角度加法把参数缩小，再求 atan 交错级数，最后还原象限/符号。
     bool negative = x.negative;
     x = x.abs();
     bool inverse = x > ONE;
@@ -228,7 +264,9 @@ static Integer atanFixed(Integer x) {
     if (inverse) sum = PI / Integer(2) - sum;
     return negative ? -sum : sum;
 }
+
 FloatResult trig(Float80 a, bool cosine, uint16_t control) {
+    // 先模 2π 约化到 [-π,π]，再用定点 Taylor 级数；微小输入用极限避免定点下溢。
     if (exponent(a) < 16383 - 128) return {cosine ? Float80{0x8000000000000000ull, 0x3fff} : a, uint16_t(a.significand ? 0x20 : 0)};
     Integer x = fixed(a) % (PI * Integer(2));
     if (x > PI) x = x - PI * Integer(2);
@@ -244,6 +282,7 @@ FloatResult trig(Float80 a, bool cosine, uint16_t control) {
     if (!cosine && !a.significand) r.value = a;
     return r;
 }
+
 FloatResult exp2m1(Float80 a, uint16_t control) {
     if (exponent(a) < 16383 - 128) {
         auto r = calculateFloat(FloatOperation::Multiply, a, {0xb17217f7d1cf79acull, 0x3ffe}, control | 0x300);
@@ -260,7 +299,9 @@ FloatResult exp2m1(Float80 a, uint16_t control) {
     if (a.significand) r.flags |= 0x20; else r.value = a;
     return r;
 }
+
 FloatResult log2(Float80 a, bool plusOne, uint16_t control) {
+    // 拆为指数+log2(尾数)；plusOne 实现 FYL2XP1，负/零定义域由异常标志返回。
     if (plusOne && exponent(a) < 16383 - 128) {
         auto r = calculateFloat(FloatOperation::Multiply, a, {0xb8aa3b295c17f0bcull, 0x3fff}, control | 0x300);
         if (a.significand) r.flags |= 0x20;
@@ -280,6 +321,7 @@ FloatResult log2(Float80 a, bool plusOne, uint16_t control) {
     if (mantissa != ONE) r.flags |= 0x20;
     return r;
 }
+
 FloatResult atan2(Float80 y, Float80 x, uint16_t control) {
     if (!y.significand) {
         if (!sign(x)) return {{0, uint16_t(y.signExponent & 0x8000)}, 0};
@@ -302,7 +344,9 @@ FloatResult atan2(Float80 y, Float80 x, uint16_t control) {
     if (fx.negative) angle = angle + (sign(y) ? -PI : PI);
     auto r = fromFixed(angle, control | 0x300); r.flags |= 0x20; return r;
 }
+
 FloatResult scale80(Float80 a, int amount, uint16_t control) {
+    // FSCALE 调整二进制指数；未屏蔽上/下溢保留 x87 的指数回绕响应。
     if (!a.significand || exponent(a) == 0x7fff) return {a, 0};
     Integer mantissa = Integer::unsignedValue(a.significand);
     if (sign(a)) mantissa = -mantissa;

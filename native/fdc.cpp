@@ -4,17 +4,23 @@
 #include <cmath>
 #include <stdexcept>
 
+// 82077/765 风格软驱控制器：命令、执行、PIO 数据、结果四类阶段，IRQ6 与 DMA2 独立握手。
 namespace asm86 {
 void FloppyController::signal() { if (interrupt) interrupt(irqPending && (dor & 8) && (dor & 4)); }
+
 void FloppyController::irq(bool raised) { irqPending = raised; signal(); }
+
 void FloppyController::deadlines() {
     nextEvent = due;
     for (auto time : seekTime) nextEvent = std::min(nextEvent, time);
 }
+
 void FloppyController::schedule(Action next, double now) {
     action = next; due = now + 600; phase = Phase::Execute; deadlines();
 }
+
 void FloppyController::softReset() {
+    // 复位会产生四个驱动器的 SENSE INTERRUPT 状态；锁定配置跨软复位保留。
     if (dirty) { auto* image = activeDisk(); if (image) image->flush(); }
     phase = Phase::Command; action = Action::None;
     command.clear(); active.clear(); result.clear(); buffer.clear(); sectors.clear();
@@ -24,29 +30,36 @@ void FloppyController::softReset() {
     if (!locked) config = {0x20,0};
     dirty = false; irq(false);
 }
+
 void FloppyController::reset() {
     dor = 0x0c; rate = perpendicular = 0; cylinder.fill(0); specify.fill(0);
     locked = false; changed = true; seenMedia = activeMedia = 0; rotation = 0;
     softReset(); pending.clear();
 }
+
 void FloppyController::checkChange() {
     auto* image = disk ? disk() : nullptr;
     auto id = image ? image->identity : 0;
     if (id != seenMedia) { changed = true; seenMedia = id; }
 }
+
 Disk* FloppyController::medium(unsigned drive) {
     checkChange(); return drive == 0 && disk ? disk() : nullptr;
 }
+
 Disk* FloppyController::activeDisk() {
+    // 用介质 identity 检测正在执行的命令期间换盘，不能把旧命令写到新映像。
     auto* image = medium(active[1] & 3);
     return image && image->identity == activeMedia ? image : nullptr;
 }
+
 void FloppyController::finish(std::vector<uint8_t> bytes, bool raised) {
     result = std::move(bytes); resultPosition = 0;
     phase = result.empty() ? Phase::Command : Phase::Result;
     action = Action::None; due = std::numeric_limits<double>::infinity(); deadlines();
     if (raised) irq(true);
 }
+
 void FloppyController::status(uint8_t st1, uint8_t st2, uint8_t c, uint8_t h, uint8_t r, uint8_t n, uint8_t actualHead) {
     auto* image = activeDisk();
     if (dirty && image) image->flush();
@@ -54,7 +67,9 @@ void FloppyController::status(uint8_t st1, uint8_t st2, uint8_t c, uint8_t h, ui
     finish({uint8_t(((st1 || (st2 & ~0x40)) ? 0x40 : 0) | ((actualHead == 255 ? h : actualHead) << 2) | (active[1] & 3)),
         st1, st2, c, h, r, n}, true);
 }
+
 uint8_t FloppyController::input(uint16_t port, double now) {
+    // 3F2 DOR；3F4 MSR（RQM/DIO/NDMA/CB）；3F5 FIFO；3F7 DIR（bit7 换盘）。
     if (port == 0x3f2) return dor;
     if (port == 0x3f5) return readData(now);
     if (port == 0x3f7) { checkChange(); return (dor & 3) == 0 && changed ? 0x80 : 0; }
@@ -71,7 +86,9 @@ uint8_t FloppyController::input(uint16_t port, double now) {
     }
     throw std::runtime_error("Invalid floppy controller phase");
 }
+
 void FloppyController::output(uint16_t port, uint8_t value, double now) {
+    // DOR bit2 复位、bit3 IRQ/DMA 允许、bit4..7 电机；DSR/CCR 选择数据率。
     if (port == 0x3f2) {
         auto old = dor; dor = value;
         if (!(dor & 4)) softReset();
@@ -85,6 +102,7 @@ void FloppyController::output(uint16_t port, uint8_t value, double now) {
     }
     if (port == 0x3f5 && (dor & 4)) writeData(value, now);
 }
+
 uint8_t FloppyController::readData(double now) {
     if (phase == Phase::Read) {
         irq(false); auto value = buffer[position++];
@@ -96,6 +114,7 @@ uint8_t FloppyController::readData(double now) {
     if (resultPosition == result.size()) { phase = Phase::Command; result.clear(); }
     return value;
 }
+
 void FloppyController::writeData(uint8_t value, double now) {
     if (phase == Phase::Write) {
         irq(false); buffer[position++] = value;
@@ -108,6 +127,8 @@ void FloppyController::writeData(uint8_t value, double now) {
     if (phase != Phase::Command) return;
     command.push_back(value);
     static constexpr int parameters[] = {-1,-1,8,2,1,8,8,1,0,-1,1,-1,8,5,0,2,0,-1,1,3,0};
+
+    // 按命令低 5 位查后续参数数；bit7 MT、bit6 MFM、bit5 SK 不改变基础命令编号。
     unsigned op = command[0] & 31;
     if (op >= std::size(parameters) || parameters[op] < 0
         || ((op == 0x0e || op == 0x10) && command[0] != op)) {
@@ -115,34 +136,35 @@ void FloppyController::writeData(uint8_t value, double now) {
     }
     if (command.size() == unsigned(parameters[op] + 1)) execute(now);
 }
+
 void FloppyController::execute(double now) {
     auto c = std::move(command); command.clear();
     auto drive = c.size() > 1 ? c[1] & 3 : 0, head = c.size() > 1 ? (c[1] >> 2) & 1 : 0;
     auto* image = medium(drive);
     switch (c[0] & 31) {
-    case 3: specify = {c[1],c[2]}; return;
-    case 4:
+    case 3: specify = {c[1],c[2]}; return; // SPECIFY：步进/磁头时间和 ND（非 DMA）位。
+    case 4: // SENSE DRIVE STATUS：返回 ST3 的就绪、零道、双面、写保护。
         finish({uint8_t(drive | (head << 2) | (drive == 0 ? 0x20 : 0) | (cylinder[drive] == 0 ? 0x10 : 0)
             | ((!image || image->heads > 1) ? 8 : 0) | (image && image->readOnly ? 0x40 : 0))}, false); return;
-    case 8: {
+    case 8: { // SENSE INTERRUPT STATUS：消费一个复位/寻道完成的 ST0+PCN。
         irq(false);
         if (pending.empty()) finish({0x80}, false);
         else { auto value = pending.front(); pending.pop_front(); finish({value[0],value[1]}, false); }
         return;
     }
-    case 7: case 15: {
+    case 7: case 15: { // RECALIBRATE / SEEK（含相对寻道）：到期后产生完成 IRQ。
         int target = (c[0] & 31) == 7 ? 0 : c[2];
         if ((c[0] & 31) == 15 && (c[0] & 0x80)) target = cylinder[drive] + (c[0] & 0x40 ? target : -target);
         seekTarget[drive] = uint8_t(std::clamp(target, 0, 255)); seekHead[drive] = uint8_t(head);
         seekTime[drive] = now + 600; deadlines(); return;
     }
-    case 14:
+    case 14: // DUMPREG：当前柱面、SPECIFY、锁定和配置快照。
         finish({cylinder[0],cylinder[1],cylinder[2],cylinder[3],specify[0],specify[1],0,
             uint8_t((locked ? 0x80 : 0) | perpendicular),config[0],config[1]}, false); return;
-    case 16: finish({0x90}, false); return;
-    case 18: perpendicular = c[1] & 63; return;
-    case 19: config = {c[2],c[3]}; return;
-    case 20: locked = c[0] & 0x80; finish({uint8_t(locked ? 0x10 : 0)}, false); return;
+    case 16: finish({0x90}, false); return; // VERSION：增强型 FDC。
+    case 18: perpendicular = c[1] & 63; return; // PERPENDICULAR MODE。
+    case 19: config = {c[2],c[3]}; return; // CONFIGURE：FIFO/隐式寻道等设置。
+    case 20: locked = c[0] & 0x80; finish({uint8_t(locked ? 0x10 : 0)}, false); return; // LOCK/UNLOCK。
     }
     active = std::move(c); activeMedia = image ? image->identity : 0;
     sectors.clear(); buffer.clear(); position = sectorIndex = 0;
@@ -156,6 +178,7 @@ void FloppyController::execute(double now) {
         schedule(Action::Transfer, now); break;
     }
 }
+
 void FloppyController::advance(double now) {
     for (unsigned i = 0; i < 4; ++i) if (now >= seekTime[i]) {
         seekTime[i] = std::numeric_limits<double>::infinity();
@@ -179,7 +202,10 @@ void FloppyController::advance(double now) {
     else if (sectors.empty()) transferReady(now);
     else transferData(now);
 }
+
 void FloppyController::transferReady(double now) {
+    // READ TRACK(02)、WRITE DATA(05)、READ DATA(06)、READ DELETED DATA(0C)。
+    // 参数 C/H/R/N/EOT/GPL/DTL；本后端只接受 N=2（512 字节），MT 可跨两个磁头。
     auto* image = activeDisk(); auto& c = active;
     unsigned drive = c[1] & 3, head = (c[1] >> 2) & 1, first = (c[0] & 31) == 2 ? 1 : c[4];
     auto fail = [&](uint8_t st1, uint8_t st2 = 0) { status(st1, st2, c[2], uint8_t(head), uint8_t(first), c[5]); };
@@ -197,7 +223,9 @@ void FloppyController::transferReady(double now) {
         }
     buffer.clear(); transferData(now);
 }
+
 void FloppyController::transferData(double now) {
+    // ND 模式逐字节 PIO；DMA 模式由通道 2 批量搬运，终端计数可以提前结束多扇区命令。
     auto* image = activeDisk();
     const auto& sector = sectors[sectorIndex];
     if (buffer.empty()) {
@@ -215,6 +243,7 @@ void FloppyController::transferData(double now) {
     if (!transfer.bytes) { schedule(Action::Transfer, now); return; }
     sectorDone(transfer.terminal, now);
 }
+
 void FloppyController::sectorDone(bool terminal, double now) {
     auto* image = activeDisk();
     if (!image) { status(4, 0, active[2], sectors[sectorIndex].head, sectors[sectorIndex].number, 2); return; }
@@ -234,7 +263,9 @@ void FloppyController::sectorDone(bool terminal, double now) {
     }
     status(!terminal && !deleted ? 0x80 : 0, deleted ? 0x40 : 0, rc, rh, rr, 2, sector.head);
 }
+
 void FloppyController::formatReady(double now) {
+    // FORMAT TRACK(0D) 收到的是每扇区四字节 C/H/R/N 表，不是扇区内容。
     auto* image = activeDisk(); unsigned head = (active[1] >> 2) & 1, drive = active[1] & 3;
     if (image->readOnly) { status(2, 0, cylinder[drive], uint8_t(head), 1, active[2]); return; }
     if (!(active[0] & 0x40) || active[2] != 2 || !active[3] || active[3] > image->spt
@@ -250,7 +281,9 @@ void FloppyController::formatReady(double now) {
     if (!transfer.bytes) { schedule(Action::Format, now); return; }
     formatDone();
 }
+
 void FloppyController::formatDone() {
+    // 先验证整张 ID 表再写入，填充值由命令指定；任一非法 ID 都不能留下部分格式化。
     auto* image = activeDisk(); unsigned drive = active[1] & 3, head = (active[1] >> 2) & 1;
     if (!image) { status(4, 0, cylinder[drive], uint8_t(head), 1, 2); return; }
     for (unsigned i = 0; i < buffer.size(); i += 4) {

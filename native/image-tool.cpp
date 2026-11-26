@@ -2,6 +2,7 @@
 #include <iostream>
 #include <stdexcept>
 
+// 命令行只做严格参数解析和结果输出，文件操作/原子发布统一交给 image 模块。
 int wmain(int argc, wchar_t** argv) {
     using namespace asm86::image;
     try {
@@ -33,6 +34,7 @@ int wmain(int argc, wchar_t** argv) {
         std::vector<std::filesystem::path> sources;
         bool literal = false, hasSize = false, hasDest = false;
         for (int i = boot ? 4 : 3; i < argc; ++i) {
+            // -- 后全部按源路径解释，允许文件名以 -- 开头；重复/跨命令选项显式报错。
             std::wstring arg = argv[i];
             if (!literal && arg == L"--") { literal = true; continue; }
             if (!literal && (arg == L"--sector" || arg == L"--partition")) {

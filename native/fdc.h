@@ -8,6 +8,8 @@
 
 namespace asm86 {
 class Disk;
+
+// 主板只挂载 A:，仍模拟四个单元的寻道/复位状态供驱动探测。
 class FloppyController {
 public:
     FloppyController() { reset(); }
@@ -21,6 +23,8 @@ public:
     uint8_t input(uint16_t port, double now);
     void output(uint16_t port, uint8_t value, double now);
 private:
+
+    // PIO 的 Read/Write 属于非 DMA 执行期；Result 阶段必须读完才能接收下一条命令。
     enum class Phase { Command, Execute, Read, Write, Result };
     enum class Action { None, Reset, Id, Transfer, Format };
     Phase phase = Phase::Command;
@@ -30,6 +34,8 @@ private:
     std::array<double, 4> seekTime{};
     std::array<uint8_t, 2> specify{}, config{0x20,0};
     std::deque<std::array<uint8_t, 2>> pending;
+
+    // command 正在接收，active 已执行，result 是 ST0/ST1/ST2/C/H/R/N 等返回字段。
     std::vector<uint8_t> command, active, result, buffer;
     unsigned position = 0, resultPosition = 0, rotation = 0, sectorIndex = 0;
     struct Sector { uint32_t lba; uint8_t head, number; };

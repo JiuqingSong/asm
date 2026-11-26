@@ -3,6 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
+// AT 主板支持：8042 键盘/A20/复位、CMOS 参数以及 RTC 周期中断。
 namespace asm86 {
 void Pc::resetAt() {
     pic[0].reset(8, !at()); pic[1].reset(0x70, false);
@@ -20,10 +21,14 @@ void Pc::resetAt() {
     cmos[0x15] = 0x80; cmos[0x16] = 2; cmos[0x18] = cmos[0x31] = at() ? 0x3c : 0;
     rtcEpoch = std::time(nullptr); nextRtc = std::numeric_limits<double>::infinity();
 }
+
 void Pc::keyboardIrq() {
     if ((!at() || ((kbdCommand & 0x11) == 1)) && (!controller.empty() || !keys.empty())) pic[0].raise(1);
 }
+
 void Pc::keyboardCommand(uint8_t value) {
+    // 写 64h 控制端口：20/60 读写命令字；D0/D1 读写输出端口；AD/AE 禁用/启用键盘。
+    // AA 自检、AB 接口测试、A7/A8 辅助接口开关、DD/DF 快速 A20；Fx 脉冲可触发复位。
     switch (value) {
     case 0x20: controller.push_back(kbdCommand); break;
     case 0x60: case 0xd1: kbdWrite = value; break;
@@ -44,7 +49,10 @@ void Pc::keyboardCommand(uint8_t value) {
     }
     keyboardIrq();
 }
+
 void Pc::keyboardData(uint8_t value) {
+    // 写 60h 可能是上一条控制器命令的参数，也可能是发给键盘的设备命令，不能混淆。
+    // ED LED、F0 扫描集、F3 重复速率、F2 标识、FF 复位；FA ACK、FE RESEND。
     if (kbdWrite == 0xd1) {
         kbdOutput = value; cpu.a20 = value & 2; fastA20 = uint8_t((fastA20 & ~2) | (value & 2));
         if (!(value & 1)) pendingReset = true;
@@ -63,7 +71,9 @@ void Pc::keyboardData(uint8_t value) {
     }
     keyboardIrq();
 }
+
 void Pc::resetCpu() {
+    // CMOS 0Fh 的热复位码支持保护模式返回实模式；暖启动指针在 BDA 40:67。
     pendingReset = false; auto code = cmos[15]; cmos[15] = 0;
     if (code != 5 && code != 9 && code != 10) { rebootRequested = true; return; }
     auto regs = cpu.r; auto selectors = cpu.s;
@@ -78,19 +88,25 @@ void Pc::resetCpu() {
         cpu.ip = cpu.pop(); cpu.loadSegment(CS, cpu.pop()); cpu.setFlags(cpu.pop());
     } else { cpu.ip = off; cpu.loadSegment(CS, seg); }
 }
+
 double Pc::rtcPeriod() const {
+    // RTC 基准 32768 Hz；寄存器 A 选分频，寄存器 B 的 PIE 开启 IRQ8。
     unsigned rate = cmos[10] & 15;
     if (!at() || !(cmos[11] & 0x40) || !rate) return std::numeric_limits<double>::infinity();
     if (rate < 3) rate += 7;
     return 1193182.0 / (32768u >> (rate - 1));
 }
+
 void Pc::rtcSchedule() { nextRtc = clock + rtcPeriod(); }
+
 void Pc::rtcAdvance() {
     cmos[12] |= 0xc0; pic[1].raise(0);
     auto period = rtcPeriod();
     nextRtc += period * (1 + std::floor((clock - nextRtc) / period));
 }
+
 uint8_t Pc::cmosRead() {
+    // 时间随客体 clock 推进；寄存器 B 控制 BCD/二进制与 12/24 小时制，读 C 清中断状态。
     auto current = rtcEpoch + std::time_t(clock / 1193182.0); std::tm t{}; localtime_s(&t, &current);
     auto encode = [&](int v) { return uint8_t(cmos[11] & 4 ? v : ((v / 10) << 4) | (v % 10)); };
     switch (cmosIndex) {
@@ -106,6 +122,7 @@ uint8_t Pc::cmosRead() {
     default: return cmos[cmosIndex];
     }
 }
+
 void Pc::cmosWrite(uint8_t value) {
     cmos[cmosIndex] = value;
     if (cmosIndex == 10 || cmosIndex == 11) rtcSchedule();

@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace asm86 {
+// ISO 固定 2048 字节逻辑扇区，流式读取，避免把整张安装光盘加载到 RAM。
 class IsoImage {
 public:
     explicit IsoImage(const std::filesystem::path& path);
@@ -34,6 +35,8 @@ public:
     uint16_t readWord(double now);
     void writeWord(uint16_t value, double now);
 private:
+
+    // Packet 阶段收 12 字节命令，Input 阶段回传数据；Sense 保留最近错误供 REQUEST SENSE 查询。
     enum class Phase { Idle, Packet, Input };
     enum class Action { Packet, Input, Complete, Reset };
     struct Sense { uint8_t key = 0, asc = 0, ascq = 0; };
@@ -46,6 +49,8 @@ private:
     bool irqPending = false, mediaChanged = false, locked = false, packetCommand = false;
     unsigned packetPosition = 0, position = 0, responsePosition = 0, byteLimit = 0xfffe, payload = 0;
     uint64_t readOffset = 0, readRemaining = 0;
+
+    // buffer 是当前 PIO 块；response 是小型协议响应，ISO 大范围读取不构造整盘 response。
     std::array<uint8_t, 12> packet{};
     std::vector<uint8_t> buffer, response;
     void signal();

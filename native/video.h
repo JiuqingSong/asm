@@ -4,6 +4,7 @@
 #include <vector>
 
 namespace asm86 {
+// 端口状态公开给 BIOS 生成配置表，显存平面/锁存器保留在设备内部。
 class Vga {
 public:
     Vga();
@@ -31,6 +32,8 @@ public:
     std::array<uint8_t, 21> attr{};
     std::array<uint8_t, 768> dac{};
 private:
+
+    // 四平面各 64 KiB；latch 是最近一次显存读取，写入模式会用它保留未覆盖的位。
     std::array<std::array<uint8_t, 65536>, 4> planes{};
     std::array<uint8_t, 4> latch{};
     uint8_t seqIndex = 0, gcIndex = 0, crtcIndex = 0, attrAddress = 0x20, misc = 0x67;

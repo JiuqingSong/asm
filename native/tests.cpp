@@ -13,10 +13,15 @@
 #include <stdexcept>
 #include <string>
 
+// 测试中的字节程序由 Cpu 真正执行，不用宿主代码替代被测指令。
+// 实模式/VM86 默认 16 位；保护模式由 CS.D 决定，66h/67h 分别改变操作数/地址宽度。
+// GDT、TSS、页表、磁盘包和像素模式是数据，不可按指令反汇编；非法指令样本用于验证 #UD。
 using namespace asm86;
 namespace {
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
+
 void referenceGraphics(const Vga& vga, std::vector<uint32_t>& pixels) {
+    // 独立逐像素参考路径，与生产批量路径比较整个画面，避免两个实现共享同一错误。
     auto width = vga.width(), height = vga.height();
     pixels.resize(width * height);
     for (unsigned y = 0; y < height; ++y) for (unsigned x = 0; x < width; ++x) {
@@ -24,6 +29,7 @@ void referenceGraphics(const Vga& vga, std::vector<uint32_t>& pixels) {
         pixels[y * width + x] = vga.blanked() ? 0 : vga.color(vga.indexed256() ? color : vga.paletteIndex(color));
     }
 }
+
 void seedGraphics(Vga& vga, uint8_t mode) {
     vga.setMode(mode);
     auto memoryMode = vga.seq[4];
@@ -35,7 +41,9 @@ void seedGraphics(Vga& vga, uint8_t mode) {
     }
     vga.seq[4] = memoryMode; vga.seq[2] = 15;
 }
+
 void graphicsFrameTests() {
+    // 每种模式改变 CRTC 回绕/步幅、实时调色板及各级消隐，复用缓冲区也不能留下旧像素。
     Vga vga;
     std::vector<uint32_t> expected, actual;
     auto verify = [&]() {
@@ -67,6 +75,7 @@ void graphicsFrameTests() {
     check(rejected, "Graphics rendering must explicitly reject text mode");
     std::cout << "Bulk VGA frames / all pixels / CRTC wrap-stride / live palette / plane-PEL masks / blanking checks passed\n";
 }
+
 void videoBenchmarks() {
     constexpr unsigned frames = 30;
     for (uint8_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
@@ -91,7 +100,9 @@ void videoBenchmarks() {
             << " max-ms/frame=" << seconds.back() * 1000 / frames << " checksum=" << expected << '\n';
     }
 }
+
 void physicalReadTests() {
+    // 用逐字节结果验证快速字/双字读取，特别覆盖 A20、边界回绕、ROM 别名与 MMIO 副作用。
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         Cpu c; c.setModel(model);
         for (size_t i = 0; i < c.mem.size(); ++i) c.mem[i] = uint8_t(i ^ (i >> 12) ^ (i >> 20));
@@ -118,7 +129,9 @@ void physicalReadTests() {
             "Word reads wholly inside MMIO must retain device side effects");
     }
 }
+
 void operandPagingTests() {
+    // 直接改页表后立即访问；跨页写入必须先验证全部字节，缺页时一个字节也不能提交。
     constexpr uint32_t directory = 0x10000, entry = 0x11020;
     auto machine = [&]() {
         Cpu c; c.setModel(CpuModel::I486); c.a20 = true;
@@ -214,7 +227,7 @@ void operandPagingTests() {
     }
     {
         auto c = machine(); c.loadSegment(CS, 0); c.ip = 0x8000;
-        const uint8_t code[] = {0x66,0xb8,0x11,0x22,0x33,0x44};
+        const uint8_t code[] = {0x66,0xb8,0x11,0x22,0x33,0x44}; // 66 B8：MOV EAX,44332211h，检查跨页取指。
         std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x30000);
         c.step();
         check(c.r32(AX) == 0x44332211 && c.ip == 0x8006 && c.readDword(entry) == 0x30027,
@@ -266,7 +279,9 @@ void operandPagingTests() {
     }
     std::cout << "Operand-instruction page walks / accessed-dirty / live mappings / cross-page atomicity / MMIO / observers / fetch limits checks passed\n";
 }
+
 void benchmarks() {
+    // 预热后比较五次样本的状态校验值，吞吐量必须来自实际执行完整循环，而不是提前停机。
     constexpr unsigned steps = 1000000;
     for (unsigned workload = 0; workload < 4; ++workload) {
         std::array<double, 5> seconds{};
@@ -275,11 +290,12 @@ void benchmarks() {
             Cpu c; c.setModel(CpuModel::I486); c.a20 = true;
             c.loadSegment(CS, 0); c.ip = 0x2000;
             if (workload == 3) {
+                // 三个 8 字节描述符：空项、平坦 32 位代码（9Ah）、平坦数据（92h）；CFh 为 G/D/B+界限。
                 const uint8_t gdt[] = {0,0,0,0,0,0,0,0, 0xff,0xff,0,0,0,0x9a,0xcf,0,
                     0xff,0xff,0,0,0,0x92,0xcf,0};
                 std::copy(std::begin(gdt), std::end(gdt), c.mem.begin() + 0x1000);
                 c.gdtr = {0x1000, 23}; c.msw |= 1;
-                const uint8_t entry[] = {0x66,0xea,0x10,0x20,0,0,8,0};
+                const uint8_t entry[] = {0x66,0xea,0x10,0x20,0,0,8,0}; // JMP FAR 0008:00002010，装入 CS.D=1。
                 std::copy(std::begin(entry), std::end(entry), c.mem.begin() + 0x2000);
                 c.step(); c.loadSegment(DS, 16);
             } else if (workload) {
@@ -291,6 +307,10 @@ void benchmarks() {
                 for (unsigned i = 0; i < 1024; ++i) c.writeDword(0x11000 + i * 4, (i << 12) | 7);
                 c.msw |= 0x80000000u;
             }
+
+            // 寄存器循环：INC AX / INC BX / XOR AX,BX / JMP 起点。
+            // 内存循环：MOV EAX,[8000h] / INC EAX / MOV [8000h],EAX / MOV EBX,[8000h] / JMP 起点。
+            // VM86 用 66h 操作数前缀+16 位地址，保护模式用默认 32 位操作数/地址。
             const std::vector<uint8_t> code = workload < 2 ? std::vector<uint8_t>{0x40,0x43,0x31,0xd8,0xeb,0xfa}
                 : workload == 2 ? std::vector<uint8_t>{0x66,0xa1,0,0x80,0x66,0x40,0x66,0xa3,0,0x80,
                     0x66,0x8b,0x1e,0,0x80,0xeb,0xef}
@@ -323,7 +343,9 @@ void benchmarks() {
             << " checksum=" << expected << '\n';
     }
 }
+
 void overlayTests(const std::filesystem::path& prefix) {
+    // 验证底盘不变、重复写覆盖、进程重新打开以及 SHA256/CRC/截断错误，不能靠“成功写入”代替读回。
     auto base = std::filesystem::path(prefix.wstring() + L".base.img");
     auto other = std::filesystem::path(prefix.wstring() + L".other.img");
     auto overlay = std::filesystem::path(prefix.wstring() + L".cow");
@@ -377,7 +399,9 @@ void overlayTests(const std::filesystem::path& prefix) {
     cleanup();
     std::cout << "Disk overlays / base immutability / reopen / SHA256 / CRC / truncation / discard checks passed\n";
 }
+
 void preferenceTests() {
+    // 独立测试注册表键验证恢复与非法值，不能改交互程序的用户设置。
     auto key = L"Software\\Asm86NativeTest-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64());
     auto cleanup = [&]() {
         auto status = RegDeleteTreeW(HKEY_CURRENT_USER, key.c_str());
@@ -454,7 +478,9 @@ void preferenceTests() {
     }
     cleanup();
 }
+
 void timingTests() {
+    // 同时观察 CPU 步数和 PIT/RTC/UART 客体时间；暂停/切档/HLT 唤醒不应累计补跑或时间漂移。
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) for (bool full : {false, true}) {
         Pc p; p.setModel(model);
         auto& c = p.cpu;
@@ -556,13 +582,16 @@ void timingTests() {
     check(idle.cpu.halted && idle.instructions == 1 && idle.clock == 0, "A halted CPU must yield without accelerating time or banking instructions");
     std::cout << "Real-time CPU rates / PIT / RTC / UART / speed-toggle / stable CPU timing / idle-wakeup checks passed\n";
 }
+
 void cpu386Tests(CpuModel model) {
+    // 同一套环境覆盖 386/486；新增 486 操作在 386 上必须仍然 #UD，不能“向前兼容”误执行。
     auto real = [&]() {
         Cpu c; c.setModel(model); c.a20 = true;
         for (auto seg : {ES, CS, SS, DS, FS, GS}) c.loadSegment(seg, 0);
         c.r[SP] = 0x8000; c.ip = 0x500; c.setFlags(2); return c;
     };
     auto run = [](Cpu& c, const std::vector<uint8_t>& code, uint32_t at = 0x500) {
+        // 限步保护：正常程序以 F4h（HLT）结束；故障样本由异常向量中的 HLT 结束。
         std::copy(code.begin(), code.end(), c.mem.begin() + at); c.ip = at; c.halted = false;
         for (unsigned i = 0; i < 1000 && !c.halted; ++i) c.step();
         check(c.halted, "386 test program did not halt");
@@ -587,7 +616,7 @@ void cpu386Tests(CpuModel model) {
     }
     {
         auto c = real(); c.writeDword(0x4000, 0x12345678); c.writeWord(0x4004, 0x2000);
-        const uint8_t code[] = {0x66,0x0f,0xb2,0x26,0,0x40,0x90};
+        const uint8_t code[] = {0x66,0x0f,0xb2,0x26,0,0x40,0x90}; // LSS ESP,[4000h] / NOP：检查 SS 中断影子。
         std::copy(std::begin(code), std::end(code), c.mem.begin() + c.ip);
         c.setFlags(IF | 2); c.step();
         check(c.r32(SP) == 0x12345678 && c.s[SS] == 0x2000, "Dword LSS must load the full ESP and stack segment");
@@ -601,6 +630,8 @@ void cpu386Tests(CpuModel model) {
             "LSS with a register source must fault without changing its destination or stack segment");
     }
     if (model == CpuModel::I486) {
+        // 0F C8=BSWAP；0F C0/C1=XADD；0F B0/B1=CMPXCHG；0F A2=CPUID。
+        // 0F 01 /7=INVLPG、0F 08/09=INVD/WBINVD；缓存/页失效指令不能读取目标 MMIO。
         auto c = real(); c.r32(AX, 0x12345678);
         run(c, {0x0f,0xc8,0xf4});
         check(c.r32(AX) == 0x78563412, "486 BSWAP must exchange all four bytes regardless of the default operand size");
@@ -655,6 +686,7 @@ void cpu386Tests(CpuModel model) {
                 "486 instructions must reject LOCK on register destinations and non-lockable operations");
         }
     } else {
+        // 以下编码在 486 有意义，但 386 必须在原 IP 交出 #UD；不是未知指令后继续运行。
         for (const auto& code : {std::vector<uint8_t>{0x0f,0xc8}, {0x0f,0xc1,0xc0}, {0x0f,0xb1,0xc0},
             {0x0f,0xa2}, {0x0f,8}, {0x0f,9}, {0x0f,1,0x3e,0,0x20}}) {
             auto c = real(); c.ww(0, 24, 0x700); c.ww(0, 26, 0); c.mem[0x700] = 0xf4;
@@ -689,7 +721,7 @@ void cpu386Tests(CpuModel model) {
         c.r32(AX, 0); run(c, {0x0f,0x23,0xf0, 0x0f,0x21,0xf1, 0xf4});
         check(c.r32(CX) == 0xffff0ff0, "Clearing DR6 must preserve its reserved bits");
         c.ww(0, 4, 0x700); c.ww(0, 6, 0);
-        const uint8_t handler[] = {0x0f,0x21,0xf1,0xcf};
+        const uint8_t handler[] = {0x0f,0x21,0xf1,0xcf}; // MOV ECX,DR6 / IRET：记录调试状态后重试原指令。
         std::copy(std::begin(handler), std::end(handler), c.mem.begin() + 0x700);
         c.r32(AX, 0x2400); run(c, {0x0f,0x23,0xf8, 0xf4});
         c.r32(AX, 0x87654321); run(c, {0x0f,0x23,0xc0, 0x0f,0x21,0xc3, 0xf4});
@@ -730,14 +762,19 @@ void cpu386Tests(CpuModel model) {
             "16-bit POP [ESP] must address the destination after incrementing SP");
     }
     auto protectedMachine = [&](const std::vector<uint8_t>& code) {
+        // GDT 数据给出 32/16 位平坦段，先用真实 LGDT/MOV CR0/JMP 进入保护模式。
         auto c = real();
         const uint8_t gdt[] = {0,0,0,0,0,0,0,0, 0xff,0xff,0,0,0,0x9a,0xcf,0,
             0xff,0xff,0,0,0,0x92,0xcf,0, 0xff,0xff,0,0,0,0x9a,0,0, 0xff,0xff,0,0,0,0x92,0,0};
         std::copy(std::begin(gdt), std::end(gdt), c.mem.begin() + 0x1000);
         c.writeWord(0x1100, 0x27); c.writeDword(0x1102, 0x1000);
+
+        // LGDT [1100h] / MOV EAX,CR0 / OR EAX,1 / MOV CR0,EAX / JMP FAR 0008:00002017。
         const std::vector<uint8_t> entry = {0x0f,0x01,0x16,0,0x11, 0x0f,0x20,0xc0, 0x66,0x83,0xc8,1,
             0x0f,0x22,0xc0, 0x66,0xea,0x17,0x20,0,0,8,0};
         std::copy(entry.begin(), entry.end(), c.mem.begin() + 0x2000);
+
+        // MOV AX,10h / MOV DS,AX / MOV ES,AX / MOV SS,AX / MOV ESP,00200000h；CS.D=1 后 66h 改回字操作。
         const std::vector<uint8_t> setup = {0x66,0xb8,0x10,0, 0x8e,0xd8,0x8e,0xc0,0x8e,0xd0, 0xbc,0,0,0x20,0};
         std::copy(setup.begin(), setup.end(), c.mem.begin() + 0x2017);
         std::copy(code.begin(), code.end(), c.mem.begin() + 0x2017 + setup.size());
@@ -950,7 +987,7 @@ void cpu386Tests(CpuModel model) {
     {
         auto c = systemMachine(); gate(c, 0x1048, 0x12000, 8, 0xec, 2);
         user(c); c.writeSegment(SS, 0x180000, 0x11223344, 4); c.writeSegment(SS, 0x180004, 0xaabbccdd, 4);
-        const uint8_t call[] = {0x66,0x9a,0,0,0x4b,0};
+        const uint8_t call[] = {0x66,0x9a,0,0,0x4b,0}; // 16 位 CALL FAR 004Bh:0000；门属性决定真正的 32 位栈帧。
         std::copy(std::begin(call), std::end(call), c.mem.begin() + 0x4000);
         c.mem[0x12000] = 0xca; c.mem[0x12001] = 8; c.mem[0x12002] = 0;
         c.step(); auto sp = c.r32(SP);
@@ -1020,7 +1057,7 @@ void cpu386Tests(CpuModel model) {
         c.writeDword(0xa020, 0x5000); c.writeDword(0xa024, 0x202); c.writeDword(0xa028, 0x89abcdef);
         c.writeDword(0xa038, 0x1e0000);
         for (unsigned i = 0; i < 6; ++i) c.writeWord(0xa048 + i * 4, i == CS ? 8 : 0x10);
-        const uint8_t call[] = {0x9a,0,0,0,0,0x40,0};
+        const uint8_t call[] = {0x9a,0,0,0,0,0x40,0}; // 32 位 CALL FAR 0040h:00000000；选择符指向 TSS，触发嵌套任务切换。
         std::copy(std::begin(call), std::end(call), c.mem.begin() + 0x3000);
         c.mem[0x5000] = 0xcf; c.r32(AX, 0x1234abcd); c.loadSegment(FS, 0x10); c.loadSegment(GS, 0x10);
     };
@@ -1028,7 +1065,7 @@ void cpu386Tests(CpuModel model) {
         auto c = systemMachine(); nextTask(c); paging(c);
         c.writeDword(0x12000, 0x21007); std::copy_n(c.mem.begin() + 0x20000, 4096, c.mem.begin() + 0x21000);
         c.writeDword(0x21014, 0x6003); c.writeDword(0x901c, 0x10000); c.writeDword(0xa01c, 0x12000);
-        const uint8_t code[] = {0xb8,0x44,0x33,0x22,0x11,0xcf};
+        const uint8_t code[] = {0xb8,0x44,0x33,0x22,0x11,0xcf}; // MOV EAX,11223344h / IRETD：新任务页表应映射到此程序。
         std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x6000); c.mem[0x5000] = 0xf4;
         c.step();
         check(c.tr.selector == 0x40 && c.cr3 == 0x12000 && c.r32(AX) == 0x89abcdef && (c.flags & 0x4000)
@@ -1065,6 +1102,7 @@ void cpu386Tests(CpuModel model) {
             "Ring-0 IRETD must load all nine VM86 frame slots without interpreting real-mode segments as descriptors");
     };
     auto vmCode = [](Cpu& c, const std::vector<uint8_t>& code) {
+        // VM86 仍按 segment<<4+IP 放代码；执行时再走用户态分页和 64 KiB 段界限检查。
         std::copy(code.begin(), code.end(), c.mem.begin() + (uint32_t(c.s[CS]) << 4) + c.ip);
     };
     auto bitmap = [&](Cpu& c, uint32_t limit = 0x2068) {
@@ -1168,24 +1206,63 @@ void cpu386Tests(CpuModel model) {
     }
     {
         auto c = systemMachine(); gate(c, 0x8068, 0x12000, 8, 0x8e);
-        std::vector<uint8_t> monitor = {0x83,0xc4,4,0x60,0x66,0xb8,0x10,0,0x8e,0xd8,0x8d,0x6c,0x24,0x20,
-            0x0f,0xb7,0x5d,4,0xc1,0xe3,4,0x03,0x5d,0,0x80,0x3b,0xcf};
-        auto toIret = monitor.size(); monitor.insert(monitor.end(), {0x74,0});
-        monitor.insert(monitor.end(), {0x83,0x45,0,2,0x0f,0xb7,0x5d,0x10,0xc1,0xe3,4,0x0f,0xb7,0x55,0x0c,
-            0x66,0x83,0xea,6,0x66,0x89,0x55,0x0c,0x03,0xda,0x66,0x8b,0x45,8,0x66,0x89,0x43,4,
-            0x66,0x8b,0x45,4,0x66,0x89,0x43,2,0x66,0x8b,0x45,0,0x66,0x89,3,
-            0x0f,0xb7,5,0x84,0,0,0,0x89,0x45,0,0x0f,0xb7,5,0x86,0,0,0,0x89,0x45,4});
-        auto toDone = monitor.size(); monitor.insert(monitor.end(), {0xeb,0});
+
+        // 32 位 #GP monitor 反射 VM86 INT/IRET；EBP 指向硬件保存的九槽 VM86 返回帧。
+        // 返回槽 +0/+4/+8/+0C/+10 分别为 EIP/CS/EFLAGS/ESP/SS。
+        std::vector<uint8_t> monitor = {
+            0x83,0xc4,4,          // ADD ESP,4：丢弃 #GP 错误码。
+            0x60,                // PUSHAD：保留八个通用寄存器。
+            0x66,0xb8,0x10,0,    // MOV AX,10h：平坦内核数据段。
+            0x8e,0xd8,           // MOV DS,AX。
+            0x8d,0x6c,0x24,0x20, // LEA EBP,[ESP+20h]：越过 PUSHAD 区，指向返回帧。
+            0x0f,0xb7,0x5d,4,    // MOVZX EBX,WORD [EBP+4]：VM86 CS。
+            0xc1,0xe3,4,         // SHL EBX,4：段值转线性基址。
+            0x03,0x5d,0,         // ADD EBX,[EBP]：加故障 IP 得指令地址。
+            0x80,0x3b,0xcf       // CMP BYTE [EBX],CFh：区分 IRET 与 INT。
+        };
+        auto toIret = monitor.size(); monitor.insert(monitor.end(), {0x74,0}); // JE iret，位移稍后回填。
+        monitor.insert(monitor.end(), {
+            0x83,0x45,0,2,       // ADD DWORD [EBP],2：越过 CD 21（INT 21h）。
+            0x0f,0xb7,0x5d,0x10, // MOVZX EBX,WORD [EBP+10h]：原 SS。
+            0xc1,0xe3,4,         // SHL EBX,4。
+            0x0f,0xb7,0x55,0x0c, // MOVZX EDX,WORD [EBP+0Ch]：原 SP。
+            0x66,0x83,0xea,6,    // SUB DX,6：为 16 位 FLAGS/CS/IP 留栈空间。
+            0x66,0x89,0x55,0x0c, // MOV WORD [EBP+0Ch],DX：只改 ESP 低字。
+            0x03,0xda,           // ADD EBX,EDX：VM86 SS:SP 线性地址。
+            0x66,0x8b,0x45,8,    // MOV AX,WORD [EBP+8]：取 FLAGS。
+            0x66,0x89,0x43,4,    // MOV WORD [EBX+4],AX：写客体 FLAGS。
+            0x66,0x8b,0x45,4,    // MOV AX,WORD [EBP+4]：取 CS。
+            0x66,0x89,0x43,2,    // MOV WORD [EBX+2],AX：写客体 CS。
+            0x66,0x8b,0x45,0,    // MOV AX,WORD [EBP]：取 INT 后的 IP。
+            0x66,0x89,3,         // MOV WORD [EBX],AX：写客体 IP。
+            0x0f,0xb7,5,0x84,0,0,0, // MOVZX EAX,WORD [0084h]：INT 21h 的 IVT offset。
+            0x89,0x45,0,         // MOV [EBP],EAX：返回到客体中断处理程序。
+            0x0f,0xb7,5,0x86,0,0,0, // MOVZX EAX,WORD [0086h]：IVT segment。
+            0x89,0x45,4          // MOV [EBP+4],EAX：替换返回 CS。
+        });
+        auto toDone = monitor.size(); monitor.insert(monitor.end(), {0xeb,0}); // JMP done，位移稍后回填。
         auto iret = monitor.size();
-        monitor.insert(monitor.end(), {0x0f,0xb7,0x5d,0x10,0xc1,0xe3,4,0x0f,0xb7,0x55,0x0c,0x03,0xda,
-            0x0f,0xb7,3,0x89,0x45,0,0x0f,0xb7,0x43,2,0x89,0x45,4,0x66,0x8b,0x43,4,
-            0x66,0x25,0xff,0xcf,0x66,0x89,0x45,8,0x66,0x83,0xc2,6,0x66,0x89,0x55,0x0c});
-        auto done = monitor.size(); monitor.insert(monitor.end(), {0x61,0xcf});
+        monitor.insert(monitor.end(), {
+            0x0f,0xb7,0x5d,0x10, // MOVZX EBX,WORD [EBP+10h]：原 SS。
+            0xc1,0xe3,4,         // SHL EBX,4。
+            0x0f,0xb7,0x55,0x0c, // MOVZX EDX,WORD [EBP+0Ch]：原 SP。
+            0x03,0xda,           // ADD EBX,EDX：指向客体 16 位 IRET 帧。
+            0x0f,0xb7,3,         // MOVZX EAX,WORD [EBX]：取 IP。
+            0x89,0x45,0,         // MOV [EBP],EAX：写 monitor 返回 IP。
+            0x0f,0xb7,0x43,2,    // MOVZX EAX,WORD [EBX+2]：取 CS。
+            0x89,0x45,4,         // MOV [EBP+4],EAX：写返回 CS。
+            0x66,0x8b,0x43,4,    // MOV AX,WORD [EBX+4]：取 FLAGS。
+            0x66,0x25,0xff,0xcf, // AND AX,CFFFh：清 IOPL，不授予直接 I/O 权限。
+            0x66,0x89,0x45,8,    // MOV WORD [EBP+8],AX：保留高字中的 VM。
+            0x66,0x83,0xc2,6,    // ADD DX,6：弹出客体的三字返回帧。
+            0x66,0x89,0x55,0x0c  // MOV WORD [EBP+0Ch],DX：更新 SP。
+        });
+        auto done = monitor.size(); monitor.insert(monitor.end(), {0x61,0xcf}); // POPAD / IRETD：恢复寄存器并回 VM86。
         check(iret - toIret - 2 < 128 && done - toDone - 2 < 128, "VM86 test monitor short branches must fit");
         monitor[toIret + 1] = uint8_t(iret - toIret - 2); monitor[toDone + 1] = uint8_t(done - toDone - 2);
         std::copy(monitor.begin(), monitor.end(), c.mem.begin() + 0x12000);
         c.writeWord(0x84, 0x5000); c.writeWord(0x86, 0x100); c.writeWord(0x3600, 0);
-        const uint8_t handler[] = {0xff,6,0,6,0xcf};
+        const uint8_t handler[] = {0xff,6,0,6,0xcf}; // INC WORD [0600h] / IRET：统计被 monitor 反射的真实 INT 21h。
         std::copy(std::begin(handler), std::end(handler), c.mem.begin() + 0x6000);
         vm(c); vmCode(c, {0xcd,0x21}); c.r32(AX, 0xcafebabe);
         unsigned entries = 0;
@@ -1251,7 +1328,7 @@ void cpu386Tests(CpuModel model) {
         check(c.tr.selector == 0x40 && c.cpl == 3 && (c.eflags() & 0x20000) && c.ip == 0x4001 && c.r32(AX) == 0x89abcdf0,
             "Nested-task IRETD must restore a VM86 task through its TSS");
         c.step();
-        const uint8_t monitor[] = {0x68,2,0x40,0,0,0x9d,0xcf};
+        const uint8_t monitor[] = {0x68,2,0x40,0,0,0x9d,0xcf}; // PUSH 4002h / POPFD / IRETD：置 NT 后按 backlink 返回旧任务。
         std::copy(std::begin(monitor), std::end(monitor), c.mem.begin() + 0x12000);
         c.step(); c.step(); c.step();
         check(c.tr.selector == 0x38 && c.cpl == 0 && !(c.eflags() & 0x20000) && c.ip == 0x3007 && c.r32(AX) == 0x1234abcd,
@@ -1269,7 +1346,7 @@ void cpu386Tests(CpuModel model) {
             && c.readDword(0x1f0000) == 0xfeedface,
             "A page fault during VM86 monitor-frame construction must restore VM state before a task-gate handler saves it");
         c.writeDword(0x207bc, 0x1ef007); c.writeDword(0x9004, 0x1f0000);
-        const uint8_t handler[] = {0x83,0xc4,4,0xcf};
+        const uint8_t handler[] = {0x83,0xc4,4,0xcf}; // ADD ESP,4 / IRETD：先丢弃 #PF 错误码，再返回原任务。
         std::copy(std::begin(handler), std::end(handler), c.mem.begin() + 0x5000); c.step(); c.step();
         check(c.tr.selector == 0x38 && c.cpl == 3 && (c.eflags() & 0x20000) && c.ip == 0x4000
             && c.r32(SP) == 0xabcd8000 && c.s[DS] == 0x300 && c.s[GS] == 0x500,
@@ -1342,22 +1419,28 @@ void cpu386Tests(CpuModel model) {
     std::cout << "386 gates / TSS stacks / call parameters / IRETD / paged task switches / fault rollback checks passed\n";
     std::cout << "386 VM86 entry-exit / sensitive instructions / interrupts / task gates / I/O bitmap / string I/O checks passed\n";
 }
+
 uint32_t read32(std::istream& f) {
     unsigned char b[4]{}; f.read(reinterpret_cast<char*>(b), 4);
     if (!f) throw std::runtime_error("Truncated test corpus");
     return uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16) | (uint32_t(b[3]) << 24);
 }
+
 using Registers = std::array<uint16_t, 14>;
+
 Registers registers(std::istream& f) {
     Registers r{}; for (auto& v : r) v = uint16_t(read32(f)); return r;
 }
+
 std::map<uint32_t, uint8_t> ram(std::istream& f) {
     std::map<uint32_t, uint8_t> result;
     auto n = read32(f); if (n > 1 << 20) throw std::runtime_error("Invalid corpus memory size");
     while (n--) { auto a = read32(f), v = read32(f); if (a >= 1 << 20 || v > 255) throw std::runtime_error("Invalid corpus memory"); result[a] = uint8_t(v); }
     return result;
 }
+
 int corpus(const char* path) {
+    // 外部单步语料保存初末寄存器/稀疏 RAM；mask 排除未定义 FLAGS，额外检查非预期写入。
     std::ifstream f(path, std::ios::binary); if (!f) throw std::runtime_error("Cannot open corpus");
     auto count = read32(f); Cpu c; std::set<uint32_t> written; c.onWrite = [&](uint32_t a) { written.insert(a); };
     unsigned failed = 0;
@@ -1393,7 +1476,9 @@ int corpus(const char* path) {
     }
     std::cout << count - failed << '/' << count << " CPU cases passed\n"; return failed ? 1 : 0;
 }
+
 void protectedTests() {
+    // 286 固定 16 位环境：PUSH SP 代际差异、LOADALL 隐藏段缓存、门/TSS/IRET 与故障重启。
     Cpu c; c.setModel(CpuModel::I286);
     auto real = [&] {
         c.reset(); for (auto seg : {ES, CS, SS, DS}) c.loadSegment(seg, 0);
@@ -1405,17 +1490,17 @@ void protectedTests() {
     real(); c.setFlags(0xffff);
     check((c.flags & 0xf000) == 0, "286 real-mode FLAGS must differ from 8088 CPU-detection bits");
     c.setFlags(2);
-    emit({0x54}); c.step();
+    emit({0x54}); c.step(); // PUSH SP：286 压原始 SP，8088 则压已递减的 SP。
     check(c.r[SP] == 0xffe && c.rw(0, 0xffe) == 0x1000, "286 PUSH SP must push its original value");
-    c.r[AX] = 3; emit({0xc1, 0xe0, 0x21}); c.step();
+    c.r[AX] = 3; emit({0xc1, 0xe0, 0x21}); c.step(); // SHL AX,21h：286 把移位次数掩成 1。
     check(c.r[AX] == 6, "286 immediate shifts must mask the shift count");
-    emit({0xd1, 0xf0}); c.step();
+    emit({0xd1, 0xf0}); c.step(); // D1 /6：286 是 SHL AX,1 别名，8088 的语义不同。
     check(c.r[AX] == 12, "286 shift group /6 must alias SHL rather than 8088 SETMO");
-    real(); c.r[AX] = 0x1234; c.r[BP] = 0x5678; emit({0x60, 0x61});
+    real(); c.r[AX] = 0x1234; c.r[BP] = 0x5678; emit({0x60, 0x61}); // PUSHA / POPA。
     c.step(); c.r[AX] = c.r[BP] = 0; c.step();
     check(c.r[AX] == 0x1234 && c.r[BP] == 0x5678 && c.r[SP] == 0x1000, "PUSHA / POPA must preserve registers and original SP");
     c.writeWord(0, 0x700); c.writeWord(2, 0); c.r[BX] = 0;
-    emit({0xf7, 0xf3}); c.step();
+    emit({0xf7, 0xf3}); c.step(); // DIV BX：零除检查故障 IP 与栈帧。
     check(c.ip == 0x700 && c.rw(0, c.r[SP]) == 0x500, "286 divide faults must restart at the faulting instruction");
 
     real(); c.mem[0x10] = 0x11; c.mem[0x100010] = 0x22;
@@ -1427,7 +1512,7 @@ void protectedTests() {
         c.mem[a + 3] = i == CS ? 0x92 : 0x93; c.writeWord(a + 4, 0xffff);
     }
     c.writeWord(0x806, 0); c.writeWord(0x818, 2); c.writeWord(0x81a, 0x600);
-    c.mem[0x120010] = 0x5a; emit({0x0f, 5}); c.step();
+    c.mem[0x120010] = 0x5a; emit({0x0f, 5}); c.step(); // 0F 05=286 LOADALL（不等同于现代 SYSCALL）。
     check(c.ip == 0x600 && c.rbS(DS, 0x10) == 0x5a, "LOADALL must restore hidden real-mode segment bases");
     c.loadSegment(DS, 0);
     check(c.rbS(DS, 0x10) == 0x11, "A real-mode segment reload must discard the LOADALL cache");
@@ -1448,7 +1533,7 @@ void protectedTests() {
     descriptor(0x18, 0x4000, 0xffff, 0x92); descriptor(0x20, 0x6000, 0xffff, 0xfa);
     descriptor(0x28, 0x7000, 0xffff, 0xf2); descriptor(0x30, 0x8000, 0xffff, 0xf2);
     descriptor(0x38, 0xa000, 43, 0x81); descriptor(0x40, 0xb000, 43, 0x81);
-    c.r[AX] = 1; emit({0x0f, 1, 0xf0, 0xea, 0, 0, 8, 0}); c.step(); c.step();
+    c.r[AX] = 1; emit({0x0f, 1, 0xf0, 0xea, 0, 0, 8, 0}); c.step(); c.step(); // LMSW AX / JMP FAR 0008:0000。
     check(c.protectedMode() && c.s[CS] == 8 && c.ip == 0, "LMSW and far jump must enter protected mode through a real descriptor");
     c.idtr.limit = 0;
     try { c.interrupt(13, 0); check(false, "An IDT-limit violation must fault"); }
@@ -1494,7 +1579,9 @@ void protectedTests() {
     check(c.tr.selector == 0x38 && c.ip == 0x405 && !(c.flags & 0x4000) && c.mem[0x1045] == 0x81,
         "Nested-task IRET must restore the previous task and clear the departed task's busy bit");
 }
+
 void atTests(CpuModel model) {
+    // BIOS/CMOS/A20 与 8042/PIC 平台测试，与 CPU 单条指令语义分开验证。
     Pc p; p.setModel(model); auto& c = p.cpu;
     c.loadSegment(CS, 0); c.ip = 0x500; c.mem[0x500] = 0xf4;
     c.r[SP] = 0x1000;
@@ -1548,7 +1635,9 @@ void atTests(CpuModel model) {
         && c.r[BX] == 0x44 && (c.flags & IF) && !p.rebootRequested && c.mem[0x800] == 0x5a,
         "A deliberate triple fault must perform CMOS 09h's stack-based real-mode return instead of rebooting DOS");
 }
+
 void keyboardProbeTests() {
+    // 键盘 TSR 探测不得消耗队列/修改哨兵；另检查 make/break 修饰键与 BIOS 队列的行为。
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         Pc p; p.setModel(model); auto& c = p.cpu;
         auto irq1 = [&]() { c.reg8(0, c.in(0x60)); return c.trap(9); };
@@ -1601,7 +1690,9 @@ void keyboardProbeTests() {
         }
     }
 }
+
 void x87Tests() {
+    // 以 x87 指令验证 80 位精度、舍入、保存恢复和异常原子性，不能只验证 CPUID 宣告有 FPU。
     Cpu c; c.setModel(CpuModel::I486);
     auto run = [&](std::initializer_list<uint8_t> code) {
         c.halted = c.waiting = false; c.ip = 0x500;
@@ -1684,12 +1775,15 @@ void x87Tests() {
         d.writeDword(0x1008, 0x0000ffff); d.writeDword(0x100c, 0x00cf9a00);
         d.writeDword(0x1010, 0x0000ffff); d.writeDword(0x1014, 0x00cf9200);
         d.loadSegment(CS, 0); d.setFlags(2); d.ip = 0x400;
-        const uint8_t enter[] = {0xea,0,5,8,0};
+        const uint8_t enter[] = {0xea,0,5,8,0}; // JMP FAR 0008:0500：当前旧 CS 为 16 位，新段为 32 位。
         std::copy(std::begin(enter), std::end(enter), d.mem.begin() + 0x400);
         d.msw = 0x11; d.onFault = [](CpuFault fault, uint32_t) { throw fault; }; d.step();
         d.loadSegment(DS, 0x10); d.loadSegment(SS, 0x10);
         d.r32(BX, 0x2000); d.r32(SI, 3);
         d.writeDword(0x201c, 0x3fc00000); d.writeDword(0x2020, 0x40200000);
+
+        // FNINIT / FLD DWORD [EBX+ESI*4+10h] / FADD DWORD [EBX+ESI*4+14h] /
+        // FSTP QWORD [EBX+ESI*4+18h] / HLT：B3h 是 scale=4,index=ESI,base=EBX 的 SIB。
         const uint8_t code[] = {0xdb,0xe3,0xd9,0x44,0xb3,0x10,0xd8,0x44,0xb3,0x14,0xdd,0x5c,0xb3,0x18,0xf4};
         std::copy(std::begin(code), std::end(code), d.mem.begin() + 0x500);
         for (unsigned i = 0; i < 16 && !d.halted; ++i) d.step();
@@ -1698,12 +1792,16 @@ void x87Tests() {
     }
     std::cout << "x87 discovery / extended precision / integer rounding / save-restore / #NM-#MF / paged VM86 atomicity / protected SIB checks passed\n";
 }
+
 void x87IrqTests(const std::filesystem::path& disk) {
+    // CR0.NE=0 走 AT 外部错误锁存/IRQ13，NE=1 走 #MF；清锁存不等同于清 x87 状态。
     Pc p; p.setModel(CpuModel::I486); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
     auto& c = p.cpu;
     c.r[AX] = 0; check(c.trap(0x11) && (c.r[AX] & 2), "486DX BIOS equipment must advertise a math coprocessor");
     c.out(0x70, 0x14); check(c.in(0x71) & 2, "486DX CMOS equipment must agree with the BIOS FPU indication");
     c.out(0x21, 0xfb); c.out(0xa1, 0xdf);
+
+    // FNINIT / FLDCW [2000h] / FLD1 / FLDZ / FDIVP ST(1),ST(0) / HLT：触发未屏蔽的 1/0。
     const uint8_t divide[] = {0xdb,0xe3,0xd9,0x2e,0,0x20,0xd9,0xe8,0xd9,0xee,0xde,0xf9,0xf4};
     auto execute = [&]() {
         c.loadSegment(CS, 0); c.loadSegment(DS, 0); c.setFlags(2);
@@ -1723,7 +1821,9 @@ void x87IrqTests(const std::filesystem::path& disk) {
     check(c.fpu.pending() && c.irq() == -1, "CR0.NE must select native #MF delivery instead of the legacy IRQ13 path");
     std::cout << "486DX BIOS-CMOS detection / cascaded x87 IRQ13 / F0-F1 error latch / CR0.NE checks passed\n";
 }
+
 void apmTests(const std::filesystem::path& disk) {
+    // 逐步验证 APM 发现/连接/版本协商/错误，再确认关机停止客体、重启明确恢复初始状态。
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         Pc p; p.setModel(model); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
         auto& c = p.cpu;
@@ -1776,7 +1876,9 @@ void apmTests(const std::filesystem::path& disk) {
     }
     std::cout << "APM real-mode discovery / connection / errors / Windows 95 power-off / explicit reboot checks passed\n";
 }
+
 void videoFirmwareTests(const std::filesystem::path& disk) {
+    // 用第二个 Vga 观察每次 guest IN/OUT；仅改变宿主 VGA 内部状态不能满足 BIOS 虚拟化约束。
     Pc p; auto& c = p.cpu;
     auto observed = std::make_unique<Vga>();
     auto input = c.in; auto output = c.out;
@@ -1785,6 +1887,9 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
     p.hard = std::make_unique<Disk>(disk, false, false);
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         p.setModel(model); p.boot(0x80); observed->setMode(3);
+
+        // MOV AX,[013Ch] / OR AX,[013Eh] / JZ HLT / MOV AX,8100h / INT 4Fh / HLT。
+        // 013Ch 是 INT 4Fh 向量；空指针应跳过 CAM 调用，不能误用占位 IRET。
         const uint8_t camProbe[] = {0xa1,0x3c,1,0x0b,0x06,0x3e,1,0x74,5,0xb8,0,0x81,0xcd,0x4f,0xf4};
         c.halted = false; c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.loadSegment(DS, 0);
         c.ip = 0x500; c.r[SP] = 0x9000;
@@ -1885,7 +1990,9 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
         }
     }
 }
+
 void virtualVideoFirmwareTests(const std::filesystem::path& disk) {
+    // VM86 monitor 接管 VGA 端口/显存后，BIOS 应上传客体字体并只清客体窗口，不破坏宿主桌面。
     for (auto model : {CpuModel::I386, CpuModel::I486}) {
         Pc p; p.setModel(model); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
         auto& c = p.cpu; c.a20 = true;
@@ -1933,7 +2040,9 @@ void virtualVideoFirmwareTests(const std::filesystem::path& disk) {
     }
     std::cout << "VM86 virtual VGA mode / guest font upload / text-graphics clears / physical desktop isolation checks passed\n";
 }
+
 void pagedBiosTests(const std::filesystem::path& disk) {
+    // BIOS 缓冲/键盘/定时器服务在分页 VM86 内必须使用客体线性地址，而非宿主直接物理拷贝。
     Pc p; p.setModel(CpuModel::I386); auto& c = p.cpu; c.a20 = true;
     p.hard = std::make_unique<Disk>(disk, false, false);
     c.cr3 = 0x10000; c.writeDword(0x10000, 0x11007);
@@ -2037,7 +2146,9 @@ void pagedBiosTests(const std::filesystem::path& disk) {
         "Firmware word stores must prevalidate both guest pages before modifying memory");
     std::cout << "386 AT / paged VM86 BIOS / keyboard / timer / video / disk-buffer checks passed\n";
 }
+
 void graphicsBiosTests() {
+    // 字体、像素 XOR、滚屏及字符读回验证 BIOS 功能与 VGA 内存布局的一致性。
     Pc p; auto& c = p.cpu;
     auto bios = [&](uint16_t ax) { c.r[AX] = ax; check(c.trap(0x10), "Graphics BIOS call was not handled"); };
     for (uint16_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
@@ -2108,7 +2219,9 @@ void graphicsBiosTests() {
         "Text strings must write attributes on the requested page without changing the active page or its cursor");
     std::cout << "Graphics BIOS / guest fonts / XOR / scroll / teletype / character readback / strings checks passed\n";
 }
+
 void videoTests() {
+    // 寄存器、平面/锁存、地址映射和显示模式组合测试；数组 patterns 是像素测试数据。
     Pc p; auto& c = p.cpu;
     auto bios = [&](uint16_t ax) { c.r[AX] = ax; check(c.trap(0x10), "VGA BIOS call was not handled"); };
     c.r[DX] = 0xffff; c.r[BX] = 0x100; bios(0xef00);
@@ -2234,7 +2347,9 @@ void videoTests() {
             "Direct text restoration must return guest text memory to the existing text display");
     }
 }
+
 void serialTests() {
+    // 检查 8250/DLAB/中断优先级、1200 波特鼠标识别及真实 IRQ4 客体处理程序。
     Pc p; auto& c = p.cpu;
     c.reset(); c.s[CS] = 0; c.ip = 0x500; c.mem[0x500] = 0xeb; c.mem[0x501] = 0xfe;
     c.out(0x21, 0xef);
@@ -2282,6 +2397,9 @@ void serialTests() {
     c.out(0x3fb, 0x80); check(c.in(0x3f8) == 96, "BIOS must configure COM1 at 1200 baud");
     c.out(0x3fb, 2); c.out(0x3f9, 1);
     c.out(0x20, 0x13); c.out(0x21, 8); c.out(0x21, 1); c.out(0x21, 0xef);
+
+    // PUSH AX / PUSH DX / MOV DX,03F8h / IN AL,DX / MOV [0600h],AL /
+    // MOV AL,20h / OUT 20h,AL（PIC EOI）/ POP DX / POP AX / IRET。
     const uint8_t handler[] = {0x50,0x52,0xba,0xf8,3,0xec,0xa2,0,6,0xb0,0x20,0xe6,0x20,0x5a,0x58,0xcf};
     std::copy(std::begin(handler), std::end(handler), c.mem.begin() + 0x700);
     c.ww(0, 12 * 4, 0x700); c.ww(0, 12 * 4 + 2, 0);
@@ -2289,7 +2407,9 @@ void serialTests() {
     c.out(0x3fc, 11); p.run(50000);
     check(c.mem[0x600] == 'M' && c.r[SP] == 0x8000, "Guest IRQ4 handler must read COM1 and return through IRET");
 }
+
 void ideTests(const std::filesystem::path& path) {
+    // 真实 ATA PIO 端口指令覆盖 CHS/LBA、IRQ14、16/32 位传输和重开后的磁盘内容。
     for (auto model : {CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
         Pc p; p.setModel(model); auto& c = p.cpu;
         p.hard = std::make_unique<Disk>(path, false, false);
@@ -2393,7 +2513,9 @@ void ideTests(const std::filesystem::path& path) {
     }
     std::cout << "ATA PIO / CHS-LBA / IRQ14 / word-dword I/O / multi-sector / reset / disk-persistence checks passed\n";
 }
+
 void atapiTests(const std::filesystem::path& path) {
+    // ATAPI 包/数据相位、IRQ15、传输上限、sense/TOC/锁盘与介质更换均通过设备端口验证。
     std::vector<uint8_t> expected(4096);
     for (unsigned i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i * 19 + i / 2048);
     {
@@ -2490,7 +2612,9 @@ void atapiTests(const std::filesystem::path& path) {
         "ATAPI software reset must restore its signature even without media");
     std::cout << "ATAPI / IRQ15 / packet phases / ISO streaming / host limits / sense / TOC / media-lock checks passed\n";
 }
+
 void softfloatTests() {
+    // 直接数学后端测试与 x87 译码测试分开，检查超出 binary64 精度的结果及 IEEE 异常标志。
     using Op = FloatOperation;
     const Float80 one{0x8000000000000000ull,0x3fff}, tiny{0x8000000000000000ull,0x3fc0};
     auto sum = calculateFloat(Op::Add, one, tiny);
@@ -2560,7 +2684,9 @@ void softfloatTests() {
     }
     std::cout << "Native SoftFloat / 80-bit precision / rounding / conversions / exception flags / wrapped exponents checks passed\n";
 }
+
 void fdcTests(const std::filesystem::path& base) {
+    // send 参数是 FDC 命令包，不是 CPU 指令；program 配置 DMA，含实际 CHRN/多道/PIO/换盘路径。
     auto path = std::filesystem::path(base.native() + L".floppy");
     HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     check(file != INVALID_HANDLE_VALUE, "Cannot create isolated FDC fixture");
@@ -2671,12 +2797,13 @@ void fdcTests(const std::filesystem::path& base) {
             std::array<uint8_t, 512> boot{}; boot[0] = 0xf4; boot[510] = 0x55; boot[511] = 0xaa;
             check(p.floppy->write(0, boot.data()), "Cannot prepare BIOS floppy boot sector");
             p.boot(0);
-            // Win9x HSFLOP finds BIOS floppy drives by trapping the DOR write a real BIOS makes for media access.
+
+            // Win9x HSFLOP 通过捕获 BIOS 访问介质时的 DOR 写入发现软驱，不能绕过端口只读映像。
             auto call = [&](uint16_t ax, uint8_t drive) {
                 c.out(0x3f2, 0x0c);
                 c.loadSegment(CS, 0); c.loadSegment(ES, 0); c.ip = 0x500; c.halted = false;
                 c.r[AX] = ax; c.r[CX] = 1; c.r[DX] = drive; c.r[BX] = 0x600;
-                const uint8_t code[] = {0xcd,0x13,0xf4};
+                const uint8_t code[] = {0xcd,0x13,0xf4}; // INT 13h / HLT：由 ROM 中真实 OUT 指令启动软驱电机。
                 std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x500); p.run(100);
                 return c.in(0x3f2);
             };
@@ -2693,7 +2820,9 @@ void fdcTests(const std::filesystem::path& base) {
     std::filesystem::remove(path);
     std::cout << "FDC / IRQ6 / reset-sense / DMA-PIO / multi-track / media-change / write-protection / format checks passed\n";
 }
+
 void dmaTests() {
+    // 精确检查 8/16 位通道的页内回绕、减地址、自初始化、级联及 count+1 的终止边界。
     Pc p; p.setModel(CpuModel::I486); auto& c = p.cpu;
     auto program = [&](unsigned channel, uint16_t address, uint16_t count, uint8_t mode, uint8_t page) {
         static constexpr uint16_t pages[] = {0x87,0x83,0x81,0x82,0,0x8b,0x89,0x8a};
@@ -2759,7 +2888,9 @@ void dmaTests() {
     check(result.terminal && xt.cpu.mem[0x100] == 'D' && xt.cpu.in(0xc0) == 255, "XT DMA must retain its 20-bit bus and not expose an AT second controller");
     std::cout << "8237 DMA / physical-MMIO bus / page wrapping / decrement / cascade / auto-init / exact terminal-count checks passed\n";
 }
+
 void diskSizingTests(const std::filesystem::path& base) {
+    // 原始容量/BIOS CHS/ATA IDENTIFY 三方一致，末扇区写入必须关闭后重开仍读得回来。
     auto path = std::filesystem::path(base.native() + L".sizing");
     check(!std::filesystem::exists(path), "Disk sizing fixture already exists");
     try {
@@ -2783,6 +2914,8 @@ void diskSizingTests(const std::filesystem::path& base) {
                     "The final sector must be writable and the first out-of-range sector rejected");
                 disk.flush(); p.boot(0x80);
                 auto& c = p.cpu; c.loadSegment(CS, 0); c.ip = 0x500;
+
+                // MOV AX,0800h / MOV DL,80h / INT 13h / HLT：查询 BIOS 硬盘几何。
                 const uint8_t code[] = {0xb8,0,8,0xb2,0x80,0xcd,0x13,0xf4};
                 std::copy(std::begin(code), std::end(code), c.mem.begin() + c.ip); p.run(100);
                 auto maximum = cylinders - 1;
@@ -2839,7 +2972,9 @@ void diskSizingTests(const std::filesystem::path& base) {
     } catch (...) { std::filesystem::remove(floppyPath); throw; }
     std::cout << "Floppy metadata footer / exact payload / inconsistent geometry rejection checks passed\n";
 }
+
 void extendedDiskTests(const std::filesystem::path& base) {
+    // 32 GiB 稀疏盘和高 LBA：EDD 参数/读写/校验/定位、无效 DAP 与边界拒绝不能只测小盘代理。
     auto path = std::filesystem::path(base.native() + L".extended");
     check(!std::filesystem::exists(path), "Extended disk fixture already exists");
     try {
@@ -2911,7 +3046,9 @@ void extendedDiskTests(const std::filesystem::path& base) {
     } catch (...) { std::filesystem::remove(path); throw; }
     std::cout << "32 GiB sparse disks / translated CHS / EDD parameters-read-write-verify-seek / invalid DAP / high LBA28 / bounds checks passed\n";
 }
+
 void mbrBootstrapTests(const std::filesystem::path& base) {
+    // 真正从新生成 MBR 链式启动 VBR，含高柱面和第四分区槽，错误元数据必须显示失败提示。
     auto path = std::filesystem::path(base.native() + L".mbr");
     check(!std::filesystem::exists(path), "MBR fixture already exists");
     try {
@@ -2919,6 +3056,9 @@ void mbrBootstrapTests(const std::filesystem::path& base) {
         std::array<uint8_t, 512> mbr{}, vbr{};
         {
             Disk disk(path, false, false); check(disk.read(0, mbr.data()), "Cannot read generated MBR");
+
+            // MOV BYTE [9000h],A5h / MOV [9001h],DL / CLI / HLT / JMP HLT。
+            // 标记证明 VBR 真的执行过，并验证 MBR 传递 BIOS 盘号 DL=80h。
             const uint8_t code[] = {0xc6,0x06,0,0x90,0xa5,0x88,0x16,1,0x90,0xfa,0xf4,0xeb,0xfd};
             std::copy(std::begin(code), std::end(code), vbr.begin()); vbr[510] = 0x55; vbr[511] = 0xaa;
             check(disk.write(63, vbr.data()), "Cannot install synthetic VBR"); disk.flush();
@@ -2959,6 +3099,7 @@ void mbrBootstrapTests(const std::filesystem::path& base) {
     } catch (...) { std::filesystem::remove(path); throw; }
     std::cout << "Generated MBR / VBR chainload / high-cylinder LBA / fourth slot / DL / invalid metadata checks passed\n";
 }
+
 void unit() {
     videoTests(); graphicsBiosTests(); serialTests(); keyboardProbeTests(); x87Tests();
     Cpu c; c.reset(); c.s[CS] = c.s[SS] = 0; c.ip = 0x100;
@@ -2980,6 +3121,8 @@ void unit() {
         {
             Disk d(path, false, false); check(d.sectors == 64512, "Hard disk geometry"); check(d.write(17, bytes.data()), "Disk write");
             bytes.fill(0);
+
+            // MOV AH,0 / INT 16h / MOV [0500h],AX / HLT：IRQ1 应唤醒 BIOS 阻塞读键。
             const uint8_t program[] = {0xb4, 0, 0xcd, 0x16, 0xa3, 0, 5, 0xf4};
             std::copy(std::begin(program), std::end(program), bytes.begin());
             bytes[510] = 0x55; bytes[511] = 0xaa; check(d.write(0, bytes.data()), "Write synthetic boot sector"); d.flush();
@@ -3012,6 +3155,7 @@ void unit() {
     std::cout << "Native unit tests passed\n";
 }
 }
+
 int main(int argc, char** argv) {
     try { if (argc == 2 && std::string(argv[1]) == "--benchmark-video") { videoBenchmarks(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--benchmark") { benchmarks(); return 0; }

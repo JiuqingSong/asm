@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <vector>
 
+// Win32 前端与无界面脚本共用 Pc；模拟执行、输入、绘图由同一消息线程协调。
 using namespace asm86;
 namespace {
 enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768 };
@@ -21,10 +22,13 @@ std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
 bool running = false;
-// Execution faults stop the CPU without powering off its diagnostic display.
+
+// 执行故障只停止 CPU，保留诊断画面；poweredOn、running、paused 不能互相替代。
 bool poweredOn = false;
 bool paused = false;
+
 std::function<bool()> confirmationDecision;
+
 auto statsOrigin = ExecutionTiming::HostClock::now();
 uint64_t statsInstructions = 0, statsDisk = 0, statsReads = 0, statsWrites = 0;
 uint64_t activityReads = 0, activityWrites = 0;
@@ -45,11 +49,14 @@ const COLORREF colors[] = {
     RGB(85,85,85),RGB(85,85,255),RGB(85,255,85),RGB(85,255,255),
     RGB(255,85,85),RGB(255,85,255),RGB(255,255,85),RGB(255,255,255)
 };
+
 std::wstring wide(const std::string& value) {
     int n = MultiByteToWideChar(CP_UTF8, 0, value.data(), int(value.size()), nullptr, 0);
     std::wstring result(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, value.data(), int(value.size()), result.data(), n); return result;
 }
+
 void title(HWND hwnd) {
+    // 客体时间来自 PIT clock，实测 MIPS 来自宿主时间差；两者不是同一个计时指标。
     std::wstring value = pc->cpu.model == CpuModel::I486 ? L"Asm86 native - 80486DX / AT (experimental)"
         : pc->cpu.model == CpuModel::I386 ? L"Asm86 native - 80386 / AT (experimental)"
         : pc->at() ? L"Asm86 native - 80286 / AT" : L"Asm86 native - 8088";
@@ -85,13 +92,16 @@ void title(HWND hwnd) {
         throw std::runtime_error("Cannot update execution speed menu");
     SetWindowTextW(hwnd, value.c_str());
 }
+
 void resetStats() {
     statsOrigin = ExecutionTiming::HostClock::now(); statsInstructions = pc->instructions;
     statsDisk = pc->hard ? pc->hard->identity : 0;
     statsReads = pc->hard ? pc->hard->readSectors : 0; statsWrites = pc->hard ? pc->hard->writtenSectors : 0;
     measuredMips = 0; activityReads = activityWrites = 0;
 }
+
 void updateStats(HWND hwnd) {
+    // 每秒更新一次；换盘时 identity 改变，不能用新盘计数减旧盘计数。
     auto now = ExecutionTiming::HostClock::now();
     auto seconds = std::chrono::duration<double>(now - statsOrigin).count();
     if (seconds < 1) return;
@@ -103,6 +113,7 @@ void updateStats(HWND hwnd) {
     statsOrigin = now; statsInstructions = pc->instructions; statsDisk = identity; statsReads = reads; statsWrites = writes;
     title(hwnd);
 }
+
 void releaseMouse(HWND hwnd) {
     if (!mouseCaptured) return;
     mouseCaptured = false;
@@ -110,26 +121,32 @@ void releaseMouse(HWND hwnd) {
     ShowCursor(TRUE);
     pc->serialMouse.motion(0, 0, 0, pc->clock);
 }
+
 void releaseKeyboard() {
+    // 失焦/暂停/弹窗时补发 break 扫描码，避免客体认为 Ctrl/Alt 等一直按着。
     for (unsigned scan = 0; scan < pressedKeys.size(); ++scan) {
         if (pressedKeys[scan] && running) pc->key(uint8_t(scan | 128), 0);
         pressedKeys[scan] = false;
     }
     if (!running) pc->modifiers(0);
 }
+
 bool confirmChange(HWND hwnd, const wchar_t* text) {
+    // 先释放捕获再显示默认 No 的确认框；自动 GUI 测试使用注入决策，避免无人值守阻塞。
     releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
     if (confirmationDecision) return confirmationDecision();
     auto answer = MessageBoxW(hwnd, text, L"Asm86 - confirm machine change", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
     if (answer != IDYES && answer != IDNO) throw std::runtime_error("Cannot show machine confirmation dialog");
     return answer == IDYES;
 }
+
 void centerMouse(HWND hwnd) {
     RECT rect{}; GetClientRect(hwnd, &rect);
     POINT center{rect.right / 2, rect.bottom / 2};
     if (!ClientToScreen(hwnd, &center) || !SetCursorPos(center.x, center.y))
         throw std::runtime_error("Cannot center captured mouse pointer");
 }
+
 std::filesystem::path choose(HWND hwnd, bool save, bool optical = false, bool overlay = false) {
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = hwnd;
@@ -141,13 +158,16 @@ std::filesystem::path choose(HWND hwnd, bool save, bool optical = false, bool ov
     if (CommDlgExtendedError()) throw std::runtime_error("File selection dialog failed");
     return {};
 }
+
 void original(HWND hwnd) {
     ShowWindow(hwnd, SW_RESTORE);
     RECT rect{0,0,int(pc->vga.width()),int(pc->vga.height())};
     AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, TRUE, 0);
     SetWindowPos(hwnd, nullptr, 0, 0, rect.right - rect.left, rect.bottom - rect.top, SWP_NOMOVE | SWP_NOZORDER);
 }
+
 void render(HDC target, int width, int height) {
+    // 图形模式批量展开 VGA，文本模式先画到内存 DC；整帧缩放一次以减少闪烁和 GDI 开销。
     if (!pc) return;
     if (!poweredOn) {
         RECT screen{0,0,width,height};
@@ -197,7 +217,8 @@ void render(HDC target, int width, int height) {
             FillRect(back, &cursor, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
         }
     }
-    // Only clear letterboxing: clearing the viewport exposes a black frame before presentation.
+
+    // 只清宽高比留出的黑边；若先清视口再呈现，窗口会短暂露出黑帧而闪烁。
     const RECT margins[] = {{0,0,width,v.y}, {0,v.y + v.height,width,height},
         {0,v.y,v.x,v.y + v.height}, {v.x + v.width,v.y,width,v.y + v.height}};
     for (const auto& margin : margins) FillRect(target, &margin, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
@@ -213,7 +234,9 @@ void render(HDC target, int width, int height) {
         } else StretchBlt(target, v.x, v.y, v.width, v.height, back, 0, 0, int(cols) * 8, 400, SRCCOPY);
     }
 }
+
 void execute(HWND hwnd) {
+    // 单次最多运行约 8 ms；APM 关机/客体复位在片段结束后回到前端统一处理。
     bool hadDisc = pc->cdrom.medium() != nullptr;
     executionTiming.run(*pc, fullSpeed, std::chrono::milliseconds(8), stableTiming);
     if (pc->powerOffRequested) {
@@ -234,7 +257,9 @@ void execute(HWND hwnd) {
         MessageBoxW(hwnd, text.c_str(), L"Firmware notice", MB_OK | MB_ICONWARNING);
     }
 }
+
 void command(HWND hwnd, int id) {
+    // 更换 CPU/硬盘和回滚必须真正关机；软盘/光盘可热换，但由设备检查忙碌/锁盘状态。
     switch (id) {
     case LoadFloppy: {
         auto p = choose(hwnd, false);
@@ -288,6 +313,8 @@ void command(HWND hwnd, int id) {
         executionTiming.reset(*pc); resetStats();
         poweredOn = running = true; paused = false; break;
     case PauseResume:
+
+        // 暂停不丢 RAM；恢复重置宿主计时基准，避免把暂停时间变成一大段客体补跑。
         if (!poweredOn || (!running && !paused)) break;
         if (running) {
             releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
@@ -328,6 +355,7 @@ void command(HWND hwnd, int id) {
     }
     title(hwnd); InvalidateRect(hwnd, nullptr, FALSE);
 }
+
 LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     try {
         switch (message) {
@@ -336,6 +364,8 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
             {
             if (running) execute(hwnd);
             updateStats(hwnd);
+
+            // 最小化只跳过刷新，不跳过 execute：后台安装不会因无 WM_PAINT 而停止。
             if (!IsIconic(hwnd)) InvalidateRect(hwnd, nullptr, FALSE); return 0;
             }
         case WM_APP:
@@ -420,7 +450,9 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
     }
     return DefWindowProcW(hwnd, message, w, l);
 }
+
 BOOL processMessage(HWND hwnd) {
+    // Full speed 主动执行 WM_APP，即使没有绘图事件也运行；消息队列持续繁忙时也保留执行机会。
     MSG message{};
     if (running && fullSpeed) {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
@@ -437,10 +469,13 @@ BOOL processMessage(HWND hwnd) {
     if (result > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
     return result;
 }
+
 void tapKey(uint8_t scan, uint8_t ascii) {
     pc->key(scan, ascii); pc->key(scan | 0x80, 0);
 }
+
 void namedKey(const std::string& value) {
+    // 脚本键名转换为客体 make/break；修饰键可分开保持，确保 Win9x 能识别真实组合键。
     if (value == "ENTER") tapKey(0x1c, 13);
     else if (value == "ESC") tapKey(1, 27);
     else if (value == "SPACE") tapKey(0x39, 32);
@@ -461,7 +496,9 @@ void namedKey(const std::string& value) {
         tapKey(uint8_t(0x3a + n), 0);
     } else throw std::runtime_error("Unknown scripted key: " + value);
 }
+
 void saveFrame(const std::filesystem::path& path) {
+    // 输出 32 位 top-down BMP；关机保存黑屏，不能把停留的旧 VGA 缓冲区当成仍在运行。
     if (!pc->vga.graphics()) throw std::runtime_error("A graphics frame requires a graphics video mode");
     unsigned width = pc->vga.width(), height = pc->vga.height();
     BITMAPFILEHEADER file{}; BITMAPINFOHEADER info{};
@@ -476,7 +513,10 @@ void saveFrame(const std::filesystem::path& path) {
     out.write(reinterpret_cast<const char*>(pixels.data()), std::streamsize(pixels.size() * sizeof(uint32_t)));
     if (!out) throw std::runtime_error("Cannot save graphics frame");
 }
+
 int headless(const std::filesystem::path& script) {
+    // run/wait 使用确定性指令预算；realtime/wait-realtime 使用与 GUI 相同的宿主计时。
+    // expect-state powered-off 必须看到 APM 请求，不能因超时/CPU 停止就判成功。
     std::ifstream stream(script); if (!stream) throw std::runtime_error("Cannot open headless script");
     std::string line; unsigned lineNumber = 0;
     try { while (std::getline(stream, line)) {
@@ -526,6 +566,7 @@ int headless(const std::filesystem::path& script) {
             out.write(reinterpret_cast<const char*>(pc->cpu.mem.data()), std::streamsize(pc->cpu.mem.size()));
             if (!out) throw std::runtime_error("Cannot save diagnostic memory");
         } else if (op == "state") {
+            // 诊断读取可能触发客体页故障，保留原 CR2，避免日志观察改变下一次异常的故障地址。
             std::cout << "CS:IP " << std::hex << pc->cpu.s[CS] << ':' << pc->cpu.ip << " flags=" << pc->cpu.flags
                 << " msw=" << pc->cpu.msw << " cpl=" << pc->cpu.cpl;
             for (auto v : pc->cpu.r) std::cout << ' ' << v;
@@ -555,6 +596,7 @@ int headless(const std::filesystem::path& script) {
             if (!valid) throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": state assertion failed: " + arg);
         } else if (op == "key") namedKey(arg);
         else if (op == "type" || op == "type-paced") {
+            // 先按修饰键，再 make/break 字符键；paced 版本留出宿主时间供图形系统消费输入。
             for (unsigned char ch : arg) {
                 SHORT vk = VkKeyScanA(char(ch)); unsigned scan = vk == -1 ? 0 : MapVirtualKeyW(uint8_t(vk), MAPVK_VK_TO_VSC);
                 if (!scan || scan > 0x7f) throw std::runtime_error("Cannot map scripted character to a keyboard scan code");
@@ -600,7 +642,9 @@ int headless(const std::filesystem::path& script) {
     if (pc->hard) pc->hard->flush();
     std::cout << pc->text() << "\nHeadless script passed\n"; return 0;
 }
+
 int application(int argc, wchar_t** argv) {
+    // 先完整解析参数再打开硬盘，让 --hard 与 --overlay 顺序无关，并避免误开成可写底盘。
     pc = std::make_unique<Pc>();
     std::filesystem::path script, hardPath, overlayPath; bool start = false, uiTest = false, discardOverlay = false, overlaySpecified = false;
     bool cpuSpecified = false, speedSpecified = false, timingSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
@@ -683,6 +727,7 @@ int application(int argc, wchar_t** argv) {
         };
     }
     if (!uiTest && script.empty()) {
+        // 仅交互 GUI 恢复/保存用户偏好；headless 与 ui-test 完全隔离真实用户设置。
         preferences = std::make_unique<Preferences>();
         if (!cpuSpecified) pc->setModel(preferences->cpu());
         if (!speedSpecified) fullSpeed = preferences->fullSpeed();
@@ -779,6 +824,7 @@ int application(int argc, wchar_t** argv) {
     executionTiming.reset(*pc); resetStats();
     if (!SetTimer(hwnd, 1, 16, nullptr)) throw std::runtime_error("Cannot start execution timer");
     if (uiTest) {
+        // 以下集成测试直接发送 Win32 消息，使用私有临时盘和可控确认结果，不操作用户原盘。
         confirmationDecision = [] { return true; };
         if (poweredOn || running) throw std::runtime_error("GUI startup must remain powered off even with --boot");
         auto checkBlackScreen = [&]() {
@@ -947,7 +993,7 @@ int application(int argc, wchar_t** argv) {
         auto savedPc = std::move(pc);
         pc = std::make_unique<Pc>();
         pc->cpu.reset(); pc->cpu.s[CS] = 0; pc->cpu.ip = 0x500; pc->cpu.flags = 0xf002;
-        pc->cpu.mem[0x500] = 0xeb; pc->cpu.mem[0x501] = 0xfe;
+        pc->cpu.mem[0x500] = 0xeb; pc->cpu.mem[0x501] = 0xfe; // EB FE=JMP $：无限短跳转用于测速，不访问磁盘。
         executionTiming.reset(*pc);
         running = true;
         if (fullSpeed) SendMessageW(hwnd, WM_COMMAND, FullSpeed, 0);
@@ -1147,6 +1193,8 @@ int application(int argc, wchar_t** argv) {
                 std::ofstream image(resetImages[i], std::ios::binary);
                 image.seekp((i == 0 ? 1008 * 512 : 160 * 1024) - 1); image.put(0);
                 std::array<char, 512> sector{};
+
+                // EB FE=JMP $；第三字节仅为盘标记 C/D，不可执行；尾部 55 AA 是引导签名。
                 sector[0] = char(0xeb); sector[1] = char(0xfe); sector[2] = char('C' + i);
                 sector[510] = 0x55; sector[511] = char(0xaa);
                 image.seekp(0); image.write(sector.data(), sector.size()); image.close();
@@ -1206,6 +1254,9 @@ int application(int argc, wchar_t** argv) {
                     c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.r[SP] = 0x9000; c.setFlags(2);
                     c.r[AX] = 0x5301; c.r[BX] = 0; c.trap(0x15);
                     c.r[AX] = 0x530e; c.r[CX] = 0x0101; c.trap(0x15);
+
+                    // MOV AX,5307h / MOV BX,1 / MOV CX,3 / INT 15h：APM 全系统关机。
+                    // 后接 MOV BYTE [0600h],FFh；它不能执行，否则前端未及时停止客体。
                     const uint8_t shutdown[] = {0xb8,7,0x53,0xbb,1,0,0xb9,3,0,0xcd,0x15,0xc6,6,0,6,0xff};
                     std::copy(std::begin(shutdown), std::end(shutdown), c.mem.begin() + 0x500);
                     c.mem[0x600] = 0;
@@ -1292,6 +1343,7 @@ int application(int argc, wchar_t** argv) {
     return 0;
 }
 }
+
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     int argc = 0; auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     try {

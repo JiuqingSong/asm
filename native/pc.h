@@ -19,6 +19,7 @@
 #include <windows.h>
 
 namespace asm86 {
+// 扇区后端由 BIOS、ATA 和 FDC 共用；文件句柄独占可写方，复制 Disk 会破坏所有权。
 class Disk {
 public:
     Disk(const std::filesystem::path& path, bool floppy, bool readOnly, const std::filesystem::path& overlay = {});
@@ -43,6 +44,8 @@ public:
     std::filesystem::path path;
     const uint64_t identity;
 private:
+
+    // 差分索引只记录各 LBA 最新数据偏移；历史记录留在追加日志中，不自动合并到底盘。
     HANDLE file = INVALID_HANDLE_VALUE;
     HANDLE overlayFile = INVALID_HANDLE_VALUE;
     std::filesystem::path differential;
@@ -54,6 +57,8 @@ private:
 
 class Pc {
 public:
+
+    // 设备共用以 PIT 输入频率为单位的虚拟时钟；CPU 指令数与宿主耗时分别计量。
     Cpu cpu;
     Vga vga;
     SerialMouse serialMouse;
@@ -82,6 +87,8 @@ public:
     unsigned activePage() const;
     unsigned cursor() const;
 private:
+
+    // AT 使用级联 8259、CMOS/RTC、8042、DMA/FDC；XT 仍保留自己的键盘/PIT路径。
     std::array<Pic, 2> pic{};
     std::array<uint8_t, 128> cmos{};
     uint8_t cmosIndex = 0, kbdCommand = 0x45, kbdOutput = 1, kbdWrite = 0, fastA20 = 0;

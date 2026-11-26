@@ -5,6 +5,7 @@
 #include <limits>
 
 namespace asm86 {
+// UART 寄存器和串口鼠标共用一套接收时间轴；回调由 Pc 路由到 IRQ4。
 class SerialMouse {
 public:
     void reset();
@@ -16,6 +17,8 @@ public:
     std::function<void(bool)> setIrq;
     double nextEvent = std::numeric_limits<double>::infinity();
 private:
+
+    // Byte.at 为客体时钟上的到达时刻；积累位移避免一次鼠标移动溢出三字节协议。
     struct Byte { double at; uint8_t value; };
     std::deque<Byte> queue;
     uint8_t dll = 12, dlm = 0, ier = 0, lcr = 3, mcr = 0, scratch = 0;

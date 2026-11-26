@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include "fpu-math.inl"
 
+// x87 80 位寄存器栈与 D8..DF 译码；基础数值运算交给 SoftFloat，超越函数使用定点内核。
 namespace asm86 {
 using namespace fpuMath;
 namespace {
@@ -12,36 +13,51 @@ constexpr Float80 INFINITY80{0x8000000000000000ull, 0x7fff};
 constexpr Float80 INDEFINITE{0xc000000000000000ull, 0xffff};
 constexpr uint16_t CONDITIONS = 0x4700;
 constexpr std::array<Float80, 7> CONSTANTS{{
+    // D9 E8..EE：FLD1、FLDL2T、FLDL2E、FLDPI、FLDLG2、FLDLN2、FLDZ。
+    // 这里存的是 80 位浮点位模式，不是机器码字节。
     ONE80, {0xd49a784bcd1b8afeull, 0x4000}, {0xb8aa3b295c17f0bcull, 0x3fff},
     {0xc90fdaa22168c235ull, 0x4000}, {0x9a209a84fbcff799ull, 0x3ffd},
     {0xb17217f7d1cf79acull, 0x3ffe}, {}
 }};
 struct FpuAbort {};
+
 uint64_t readUnsigned(const std::vector<uint8_t>& bytes, unsigned at, unsigned size) {
     if (at > bytes.size() || size > bytes.size() - at || size > 8) throw std::out_of_range("Short x87 memory operand");
     uint64_t n = 0;
     for (unsigned i = 0; i < size; ++i) n |= uint64_t(bytes[at + i]) << (i * 8);
     return n;
 }
+
 void writeUnsigned(std::vector<uint8_t>& bytes, unsigned at, uint64_t n, unsigned size) {
     for (unsigned i = 0; i < size; ++i) { bytes.at(at + i) = uint8_t(n); n >>= 8; }
 }
+
 Float80 read80(const std::vector<uint8_t>& bytes, unsigned at = 0) {
     return {readUnsigned(bytes, at, 8), uint16_t(readUnsigned(bytes, at + 8, 2))};
 }
+
 std::vector<uint8_t> rawBytes(uint64_t n, unsigned size) {
     std::vector<uint8_t> out(size); writeUnsigned(out, 0, n, size); return out;
 }
+
 uint64_t signExtend(uint64_t n, unsigned bits) {
     if (bits == 64) return n;
     uint64_t mask = (uint64_t(1) << bits) - 1;
     return (n & (uint64_t(1) << (bits - 1))) ? n | ~mask : n & mask;
 }
+
 Float80 signedZero(Float80 a) { return {0, uint16_t(a.signExponent & 0x8000)}; }
+
 Float80 signedInfinity(Float80 a) { return {INFINITY80.significand, uint16_t(0x7fff | (a.signExponent & 0x8000))}; }
 }
 
 FpuMemoryOperation Fpu::memoryOperation(uint8_t op, unsigned reg, bool operand32) {
+    // 偶数 ESC：D8 实数32、DA 整数32、DC 实数64、DE 整数16，均为算术/比较源。
+    // 奇数 ESC 的 /0..7 操作数尺寸表（0 表示非法编码）：
+    // D9：FLD32、非法、FST32、FSTP32、FLDENV、FLDCW、FNSTENV、FNSTCW。
+    // DB：FILD32、非法、FIST32、FISTP32、非法、FLD80、非法、FSTP80。
+    // DD：FLD64、非法、FST64、FSTP64、FRSTOR、非法、FNSAVE、FNSTSW。
+    // DF：FILD16、非法、FIST16、FISTP16、FBLD、FILD64、FBSTP、FISTP64。
     if (op < 0xd8 || op > 0xdf || reg > 7) return {0, false};
     if (!(op & 1)) return {op == 0xd8 || op == 0xda ? 4u : op == 0xdc ? 8u : 2u, false};
     unsigned env = operand32 ? 28 : 14;
@@ -53,71 +69,94 @@ FpuMemoryOperation Fpu::memoryOperation(uint8_t op, unsigned reg, bool operand32
     };
     return {sizes[(op - 0xd9) / 2][reg], reg == 2 || reg == 3 || reg == 6 || reg == 7};
 }
+
 bool Fpu::noWait(uint8_t op, uint8_t m) {
+    // FN 控制/状态指令可以在未处理浮点异常时执行；带前置 9B FWAIT 的版本先等待。
     return (op == 0xdb && m >= 0xe0 && m <= 0xe4) || (op == 0xdf && m == 0xe0) ||
         (m < 0xc0 && (op == 0xd9 || op == 0xdd) && (m & 0x38) >= 0x30);
 }
+
 uint16_t Fpu::statusWord() const { return uint16_t((status & ~0x3800) | ((top & 7) << 11)); }
+
 uint16_t Fpu::tagWord() const {
+    // 每个物理栈槽两位 tag：0 有效、1 零、2 特殊、3 空；TOP 决定 ST(i) 的物理槽。
     uint16_t word = 0;
     for (unsigned i = 0; i < 8; ++i) word |= uint16_t((tags[i] & 3) << (i * 2));
     return word;
 }
+
 bool Fpu::pending() const { return (status & ~control & 0x3f) != 0; }
+
 Float80 Fpu::st(unsigned i) const { return registers[(top + i) & 7]; }
+
 uint8_t Fpu::tag(unsigned i) const { return tags[(top + i) & 7]; }
+
 void Fpu::init() {
     control = 0x037f; status = 0; top = 0; tags.fill(3);
     ip = dp = 0; cs = ds = opcode = 0; updateError();
 }
+
 void Fpu::updateError() {
     if (pending()) status |= 0x8080; else status &= uint16_t(~0x8080);
     if (onError) onError(pending());
 }
+
 void Fpu::raise(uint16_t flags, bool registerResult) {
     status |= flags & 0x7f; updateError();
     if (flags & ~control & (registerResult ? 7 : 0x1f)) throw FpuAbort{};
 }
+
 Float80 Fpu::result(FloatResult r, bool registerResult) {
     status = uint16_t((status & ~0x200) | (r.flags & 0x200));
     raise(r.flags, registerResult); return r.value;
 }
+
 Float80 Fpu::stackFault(bool overflow) {
     status = uint16_t((status & ~0x200) | (overflow ? 0x200 : 0));
     raise(0x41); return INDEFINITE;
 }
+
 Float80 Fpu::get(unsigned i) {
     if (tag(i) == 3) return stackFault(false);
     Float80 value = st(i);
     if (unsupported(value)) { raise(1); return INDEFINITE; }
     return value;
 }
+
 void Fpu::denormal(Float80 a) { if (!exponent(a) && a.significand) raise(2); }
+
 void Fpu::set(unsigned i, Float80 value) {
     unsigned p = (top + i) & 7, e = exponent(value);
     registers[p] = value;
     tags[p] = !value.significand && !e ? 1 : !e || e == 0x7fff || unsupported(value) ? 2 : 0;
 }
+
 void Fpu::push(Float80 value) {
     unsigned next = (top + 7) & 7;
     if (tags[next] != 3) value = stackFault(true);
     top = next; set(0, value);
 }
+
 void Fpu::pop() { tags[top] = 3; top = (top + 1) & 7; }
+
 Float80 Fpu::arithmetic(unsigned kind, Float80 a, Float80 b) {
+    // /0 FADD、/1 FMUL、/2 FCOM、/3 FCOMP、/4 FSUB、/5 FSUBR、/6 FDIV、/7 FDIVR。
     denormal(a); denormal(b);
     auto op = kind == 0 ? FloatOperation::Add : kind == 1 ? FloatOperation::Multiply :
         kind <= 5 ? FloatOperation::Subtract : FloatOperation::Divide;
     if (kind == 5 || kind == 7) std::swap(a, b);
     return result(calculateFloat(op, a, b, control), true);
 }
+
 void Fpu::compare(Float80 a, Float80 b, bool quiet) {
     denormal(a); denormal(b);
     auto r = calculateFloat(FloatOperation::Compare, a, b, control);
     if ((nan(a) || nan(b)) && !quiet) r.flags |= 1;
     result(r); status = uint16_t((status & ~CONDITIONS) | r.value.significand);
 }
+
 Float80 Fpu::fromInteger(uint64_t value) { return result(calculateFloat(FloatOperation::FromInteger64, {value, 0}, {}, control)); }
+
 uint64_t Fpu::toInteger(Float80 value, unsigned bits) {
     auto r = calculateFloat(FloatOperation::ToInteger64, value, {}, control);
     uint64_t integer = r.value.significand;
@@ -127,6 +166,7 @@ uint64_t Fpu::toInteger(Float80 value, unsigned bits) {
     result(r);
     return bits == 64 ? integer : integer & ((uint64_t(1) << bits) - 1);
 }
+
 void Fpu::execute(uint8_t op, uint8_t m, const FpuContext& c) {
     const Fpu old = *this;
     unsigned reg = (m >> 3) & 7;
@@ -143,8 +183,8 @@ void Fpu::execute(uint8_t op, uint8_t m, const FpuContext& c) {
         if (mem) memory(op, reg, c); else registerOperation(op, m, c);
         updateError();
     } catch (const FpuAbort&) {
-        // Floating-point exceptions retain diagnostics/pointers, but suppress
-        // register writes and stack movement. Bus/page faults restore everything.
+        // 未屏蔽浮点异常保留诊断/指针，但撤销寄存器、TOP 和 tag 修改；
+        // 总线/分页异常则恢复整个 FPU 状态，并继续向 CPU 传播。
         registers = old.registers; tags = old.tags; top = old.top; updateError();
     } catch (...) {
         *this = old;
@@ -152,7 +192,9 @@ void Fpu::execute(uint8_t op, uint8_t m, const FpuContext& c) {
         throw;
     }
 }
+
 void Fpu::memory(uint8_t op, unsigned reg, const FpuContext& c) {
+    // ModR/M.mod!=3 时 /reg 决定内存指令；所有读写通过 CPU 已验证的完整操作数回调。
     auto shape = memoryOperation(op, reg, c.operand32);
     if (!shape.size) throw std::invalid_argument("Unsupported x87 memory encoding");
     auto read = [&]() {
@@ -215,10 +257,12 @@ void Fpu::memory(uint8_t op, unsigned reg, const FpuContext& c) {
         Float80 value = get(); auto out = rawBytes(value.significand, 10);
         writeUnsigned(out, 8, value.signExponent, 2); c.write(out); pop();
     } else if (op == 0xdf && reg == 4) {
+        // DF /4 FBLD：9 字节各存两位 BCD，第 10 字节 bit7 为符号，共 18 位十进制数。
         auto bytes = read(); uint64_t value = 0;
         for (unsigned k = 9; k-- > 0;) value = value * 100 + (bytes[k] >> 4) * 10 + (bytes[k] & 15);
         push(fromInteger(bytes[9] & 0x80 ? uint64_t(0) - value : value));
     } else if (op == 0xdf && reg == 6) {
+        // DF /6 FBSTP：按控制字舍入为 18 位 BCD，写入成功后再弹出 ST(0)。
         Float80 value = get();
         auto raw = result(calculateFloat(FloatOperation::ToInteger64, value, {}, control));
         uint64_t integer = raw.significand;
@@ -237,7 +281,9 @@ void Fpu::memory(uint8_t op, unsigned reg, const FpuContext& c) {
         c.write(out); pop();
     } else throw std::invalid_argument("Unsupported x87 memory encoding");
 }
+
 void Fpu::registerOperation(uint8_t op, uint8_t m, const FpuContext& c) {
+    // ModR/M.mod=3：低三位指定 ST(i)。D8 操作 ST(0)，DC 操作 ST(i)，DE 算术后弹栈。
     unsigned reg = (m >> 3) & 7, i = m & 7;
     if (op == 0xd8 || op == 0xdc || (op == 0xde && m != 0xd9)) {
         Float80 a = get(), b = get(i);
@@ -247,6 +293,8 @@ void Fpu::registerOperation(uint8_t op, uint8_t m, const FpuContext& c) {
         return;
     }
     if (op == 0xd9) {
+        // D9 C0..C7 FLD ST(i)、C8..CF FXCH ST(i)、D0 FNOP；
+        // E0 FCHS、E1 FABS、E4 FTST、E5 FXAM、E8..EE 加载常数。
         if (m < 0xc8) { push(get(i)); return; }
         if (m < 0xd0) { Float80 a = get(), b = get(i); set(0, b); set(i, a); return; }
         if (m == 0xd0) return;
@@ -274,24 +322,31 @@ void Fpu::registerOperation(uint8_t op, uint8_t m, const FpuContext& c) {
         if (m >= 0xf0) { transcendental(m); return; }
     }
     if ((op == 0xda && m == 0xe9) || (op == 0xde && m == 0xd9)) {
+        // DA E9 FUCOMPP（安静比较）/ DE D9 FCOMPP：比较 ST(0)/ST(1)，弹出两次。
         Float80 a = get(), b = get(1); compare(a, b, op == 0xda); pop(); pop(); return;
     }
     if (op == 0xdb && m >= 0xe0 && m <= 0xe4) {
+        // DB E2 FNCLEX 清异常、DB E3 FNINIT 初始化；旧式 ENI/DISI/SETPM 保留无操作行为。
         if (m == 0xe2) { status &= 0x7f00; updateError(); }
         else if (m == 0xe3) init();
         return;
     }
     if (op == 0xdd) {
+        // DD C0..C7 FFREE；D0..DF FST/FSTP ST(i)；E0..EF FUCOM/FUCOMP。
         if (reg == 0) { tags[(top + i) & 7] = 3; return; }
         if (reg == 2 || reg == 3) { set(i, get()); if (reg == 3) pop(); return; }
         if (reg == 4 || reg == 5) {
             Float80 a = get(), b = get(i); compare(a, b, true); if (reg == 5) pop(); return;
         }
     }
-    if (op == 0xdf && m == 0xe0) { c.ax(statusWord()); return; }
+    if (op == 0xdf && m == 0xe0) { c.ax(statusWord()); return; } // DF E0 FNSTSW AX。
     throw std::invalid_argument("Unsupported x87 register encoding");
 }
+
 void Fpu::transcendental(uint8_t m) {
+    // 均以前导 D9 编码：F0 F2XM1、F1 FYL2X、F2 FPTAN、F3 FPATAN、F4 FXTRACT、
+    // F5 FPREM1、F6 FDECSTP、F7 FINCSTP、F8 FPREM、F9 FYL2XP1、FA FSQRT、
+    // FB FSINCOS、FC FRNDINT、FD FSCALE、FE FSIN、FF FCOS。
     if (m == 0xf6 || m == 0xf7) { top = (top + (m == 0xf6 ? 7 : 1)) & 7; return; }
     Float80 a = get(); unsigned e = exponent(a); denormal(a);
     if (m == 0xfc) { set(0, result(calculateFloat(FloatOperation::RoundToInteger, a, {}, control), true)); return; }
@@ -355,7 +410,7 @@ void Fpu::transcendental(uint8_t m) {
     if (m == 0xf0) {
         if (e == 0x7fff) { raise(1); set(0, INDEFINITE); }
         else if (e <= 16383) set(0, result(exp2m1(a, control)));
-        else status |= 0x20; // Undefined outside [-1,1], as in the reference core.
+        else status |= 0x20; // 超出 [-1,1] 的结果未定义，保持与参考核心一致的行为。
         return;
     }
     if (e == 0x7fff) { raise(1); set(0, INDEFINITE); return; }
@@ -369,7 +424,9 @@ void Fpu::transcendental(uint8_t m) {
         set(0, result(calculateFloat(FloatOperation::Divide, sine.value, cosine.value, control | 0x300))); push(ONE80);
     } else throw std::invalid_argument("Unsupported x87 transcendental encoding");
 }
+
 void Fpu::remainder(Float80 a, Float80 b, bool nearest) {
+    // 指数差过大时只完成一次部分余数，C2=1 要求客体重复；完成后 C0/C3/C1 存商低三位。
     unsigned ae = exponent(a), be = exponent(b); denormal(b);
     if (nan(a) || nan(b)) { set(0, result(calculateFloat(FloatOperation::Add, a, b, control))); return; }
     if (ae == 0x7fff || (!b.significand && !be)) { raise(1); set(0, INDEFINITE); return; }
@@ -393,7 +450,9 @@ void Fpu::remainder(Float80 a, Float80 b, bool nearest) {
         status = uint16_t((status & ~CONDITIONS) | ((q & 4) << 6) | ((q & 2) << 13) | ((q & 1) << 9));
     }
 }
+
 std::vector<uint8_t> Fpu::environment(const FpuContext& c) const {
+    // FLDENV/FNSTENV 与 FSAVE/FRSTOR 的环境头为 14/28 字节；实模式和保护模式指针布局不同。
     std::vector<uint8_t> bytes(c.operand32 ? 28 : 14, 0xff);
     unsigned stride = c.operand32 ? 4 : 2;
     writeUnsigned(bytes, 0, control, 2); writeUnsigned(bytes, stride, statusWord(), 2); writeUnsigned(bytes, stride * 2, tagWord(), 2);
@@ -418,6 +477,7 @@ std::vector<uint8_t> Fpu::environment(const FpuContext& c) const {
     }
     return bytes;
 }
+
 void Fpu::loadEnvironment(const std::vector<uint8_t>& bytes, const FpuContext& c) {
     unsigned stride = c.operand32 ? 4 : 2;
     control = uint16_t(readUnsigned(bytes, 0, 2));
