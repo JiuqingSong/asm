@@ -8,6 +8,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <wincrypt.h>
+#include <winioctl.h>
 
 namespace asm86 {
 static std::atomic<uint64_t> nextDiskIdentity{0};
@@ -156,8 +157,8 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::file
     try {
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(file, &size)) throw osError("Cannot size disk image");
-    if (size.QuadPart <= 0 || size.QuadPart % 512 || size.QuadPart > 504LL * 1024 * 1024) {
-        throw std::runtime_error("Disk image must contain whole 512-byte sectors and be at most 504 MiB");
+    if (size.QuadPart <= 0 || size.QuadPart % 512 || uint64_t(size.QuadPart) > MaxHardBytes) {
+        throw std::runtime_error("Disk image must contain whole 512-byte sectors and be at most 32 GiB");
     }
     sectors = uint32_t(size.QuadPart / 512);
     if (floppy) {
@@ -174,9 +175,10 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::file
         }
     } else { heads = 16; spt = 63; }
     cylinders = int(sectors / unsigned(heads * spt));
-    if (!floppy && (cylinders < 1 || sectors % unsigned(heads * spt) || cylinders > 1024)) {
-        throw std::runtime_error("Hard disk image must use 16 heads, 63 sectors and 1..1024 complete cylinders");
+    if (!floppy && (cylinders < 1 || (size.QuadPart <= 504LL * 1024 * 1024 && sectors % unsigned(heads * spt)))) {
+        throw std::runtime_error("Hard disk images up to 504 MiB require complete 16-head/63-sector cylinders");
     }
+    if (!floppy) cylinders = std::min(cylinders, 16383);
     if (!overlay.empty()) openOverlay();
     } catch (...) {
         if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
@@ -229,14 +231,35 @@ Disk::~Disk() {
 }
 void Disk::create(const std::filesystem::path& p, unsigned cylinders) {
     if (cylinders < 1 || cylinders > 1024) throw std::runtime_error("Hard disk creation requires 1..1024 cylinders");
+    createBytes(p, uint64_t(cylinders) * 16 * 63 * 512);
+}
+void Disk::createBytes(const std::filesystem::path& p, uint64_t bytes) {
+    if (bytes < 16 * 63 * 512 || bytes > MaxHardBytes || bytes % 512 ||
+        (bytes <= 504ULL * 1024 * 1024 && bytes % (16 * 63 * 512)))
+        throw std::runtime_error("Invalid raw hard disk size (maximum 32 GiB; small disks require complete cylinders)");
     auto h = CreateFileW(p.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) throw osError("Cannot create new hard disk image (existing files are never overwritten)");
-    LARGE_INTEGER size{}; size.QuadPart = int64_t(cylinders) * 16 * 63 * 512;
+    if (bytes > 504ULL * 1024 * 1024) {
+        DWORD returned = 0;
+        if (!DeviceIoControl(h, FSCTL_SET_SPARSE, nullptr, 0, nullptr, 0, &returned, nullptr)) {
+            auto e = osError("Large disk creation requires a filesystem supporting sparse files"); CloseHandle(h); throw e;
+        }
+    }
+    LARGE_INTEGER size{}; size.QuadPart = int64_t(bytes);
     if (!SetFilePointerEx(h, size, nullptr, FILE_BEGIN) || !SetEndOfFile(h) || !FlushFileBuffers(h)) {
         auto e = osError("Cannot allocate hard disk image"); CloseHandle(h); throw e;
     }
     CloseHandle(h);
 }
+int Disk::biosHeads() const {
+    int result = heads;
+    if (heads == 16) {
+        while (result < 128 && sectors / unsigned(result * spt) > 1024) result *= 2;
+        if (sectors / unsigned(result * spt) > 1024) result = 255;
+    }
+    return result;
+}
+int Disk::biosCylinders() const { return std::min(1024, int(sectors / unsigned(biosHeads() * spt))); }
 bool Disk::transfer(uint32_t lba, uint8_t* data, bool writing) {
     if (lba >= sectors || (writing && readOnly)) return false;
     if (hasOverlay()) {
@@ -256,8 +279,14 @@ bool Disk::transfer(uint32_t lba, uint8_t* data, bool writing) {
     diskIo(file, uint64_t(lba) * 512, data, 512, writing);
     return true;
 }
-bool Disk::read(uint32_t lba, uint8_t* p) { return transfer(lba, p, false); }
-bool Disk::write(uint32_t lba, const uint8_t* p) { return transfer(lba, const_cast<uint8_t*>(p), true); }
+bool Disk::read(uint32_t lba, uint8_t* p) {
+    if (!transfer(lba, p, false)) return false;
+    ++readSectors; return true;
+}
+bool Disk::write(uint32_t lba, const uint8_t* p) {
+    if (!transfer(lba, const_cast<uint8_t*>(p), true)) return false;
+    ++writtenSectors; return true;
+}
 void Disk::flush() {
     if (!readOnly && !FlushFileBuffers(hasOverlay() ? overlayFile : file)) throw osError("Disk flush failed");
 }
@@ -385,7 +414,7 @@ void Pc::boot(uint8_t drive) {
     cpu.ww(0, 0x1e * 4, 0xefc7); cpu.ww(0, 0x1e * 4 + 2, 0xf000);
     if (hard) {
         cpu.ww(0, 0x41 * 4, 0xe401); cpu.ww(0, 0x41 * 4 + 2, 0xf000);
-        cpu.ww(0xf000, 0xe401, uint16_t(hard->cylinders)); cpu.wb(0xf000, 0xe403, uint8_t(hard->heads));
+        cpu.ww(0xf000, 0xe401, uint16_t(hard->biosCylinders())); cpu.wb(0xf000, 0xe403, uint8_t(hard->biosHeads()));
         cpu.wb(0xf000, 0xe40f, uint8_t(hard->spt));
     }
     const char date[] = "11/08/82";
@@ -853,7 +882,7 @@ bool Pc::disk() {
     if (ah == 1) { auto v = c.rbF(0x40, hd ? 0x74 : 0x41); status(v); return true; }
     if (ah == 8) {
         if (!d && drive != 0) { r[DX] = 0; status(1); return true; }
-        int cy = d ? d->cylinders - 1 : 79, heads = d ? d->heads : 2, spt = d ? d->spt : 18;
+        int cy = d ? d->biosCylinders() - 1 : 79, heads = d ? d->biosHeads() : 2, spt = d ? d->spt : 18;
         r[CX] = uint16_t(((cy & 255) << 8) | ((cy >> 2) & 0xc0) | spt);
         r[DX] = uint16_t(((heads - 1) << 8) | (hd ? (hard ? 1 : 0) : 1));
         if (!hd) { c.reg8(3, d ? uint8_t(d->floppyType) : 4); c.loadSegment(ES, 0xf000); r[DI] = 0xefc7; }
@@ -867,12 +896,64 @@ bool Pc::disk() {
     if (!d) { status(hd ? 1 : 0x80); return true; }
     if (ah == 0x16) { auto changed = d->changed; d->changed = false; status(changed ? 6 : 0); return true; }
     if (ah == 0x17 || ah == 0x18) { if (ah == 0x18) { c.loadSegment(ES, 0xf000); r[DI] = 0xefc7; } status(0); return true; }
-    if (ah == 0x41) { status(1); return true; }
+    if (ah == 0x41) {
+        if (!hd || r[BX] != 0x55aa) { status(1); return true; }
+        r[BX] = 0xaa55; r[CX] = 5; status(0); c.reg8(4, 0x21); return true;
+    }
+    if (hd && ah == 0x48) {
+        auto ds = c.s[DS], si = r[SI];
+        if (si > 0xffe6 || c.rwF(ds, si) < 26) { status(1); return true; }
+        std::array<uint8_t, 26> parameters{};
+        parameters[0] = 26;
+        auto heads = d->biosHeads(), cylinders = d->biosCylinders();
+        parameters[2] = uint64_t(heads) * cylinders * d->spt == d->sectors ? 2 : 0;
+        diskWord(parameters.data() + 4, unsigned(cylinders)); diskWord(parameters.data() + 8, unsigned(heads));
+        diskWord(parameters.data() + 12, unsigned(d->spt)); diskWord(parameters.data() + 16, d->sectors);
+        parameters[25] = 2;
+        for (unsigned i = 0; i < parameters.size(); ++i) c.wbF(ds, uint16_t(si + i), parameters[i]);
+        status(0); return true;
+    }
+    if (hd && (ah == 0x42 || ah == 0x43 || ah == 0x44 || ah == 0x47)) {
+        auto ds = c.s[DS], si = r[SI];
+        if (si > 0xfff0 || c.rbF(ds, si) != 16 || c.rbF(ds, uint16_t(si + 1))) { status(1); return true; }
+        auto count = c.rwF(ds, uint16_t(si + 2));
+        auto offset = c.rwF(ds, uint16_t(si + 4)), segment = c.rwF(ds, uint16_t(si + 6));
+        uint64_t lba = 0;
+        for (unsigned i = 0; i < 8; ++i) lba |= uint64_t(c.rbF(ds, uint16_t(si + 8 + i))) << (8 * i);
+        auto failure = [&](uint8_t code) { c.wwF(ds, uint16_t(si + 2), 0); status(code); return true; };
+        if (!count || count > 127 || (ah == 0x43 && c.reg8(0) > 1)) return failure(1);
+        if (lba >= d->sectors || count > d->sectors - lba) return failure(4);
+        if ((ah == 0x42 || ah == 0x43) && uint32_t(offset) + uint32_t(count) * 512 > 0x10000) return failure(9);
+        if (ah == 0x43 && d->readOnly) return failure(3);
+        if (ah == 0x47) { status(0); return true; }
+        std::vector<uint8_t> data(unsigned(count) * 512);
+        auto address = (uint32_t(segment) << 4) + offset;
+        if (ah == 0x43) {
+            for (unsigned i = 0; i < data.size(); ++i) data[i] = c.readLinear(address + i);
+        }
+        for (unsigned i = 0; i < count; ++i) {
+            bool ok = ah == 0x43 ? d->write(uint32_t(lba) + i, data.data() + i * 512)
+                : d->read(uint32_t(lba) + i, data.data() + i * 512);
+            if (!ok) { c.wwF(ds, uint16_t(si + 2), uint16_t(i)); status(4); return true; }
+        }
+        if (ah == 0x42) for (unsigned i = 0; i < data.size(); ++i) c.writeLinear(address + i, data[i]);
+        if (ah == 0x43) {
+            d->flush();
+            if (c.reg8(0) == 1) {
+                std::array<uint8_t, 512> verified{};
+                for (unsigned i = 0; i < count; ++i) {
+                    if (!d->read(uint32_t(lba) + i, verified.data()) ||
+                        !std::equal(verified.begin(), verified.end(), data.begin() + i * 512)) return failure(0x10);
+                }
+            }
+        }
+        status(0); return true;
+    }
     if (ah == 9 || ah == 0x0c || (ah >= 0x10 && ah <= 0x14)) { status(0); return true; }
     if (ah < 2 || ah > 5) { status(1); notice = "Unsupported INT 13h function " + std::to_string(ah); return true; }
-    if (cylinder >= d->cylinders || head >= d->heads || sector < 1 || sector > d->spt) { status(4); c.reg8(0, 0); return true; }
+    if (cylinder >= d->biosCylinders() || head >= d->biosHeads() || sector < 1 || sector > d->spt) { status(4); c.reg8(0, 0); return true; }
     unsigned count = ah == 5 ? unsigned(d->spt) : c.reg8(0);
-    uint32_t lba = unsigned((cylinder * d->heads + head) * d->spt + (ah == 5 ? 0 : sector - 1));
+    uint32_t lba = unsigned((cylinder * d->biosHeads() + head) * d->spt + (ah == 5 ? 0 : sector - 1));
     if (!count || lba + count > d->sectors) { status(4); c.reg8(0, 0); return true; }
     if ((ah == 3 || ah == 5) && d->readOnly) { status(3); c.reg8(0, 0); return true; }
     std::array<uint8_t, 512> buffer{};

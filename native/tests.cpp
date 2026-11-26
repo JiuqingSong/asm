@@ -342,6 +342,8 @@ void overlayTests(const std::filesystem::path& prefix) {
             if (writer != INVALID_HANDLE_VALUE) CloseHandle(writer);
             check(writer == INVALID_HANDLE_VALUE, "Overlay lifetime must deny writable host handles to the base");
             check(!source.write(7, bytes.data()) && !disk.write(disk.sectors, bytes.data()), "Read-only base and overlay bounds must be enforced");
+            check(disk.readSectors == 1 && disk.writtenSectors == 2 && source.readSectors == 1 && source.writtenSectors == 0,
+                "Disk activity counts must include successful guest sector I/O, not base hashing or rejected writes");
         }
         {
             Disk disk(base, false, false, overlay);
@@ -2013,6 +2015,20 @@ void pagedBiosTests(const std::filesystem::path& disk) {
     p.hard->read(1, sector.data());
     check(std::equal(sector.begin(), sector.end(), c.mem.begin() + 0x201fff),
         "Firmware disk writes must read the VM's data rather than same-address physical RAM");
+    c.r[SI] = 0x600; c.wwF(0, 0x600, 16); c.wwF(0, 0x602, 1);
+    c.wwF(0, 0x604, 0x1fff); c.wwF(0, 0x606, 0);
+    for (unsigned i = 0; i < 8; ++i) c.wbF(0, uint16_t(0x608 + i), 0);
+    c.r[AX] = 0x4200; p.hard->read(0, sector.data()); c.mem[0x1fff] = 0xdd;
+    check(c.trap(0x13) && !(c.readWord(0x203004) & CF) &&
+        std::equal(sector.begin(), sector.end(), c.mem.begin() + 0x201fff) && c.mem[0x1fff] == 0xdd,
+        "EDD packets, data buffers and status must follow VM86 paging instead of physical aliases");
+    c.wbF(0, 0x608, 2); c.r[AX] = 0x4300;
+    p.hard->read(2, sector.data()); c.writeDword(0x11008, 0);
+    bool writeFault = false;
+    try { c.trap(0x13); } catch (const CpuFault& f) { writeFault = f.vector == 14 && c.cr2 == 0x2000; }
+    std::array<uint8_t, 512> unchanged{}; p.hard->read(2, unchanged.data());
+    check(writeFault && unchanged == sector, "EDD must stage all guest source bytes before changing disk sectors");
+    c.writeDword(0x11008, 0x202007);
     c.mem[0x201fff] = 0x55; c.mem[0x202000] = 0x66; c.writeDword(0x11008, 0x202005);
     bool rejected = false;
     try { c.wwF(0x100, 0xfff, 0xabcd); }
@@ -2823,6 +2839,78 @@ void diskSizingTests(const std::filesystem::path& base) {
     } catch (...) { std::filesystem::remove(floppyPath); throw; }
     std::cout << "Floppy metadata footer / exact payload / inconsistent geometry rejection checks passed\n";
 }
+void extendedDiskTests(const std::filesystem::path& base) {
+    auto path = std::filesystem::path(base.native() + L".extended");
+    check(!std::filesystem::exists(path), "Extended disk fixture already exists");
+    try {
+        Disk::createBytes(path, Disk::MaxHardBytes);
+        {
+            Pc p; p.setModel(CpuModel::I486); p.hard = std::make_unique<Disk>(path, false, false);
+            auto& d = *p.hard; auto& c = p.cpu;
+            for (int seg : {CS, SS, DS, ES}) c.loadSegment(seg, 0);
+            c.r[SP] = 0x1000; c.r[SI] = 0x600; c.r[DX] = 0x80;
+            auto call = [&](uint16_t ax) {
+                c.r[AX] = ax; c.r[DX] = 0x80; c.ww(0, 0x1004, CF);
+                check(c.trap(0x13), "EDD BIOS trap must be handled");
+                return !(c.rw(0, 0x1004) & CF);
+            };
+            auto packet = [&](uint64_t lba, uint16_t count = 1, uint16_t offset = 0x2000) {
+                c.ww(0, 0x600, 16); c.ww(0, 0x602, count); c.ww(0, 0x604, offset); c.ww(0, 0x606, 0);
+                for (unsigned i = 0; i < 8; ++i) c.wb(0, uint16_t(0x608 + i), uint8_t(lba >> (i * 8)));
+            };
+            check(d.sectors == Disk::MaxHardBytes / 512 && d.biosHeads() == 255 && d.biosCylinders() == 1024,
+                "32 GiB capacity must not wrap and legacy translated CHS must remain representable");
+            c.r[BX] = 0x55aa;
+            check(call(0x4100) && c.r[BX] == 0xaa55 && c.reg8(4) == 0x21 && c.r[CX] == 5, "EDD installation signature and supported features");
+            c.r[BX] = 0; check(!call(0x4100), "EDD must reject an invalid installation signature");
+            c.ww(0, 0x600, 26);
+            check(call(0x4800) && c.rw(0, 0x600) == 26 && c.readDword(0x610) == d.sectors &&
+                c.readDword(0x614) == 0 && c.rw(0, 0x618) == 512, "EDD parameters must report full 64-bit sector capacity and sector size");
+            std::array<uint8_t, 512> sector{}; sector.fill(0xa7);
+            check(d.write(d.sectors - 1, sector.data()), "Seed high LBA sector");
+            packet(d.sectors - 1);
+            check(call(0x4200) && c.mem[0x2000] == 0xa7 && c.mem[0x21ff] == 0xa7, "EDD reads must reach the final sector beyond legacy CHS");
+            std::fill(c.mem.begin() + 0x2000, c.mem.begin() + 0x2400, 0x5c);
+            const uint32_t boundary = 1024 * 1008 - 1;
+            packet(boundary, 2);
+            check(call(0x4301) && c.rw(0, 0x602) == 2, "EDD verified multi-sector write must cross the former 504 MiB boundary");
+            check(d.read(boundary + 1, sector.data()) && sector[0] == 0x5c && sector[511] == 0x5c, "EDD boundary write must persist full sectors");
+            packet(d.sectors - 1, 2);
+            check(!call(0x4300) && c.reg8(4) == 4 && c.rw(0, 0x602) == 0, "EDD must reject a whole out-of-range request before writing any sector");
+            check(d.read(d.sectors - 1, sector.data()) && sector[0] == 0xa7, "Rejected EDD writes must not partially modify disk data");
+            packet(uint64_t(1) << 32);
+            check(!call(0x4200) && c.reg8(4) == 4, "EDD must reject high 64-bit LBAs instead of truncating them");
+            packet(0, 2, 0xff00);
+            check(!call(0x4200) && c.reg8(4) == 9, "EDD must reject transfers crossing a 64 KiB buffer boundary");
+            packet(0, 128); check(!call(0x4200) && c.reg8(4) == 1, "EDD packet count is limited to 1..127");
+            packet(0); c.wb(0, 0x600, 24); check(!call(0x4200), "EDD flat-address packets are not advertised or accepted");
+            packet(0); c.wb(0, 0x601, 1); check(!call(0x4200), "EDD packet reserved byte must be zero");
+            packet(boundary, 2); check(call(0x4400), "EDD verify must read the addressed sectors");
+            packet(d.sectors - 1); check(call(0x4700), "EDD seek must validate the addressed sector");
+            c.out(0x3f6, 2); c.out(0x1f6, 0xe0); c.out(0x1f7, 0xec); p.advanceClock(p.clock + 120);
+            std::array<uint16_t, 256> identity{};
+            for (auto& word : identity) word = uint16_t(c.inputPort(0x1f0, 2));
+            check((identity[60] | uint32_t(identity[61]) << 16) == d.sectors && identity[1] == 16383,
+                "ATA IDENTIFY must retain full LBA capacity while capping legacy cylinder geometry");
+            auto address = [&](uint32_t lba, uint8_t count) {
+                c.out(0x1f6, uint8_t(0xe0 | (lba >> 24))); c.out(0x1f2, count); c.out(0x1f3, uint8_t(lba));
+                c.out(0x1f4, uint8_t(lba >> 8)); c.out(0x1f5, uint8_t(lba >> 16));
+            };
+            address(d.sectors - 1, 1); c.out(0x1f7, 0x20); p.advanceClock(p.clock + 120);
+            check(c.in(0x3f6) == 0x58, "High-nibble LBA28 read must request data");
+            for (unsigned i = 0; i < 256; ++i) check(c.inputPort(0x1f0, 2) == 0xa7a7, "ATA LBA28 high device bits must address the final 32 GiB sector");
+            address(d.sectors - 1, 2); c.out(0x1f7, 0x30); p.advanceClock(p.clock + 120);
+            check((c.in(0x3f6) & 1) && c.in(0x1f1) == 0x10, "ATA must reject a write crossing the end before requesting data");
+            d.flush(); p.hard.reset(); p.hard = std::make_unique<Disk>(path, false, true);
+            packet(0); check(!call(0x4300) && c.reg8(4) == 3, "EDD must preserve write protection");
+        }
+        std::filesystem::remove(path);
+        bool rejected = false;
+        try { Disk::createBytes(path, Disk::MaxHardBytes + 512); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected && !std::filesystem::exists(path), "Oversized disks must be rejected before creating a host file");
+    } catch (...) { std::filesystem::remove(path); throw; }
+    std::cout << "32 GiB sparse disks / translated CHS / EDD parameters-read-write-verify-seek / invalid DAP / high LBA28 / bounds checks passed\n";
+}
 void mbrBootstrapTests(const std::filesystem::path& base) {
     auto path = std::filesystem::path(base.native() + L".mbr");
     check(!std::filesystem::exists(path), "MBR fixture already exists");
@@ -2916,7 +3004,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

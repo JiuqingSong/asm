@@ -26,6 +26,10 @@ public:
     Disk(const Disk&) = delete;
     Disk& operator=(const Disk&) = delete;
     static void create(const std::filesystem::path& path, unsigned cylinders = 64);
+    static constexpr uint64_t MaxHardBytes = 32ULL * 1024 * 1024 * 1024;
+    static void createBytes(const std::filesystem::path& path, uint64_t bytes);
+    int biosHeads() const;
+    int biosCylinders() const;
     bool read(uint32_t lba, uint8_t* data);
     bool write(uint32_t lba, const uint8_t* data);
     void flush();
@@ -35,6 +39,7 @@ public:
     uint32_t sectors = 0;
     int cylinders = 0, heads = 0, spt = 0, floppyType = 0;
     bool readOnly = false, changed = true;
+    uint64_t readSectors = 0, writtenSectors = 0;
     std::filesystem::path path;
     const uint64_t identity;
 private:
