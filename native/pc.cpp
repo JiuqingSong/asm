@@ -707,6 +707,7 @@ bool Pc::video() {
     }
     case 0x1a: c.reg8(0, 0x1a); r[BX] = 8; return true;
     case 0x1b: c.reg8(0, 0); return true;
+    case 0x4f: r[AX] = 0x014f; return true; // VBE/SVGA extensions, including monitor DDC, are unavailable.
     case 0x6f: r[BX] = 0; return true; // Video Seven extensions are absent.
     case 0xef: return true; // No MSHERC hook; preserve the caller's non-Hercules sentinel.
     case 0xfa:

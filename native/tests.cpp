@@ -1286,6 +1286,19 @@ void videoFirmwareTests(const std::filesystem::path& disk) {
         p.key(0x1e, 'a');
         check(c.irq() == 9, "Masking an unowned serial interrupt must leave keyboard IRQ1 deliverable");
         c.in(0x60); c.out(0x20, 0x20); p.serialMouse.reset();
+        for (uint16_t subfunction : {0, 1}) {
+            c.halted = false; c.ip = 0x500; c.mem[0x501] = 0x10;
+            c.loadSegment(ES, 0x4321); c.r[DI] = 0x200;
+            c.r[AX] = 0x4f15; c.r[BX] = subfunction; c.r[CX] = c.r[DX] = 0;
+            c.setFlags(CF | DF | 2);
+            std::fill(c.mem.begin() + 0x43410, c.mem.begin() + 0x43490, 0x5a);
+            auto expected = c.r; expected[AX] = 0x014f; auto flags = c.flags;
+            p.runCpu(100);
+            check(c.halted && c.r == expected && c.flags == flags && c.s[ES] == 0x4321,
+                "VBE DDC capability and EDID probes must return failure without altering caller state");
+            check(std::all_of(c.mem.begin() + 0x43410, c.mem.begin() + 0x43490, [](uint8_t b) { return b == 0x5a; }),
+                "Unavailable DDC must not fabricate or overwrite monitor EDID data");
+        }
         for (uint16_t mode : {0x12, 0x93, 3}) {
             c.halted = false;
             c.loadSegment(CS, 0); c.loadSegment(SS, 0);
