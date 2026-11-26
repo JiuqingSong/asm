@@ -481,6 +481,44 @@ void preferenceTests() {
 
 void timingTests() {
     // 同时观察 CPU 步数和 PIT/RTC/UART 客体时间；暂停/切档/HLT 唤醒不应累计补跑或时间漂移。
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
+        Pc p; p.setModel(model);
+        auto& c = p.cpu;
+        auto counter = [&](unsigned channel) {
+            auto low = c.in(uint16_t(0x40 + channel));
+            auto high = c.in(uint16_t(0x40 + channel));
+            return uint16_t(low | (uint16_t(high) << 8));
+        };
+        for (unsigned period : {1000u, 65536u}) for (unsigned channel = 0; channel < 3; ++channel) {
+            p.advanceClock(p.clock + 137.25);
+            c.out(0x43, uint8_t((channel << 6) | 0x34));
+            c.out(uint16_t(0x40 + channel), uint8_t(period));
+            c.out(uint16_t(0x40 + channel), uint8_t(period >> 8));
+            auto loadedAt = p.clock;
+            check(counter(channel) == uint16_t(period), "Loading a PIT count must start its read phase at the load time");
+            p.advanceClock(loadedAt + 37);
+            c.out(0x43, uint8_t(channel << 6));
+            p.advanceClock(loadedAt + 50);
+            check(counter(channel) == uint16_t(period - 37), "A PIT latch must retain the count at the latch time");
+            check(counter(channel) == uint16_t(period - 50), "Live PIT reads must resume after consuming the latched pair");
+            p.advanceClock(loadedAt + period - 1);
+            check(counter(channel) == 1, "A reloaded PIT count must reach one just before its own period boundary");
+            p.advanceClock(loadedAt + period);
+            check(counter(channel) == uint16_t(period), "A periodic PIT count must wrap at its load-relative boundary");
+        }
+    }
+    {
+        Pc p; p.setModel(CpuModel::I486);
+        auto& c = p.cpu;
+        c.out(0x21, 0xfe); p.advanceClock(137.25);
+        c.out(0x43, 0x34); c.out(0x40, 0xe8); c.out(0x40, 3);
+        p.advanceClock(1136.25);
+        check(c.irq() < 0, "IRQ0 must not arrive before the reloaded PIT period");
+        p.advanceClock(1137.25);
+        auto low = c.in(0x40); auto high = c.in(0x40);
+        check(c.irq() == 8 && uint16_t(low | (uint16_t(high) << 8)) == 1000,
+            "PIT counter wrap and IRQ0 must share the same reload phase");
+    }
     for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) for (bool full : {false, true}) {
         Pc p; p.setModel(model);
         auto& c = p.cpu;
@@ -1596,6 +1634,26 @@ void atTests(CpuModel model) {
         "VCPI installation checks must report no provider instead of stopping Windows Setup or advertising a version");
     c.r[BX] = 0x510; c.mem[0x510] = 0x7f; c.r[AX] = 0;
     check(c.trap(0x5c) && c.r[AX] == 0, "An absent NetBIOS provider must not answer its presence probe");
+    {
+        auto savedRegisters = c.r;
+        auto savedEs = c.s[ES];
+        c.loadSegment(ES, 0x29ab);
+        c.r[BX] = 0xc3;
+        constexpr uint32_t address = 0x29ab0 + 0xc3;
+        for (uint8_t command : {0x00, 0x33, 0xb3}) {
+            std::array<uint8_t, 64> ncb{};
+            ncb.fill(0xa5); ncb[0] = command;
+            std::copy(ncb.begin(), ncb.end(), c.mem.begin() + address);
+            c.r[AX] = command == 0x33 ? 0 : 0x1200;
+            auto expected = c.r; expected[AX] |= 0xfb;
+            auto segments = c.s; auto flags = c.eflags();
+            check(c.trap(0x5c) && c.r == expected && c.s == segments && c.eflags() == flags
+                && std::equal(ncb.begin(), ncb.end(), c.mem.begin() + address),
+                "NetBIOS requests without a provider must return AL=FBh, preserve AH/state/NCB and never claim success");
+        }
+        c.r = savedRegisters;
+        c.loadSegment(ES, savedEs);
+    }
     c.r[AX] = 0x8700; c.r[SI] = 0x600; c.r[CX] = 2;
     c.writeWord(0x610, 3); c.writeWord(0x612, 0x10); c.mem[0x614] = 0x10;
     c.writeWord(0x618, 3); c.writeWord(0x61a, 0x10); c.mem[0x61c] = 0x11;

@@ -100,11 +100,13 @@ private:
     uint16_t keyboardLatch = 0;
     bool keyboardRead = false;
     std::array<uint16_t, 3> reload{0, 0, 0};
+    std::array<double, 3> pitStart{};
     std::array<uint16_t, 3> latch{};
     std::array<uint8_t, 3> access{3, 3, 3}, pitMode{3, 3, 3};
     std::array<bool, 3> writeHigh{}, readHigh{}, latched{};
     uint8_t port61 = 0, crtcIndex = 0;
     double nextTimer = 65536;
+    uint16_t pitCounter(unsigned channel) const;
     uint8_t input(uint16_t port);
     void output(uint16_t port, uint8_t value);
     int acknowledge();

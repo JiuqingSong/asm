@@ -459,7 +459,7 @@ void Pc::boot(uint8_t drive) {
     apmConnected = false; apmEnabled = apmEngaged = true; apmVersion = 0x0100;
     instructions = 0; clock = 0; notice.clear(); keys.clear();
     resetAt();
-    reload.fill(0); access.fill(3); pitMode.fill(3); writeHigh.fill(false); readHigh.fill(false); latched.fill(false);
+    reload.fill(0); pitStart.fill(0); access.fill(3); pitMode.fill(3); writeHigh.fill(false); readHigh.fill(false); latched.fill(false);
     port61 = crtcIndex = 0; nextTimer = 65536;
     for (unsigned n = 0; n < 256; ++n) {
         uint16_t off = uint16_t(0x1000 + n * 8);
@@ -613,6 +613,12 @@ int Pc::acknowledge() {
     return pic[0].base + line;
 }
 
+uint16_t Pc::pitCounter(unsigned channel) const {
+    auto period = reload[channel] ? unsigned(reload[channel]) : 65536u;
+    // 读值与 IRQ 必须共用装载时刻，否则 Windows 高精度计时会在回绕附近倒退或停顿。
+    return uint16_t(period - uint64_t(clock - pitStart[channel]) % period);
+}
+
 uint8_t Pc::input(uint16_t p) {
     if (FloppyController::owns(p)) return fdc.input(p, clock);
     if ((at() || p < 0xc0) && DmaController::owns(p)) return dma.input(p);
@@ -626,7 +632,7 @@ uint8_t Pc::input(uint16_t p) {
     if (at() && p == 0x92) return fastA20;
     if (p >= 0x40 && p <= 0x42) {
         unsigned ch = p - 0x40;
-        uint16_t value = latched[ch] ? latch[ch] : uint16_t((reload[ch] ? reload[ch] : 65536) - uint64_t(clock) % (reload[ch] ? reload[ch] : 65536));
+        uint16_t value = latched[ch] ? latch[ch] : pitCounter(ch);
         uint8_t result = uint8_t(value >> ((access[ch] == 2 || (access[ch] == 3 && readHigh[ch])) ? 8 : 0));
         if (access[ch] == 3) { readHigh[ch] = !readHigh[ch]; if (!readHigh[ch]) latched[ch] = false; }
         else latched[ch] = false;
@@ -675,7 +681,7 @@ void Pc::output(uint16_t p, uint8_t v) {
         unsigned ch = v >> 6; if (ch == 3) return;
         unsigned mode = (v >> 4) & 3;
         if (!mode) {
-            latch[ch] = uint16_t((reload[ch] ? reload[ch] : 65536) - uint64_t(clock) % (reload[ch] ? reload[ch] : 65536));
+            latch[ch] = pitCounter(ch);
             latched[ch] = true; readHigh[ch] = false;
         } else { access[ch] = uint8_t(mode); pitMode[ch] = (v >> 1) & 7; writeHigh[ch] = readHigh[ch] = false; }
     } else if (p >= 0x40 && p <= 0x42) {
@@ -686,7 +692,10 @@ void Pc::output(uint16_t p, uint8_t v) {
             reload[ch] = writeHigh[ch] ? uint16_t((reload[ch] & 255) | (uint16_t(v) << 8)) : uint16_t((reload[ch] & 0xff00) | v);
             writeHigh[ch] = !writeHigh[ch];
         }
-        if (ch == 0 && (access[ch] != 3 || !writeHigh[ch])) nextTimer = clock + (reload[ch] ? reload[ch] : 65536);
+        if (access[ch] != 3 || !writeHigh[ch]) {
+            pitStart[ch] = clock;
+            if (ch == 0) nextTimer = clock + (reload[ch] ? reload[ch] : 65536);
+        }
     } else if (p == 0x61) port61 = v;
     else if (p == 0x3d4 || p == 0x3b4) crtcIndex = v;
     else if (p == 0x3d5 || p == 0x3b5) {
@@ -1199,7 +1208,12 @@ bool Pc::bios(uint8_t n) {
     if (r[AX] == 0x6f00 && (n == 0x14 || n == 0x16 || n == 0x17)) return true;
     if (n == 0x68 && ah == 0x43) return true; // 没有返回 F386h 签名的驻留扩展器。
     if (n == 0x67 && r[AX] == 0xde00) { c.reg8(4, 0x84); return true; } // 未安装 VCPI 提供者。
-    if (n == 0x5c && c.rbF(c.s[ES], r[BX]) == 0x7f) return true; // NetBIOS 安装探测：保持“无提供者”。
+    if (n == 0x5c) {
+        // 7Fh 是 BWNB 安装探测：未安装时不改其哨兵。其它请求返回 FBh（NetBIOS emulator not found）。
+        // 没有驻留提供者接收 NCB，不改控制块、不排队或调用异步完成回调，更不能返回成功。
+        if (c.rbF(c.s[ES], r[BX]) != 0x7f) c.reg8(0, 0xfb);
+        return true;
+    }
     switch (n) {
     case 8: {
         // IRQ0 累加 BDA 0040:006C 的双字 tick；一天 1800B0h tick，溢出累加午夜计数。
