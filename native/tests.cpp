@@ -1758,6 +1758,21 @@ void atTests(CpuModel model) {
     Pc p; p.setModel(model); auto& c = p.cpu;
     c.loadSegment(CS, 0); c.ip = 0x500; c.mem[0x500] = 0xf4;
     c.r[SP] = 0x1000;
+    {
+        auto decodeBcd = [](uint8_t value) { return (value >> 4) * 10 + (value & 15); };
+        c.r[AX] = 0x0400;
+        check(c.trap(0x1a), "BIOS calendar must be available for the AT RTC century regression");
+        const auto year = decodeBcd(c.reg8(5)) * 100 + decodeBcd(c.reg8(1));
+        auto readCmos = [&](uint8_t index) { c.out(0x70, index); return c.in(0x71); };
+        for (bool binary : {false, true}) {
+            c.out(0x70, 11); c.out(0x71, binary ? 6 : 2);
+            auto decode = [&](uint8_t value) { return binary ? int(value) : decodeBcd(value); };
+            check(decode(readCmos(0x37)) * 100 + decode(readCmos(9)) == year
+                && readCmos(0x37) == readCmos(0x32),
+                "NT's CMOS 37h century must produce the same full year as BIOS and CMOS 32h in BCD and binary modes");
+        }
+        c.out(0x70, 11); c.out(0x71, 2);
+    }
     for (auto number : {0x14, 0x16, 0x17}) {
         c.r[AX] = 0x6f00; c.r[BX] = 0;
         check(c.trap(uint8_t(number)) && c.r[BX] == 0 && c.r[AX] == 0x6f00, "HP-HIL probes must not advertise a nonexistent mouse interface");

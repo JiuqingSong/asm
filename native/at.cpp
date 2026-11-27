@@ -124,7 +124,7 @@ uint8_t Pc::cmosRead() {
     case 7: return encode(t.tm_mday);
     case 8: return encode(t.tm_mon + 1);
     case 9: return encode((t.tm_year + 1900) % 100);
-    case 0x32: return encode((t.tm_year + 1900) / 100);
+    case 0x32: case 0x37: return encode((t.tm_year + 1900) / 100);
     case 12: { auto value = cmos[12]; cmos[12] = 0; return value; }
     default: return cmos[cmosIndex];
     }
