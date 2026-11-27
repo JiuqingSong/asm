@@ -2,6 +2,7 @@
 #include "display.h"
 #include "preferences.h"
 #include "timing.h"
+#include "audio.h"
 #include <commdlg.h>
 #include <shellapi.h>
 #include <windowsx.h>
@@ -19,6 +20,7 @@ using namespace asm86;
 namespace {
 enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768, BootCd };
 std::unique_ptr<Pc> pc;
+AudioOutput audioOutput;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
 bool running = false;
@@ -76,6 +78,10 @@ void title(HWND hwnd) {
     if (pc->hard && pc->hard->hasOverlay()) value += L" | Overlay: " + pc->hard->overlayPath().filename().wstring();
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
     if (pc->vga.cirrus()) value += L" | PCI Cirrus GD5446";
+    if (pc->sound.enabled) value += L" | SB2 PCM A220 I5 D1";
+    if (pc->sound.enabled && audioOutput.dropped) value += L" | Audio dropped: " + std::to_wstring(audioOutput.dropped);
+    if (pc->sound.enabled && pc->sound.unsupportedCommands)
+        value += L" | Unsupported SB commands: " + std::to_wstring(pc->sound.unsupportedCommands);
     value += L" | RAM: " + std::to_wstring(pc->cpu.mem.size() >> 20) + L" MiB";
     value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 && stableTiming ? L" | Normal speed (486 ~32 MIPS virtual)"
         : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
@@ -253,6 +259,7 @@ void execute(HWND hwnd) {
     bool hadDisc = pc->cdrom.medium() != nullptr;
     executionTiming.run(*pc, fullSpeed, std::chrono::milliseconds(8), stableTiming);
     if (pc->powerOffRequested) {
+        audioOutput.clear();
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
         if (pc->hard) pc->hard->flush();
         poweredOn = running = paused = false; resetStats();
@@ -330,6 +337,7 @@ void command(HWND hwnd, int id) {
         // 暂停不丢 RAM；恢复重置宿主计时基准，避免把暂停时间变成一大段客体补跑。
         if (!poweredOn || (!running && !paused)) break;
         if (running) {
+            audioOutput.clear();
             releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
             running = false; paused = true;
         } else {
@@ -338,6 +346,7 @@ void command(HWND hwnd, int id) {
         resetStats(); break;
     case Reset:
         if (poweredOn && !confirmChange(hwnd, L"Force power off?\nUnsaved guest data may be lost. Prefer shutting down within Windows.")) break;
+        audioOutput.clear();
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
         poweredOn = running = paused = false; resetStats(); if (pc->hard) pc->hard->flush(); break;
     case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
@@ -455,11 +464,14 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         }
         case WM_CLOSE:
             if (poweredOn && !confirmChange(hwnd, L"Close while the machine is powered on?\nThis forces power off and may lose guest data.")) return 0;
+            audioOutput.clear();
             releaseMouse(hwnd); releaseKeyboard(); poweredOn = running = paused = false;
             if (pc->hard) pc->hard->flush(); DestroyWindow(hwnd); return 0;
         case WM_DESTROY: KillTimer(hwnd, 1); PostQuitMessage(0); return 0;
         }
     } catch (const std::exception& e) {
+        try { audioOutput.clear(); }
+        catch (const std::exception& audioError) { std::cerr << audioError.what() << '\n'; }
         releaseMouse(hwnd); running = paused = false; resetStats(); title(hwnd);
         MessageBoxW(hwnd, wide(e.what()).c_str(), L"Asm86 - machine stopped", MB_OK | MB_ICONERROR); return 0;
     }
@@ -807,6 +819,10 @@ int application(int argc, wchar_t** argv) {
             pc->setCirrus(value == L"cirrus");
             defaultVideo = false;
         }
+        else if (option == L"--sound") {
+            if (value != L"off" && value != L"sb2") throw std::runtime_error("--sound must be off or sb2");
+            pc->sound.enabled = value == L"sb2";
+        }
         else if (option == L"--memory") {
             if (value != L"16" && value != L"32" && value != L"64" && value != L"128" && value != L"256")
                 throw std::runtime_error("--memory must be 16, 32, 64, 128 or 256 MiB");
@@ -816,6 +832,11 @@ int application(int argc, wchar_t** argv) {
             pc->bootDrive = selectedBootDrive(value.wstring()); start = true;
         } else if (option == L"--headless") script = value;
         else throw std::runtime_error("Unknown command-line option");
+    }
+    if (pc->sound.enabled) {
+        audioOutput.open();
+        pc->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
+        pc->sound.clearOutput = [] { audioOutput.clear(); };
     }
     if (hardSpecified) pc->hard = std::make_unique<Disk>(hardPath, false, false, overlayPath);
     if (discardOverlay) {

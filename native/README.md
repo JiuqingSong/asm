@@ -32,6 +32,42 @@ Windows 95 已完成真实安装，验证窗口/全屏 DOS 命令、`EXIT` 返�
 Windows 95 OSR2 完整安装由用户确认。Windows 9x 支持仍属实验性，不代表所有驱动或应用兼容。
 Windows 98 的完整安装、重新启动及安装后基本操作也已由用户验证。
 
+## 可选 ISA Sound Blaster PCM（首版）
+
+默认**关闭**，不改变现有 Windows/NT 客体的硬件探测。启动时用
+`.\native\run.ps1 -Sound sb2 -NormalSpeed`，或
+`.\native\build\asm86-native.exe --sound sb2 --normal-speed` 启用；
+`--sound off` 关闭。此选项不保存到用户设置。DOS 软件选择 **Sound Blaster / 8-bit mono**，
+固定资源 **220h、IRQ5、DMA1**，可在 DOS 中设置 `SET BLASTER=A220 I5 D1 T3`。
+`T3` 表示 Sound Blaster 2.0，**不是** SB Pro/SB16。
+
+`sound.cpp` 实现 DSP 2.01 复位/识别、`40h` 时间常数、`14h` 单周期、
+`48h` + `1Ch` 自动初始化 PCM、`D0h/D4h` 暂停/继续、
+`DAh` 当前块结束退出自动初始化、扬声器开关、IRQ 测试及 `22Eh` 确认。
+播放使用真实 8237 DMA1 内存总线、地址/计数/屏蔽及自动重载，不绕过 DMA 直接读取缓冲。
+DSP 块长度与 DMA 长度各自独立；屏蔽或方向错误的 DMA 等待，不伪造完成中断。
+支持无符号 **8 位单声道 PCM**，时间常数采样率约 **4–22 kHz**
+（允许量化后的实际速率至 23 kHz）。客体 PIT 时钟驱动采样和 IRQ，
+重采样为 48 kHz / 16 位单声道，通过 Windows `waveOut` 真正输出。
+宿主输出采用最多 16 个 10ms 缓冲；队列满则丢弃新音频、不阻塞客体，
+标题栏显示丢帧数。请使用正常速度；全速/无界面快速执行可能溢出，
+暂停、复位、关机清除宿主队列。宿主音频 API 失败会明确报错，不静默成功；
+不支持的 DSP 命令计数也显示在标题栏。
+
+**限制：** 不支持 OPL/FM、MIDI/MPU、录音、ADPCM、直接 DAC、
+高速度 `90h/91h`、SB Pro 立体声、SB16 16 位 DMA、混音器、PnP 或可配置资源。
+不宣称 Windows 音频驱动兼容；未用已安装的 DOS/Windows 声卡驱动验证。
+本次验证包括 CPU 真正执行 8088 `OUT` 指令，编程 DMA/DSP 后 `HLT`，
+产生约 0.75 秒的 440 Hz PCM 并完成 Windows 输出；不需要任何 OS 磁盘。
+这是提交到音频驱动并完成缓冲的验证，不是麦克风回录或人工听感证明。
+
+```powershell
+.\native\build\native-tests.exe --test-sound # 无宿主音频设备要求，亦纳入完整测试
+.\native\build\native-tests.exe --test-audio # 需要 Windows 音频设备，会播放短音
+```
+
+`sound.h/.cpp` 是独立 DSP/PCM 状态机，`audio.h/.cpp` 是有界 Windows 输出队列。
+
 ## 源码阅读
 
 自有 C++ 源码中的中文注释说明 CPU 指令编码、保护/分页规则、BIOS 固件、设备协议及测试意图。

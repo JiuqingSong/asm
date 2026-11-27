@@ -7,6 +7,7 @@
 #include "atapi.h"
 #include "dma.h"
 #include "fdc.h"
+#include "sound.h"
 #include <ctime>
 #include <filesystem>
 #include <memory>
@@ -70,6 +71,7 @@ public:
     AtapiCdrom cdrom;
     DmaController dma;
     FloppyController fdc;
+    SoundBlaster sound;
     std::unique_ptr<Disk> floppy, hard;
     uint64_t instructions = 0;
     double clock = 0;

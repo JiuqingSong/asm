@@ -707,6 +707,11 @@ void Disk::flush() {
 }
 
 Pc::Pc() {
+    sound.dma = [this](uint8_t* data, unsigned length) { return dma.transfer(1, data, length, DmaDirection::FromMemory); };
+    sound.interrupt = [this](bool raised) {
+        if (raised) pic[0].raise(5);
+        else pic[0].pending &= uint8_t(~0x20);
+    };
     fdc.disk = [this]() { return floppyDisk(); };
     fdc.interrupt = [this](bool raised) {
         if (raised) pic[0].raise(6);
@@ -1147,6 +1152,7 @@ void Pc::advanceClock(double target) {
     if (at() && clock >= ide.nextEvent) ide.advance(clock);
     if (at() && clock >= cdrom.nextEvent) cdrom.advance(clock);
     if (clock >= fdc.nextEvent) fdc.advance(clock);
+    if (clock >= sound.nextEvent()) sound.advance(clock);
 }
 
 int Pc::acknowledge() {
@@ -1169,6 +1175,7 @@ uint16_t Pc::pitCounter(unsigned channel) const {
 }
 
 uint8_t Pc::input(uint16_t p) {
+    if (sound.enabled && SoundBlaster::owns(p)) return sound.input(p, clock);
     if (vga.cirrus() && p >= 0xcf8 && p <= 0xcfb) return uint8_t(pciAddress >> ((p - 0xcf8) * 8));
     if (vga.cirrus() && p >= 0xcfc && p <= 0xcff)
         return (pciAddress & 0x80ffff00) == 0x80001000 ? pciRead((pciAddress & 0xfc) + p - 0xcfc) : 255;
@@ -1212,6 +1219,7 @@ uint8_t Pc::input(uint16_t p) {
 }
 
 void Pc::output(uint16_t p, uint8_t v) {
+    if (sound.enabled && SoundBlaster::owns(p)) { sound.output(p, v, clock); return; }
     if (vga.cirrus() && p >= 0xcf8 && p <= 0xcfb) {
         unsigned shift = (p - 0xcf8) * 8; pciAddress = (pciAddress & ~(255u << shift)) | (uint32_t(v) << shift); return;
     }

@@ -9,6 +9,7 @@ param(
     [switch]$RealTimeTiming,
     [string]$Overlay,
     [ValidateSet('vga', 'cirrus')][string]$Video,
+    [ValidateSet('off', 'sb2')][string]$Sound,
     [ValidateSet(16, 32, 64, 128, 256)][int]$Memory
 )
 $ErrorActionPreference = 'Stop'
@@ -20,6 +21,7 @@ $arguments = @()
 if ($Cpu) { $arguments += @('--cpu', $Cpu) }
 if ($Memory) { $arguments += @('--memory', $Memory) }
 if ($Video) { $arguments += @('--video', $Video) }
+if ($Sound) { $arguments += @('--sound', $Sound) }
 if ($HardDisk) {
     $arguments += @('--hard', ('"{0}"' -f (Resolve-Path -LiteralPath $HardDisk).Path))
 }
