@@ -437,6 +437,8 @@ void Snapshot::validate(const Pc& p) {
 }
 
 void Snapshot::save(Pc& pc, const std::filesystem::path& value) {
+    // TLB 不写入快照；保存时同时清空运行中的 TLB，使继续执行与恢复后的执行完全一致。
+    pc.cpu.flushTlb();
     auto path = std::filesystem::absolute(value);
     for (auto* disk : {pc.floppy.get(), pc.hard.get(), pc.cdFloppy.get()}) {
         if (!disk) continue;

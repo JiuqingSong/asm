@@ -263,10 +263,10 @@ void operandPagingTests() {
         check(c.readSegment(DS, 0x8001, size) == (size == 2 ? 0x6655u : 0x88776655u)
             && c.readDword(entry) == 0x30067 && c.mem[0x30000] == 0xa5 && c.mem[0x30005] == 0x5a,
             "Same-page stores must set dirty bits without changing neighboring bytes");
-        c.writeDword(entry, 0x40007); c.writeDword(0x40001, 0x12345678);
+        c.writeDword(entry, 0x40007); c.flushTlb(); c.writeDword(0x40001, 0x12345678); // 操作系统改页表后须 INVLPG。
         check(c.readSegment(DS, 0x8001, size) == (size == 2 ? 0x5678u : 0x12345678u),
-            "Operand translations must not survive direct guest page-table changes");
-        c.writeDword(entry, 0x40005);
+            "Operand translations must not survive page-table changes followed by a TLB flush");
+        c.writeDword(entry, 0x40005); c.flushTlb();
         bool denied = false;
         try { c.writeSegment(DS, 0x8001, 0, size); }
         catch (const CpuFault& f) { denied = f.vector == 14 && f.code == 7 && c.cr2 == 0x8001; }
@@ -278,7 +278,7 @@ void operandPagingTests() {
         c.mem[0x30ffe] = 0x11; c.mem[0x30fff] = 0x22; c.mem[0x50000] = 0x33; c.mem[0x50001] = 0x44;
         check(c.readSegment(DS, offset, size) == (size == 2 ? 0x3322u : 0x44332211u),
             "Cross-page operands must honor independently mapped, noncontiguous physical pages");
-        c.writeDword(entry + 4, 0);
+        c.writeDword(entry + 4, 0); c.flushTlb();
         denied = false;
         try { c.writeSegment(DS, offset, 0xaabbccdd, size); }
         catch (const CpuFault& f) { denied = f.vector == 14 && f.code == 6 && c.cr2 == 0x9000; }
@@ -1055,7 +1055,7 @@ void cpu386Tests(CpuModel model) {
         check(c.mem[0x100000] == 0x5a && c.readLinear(0x40000000) == 0x5a
             && (c.readDword(0x10400) & 0x20) && (c.readDword(0x12000) & 0x60) == 0x60,
             "386 page translation must use PDE/PTE mapping and set accessed/dirty bits");
-        c.cpl = 3; c.writeDword(0x12000, 0x100005);
+        c.cpl = 3; c.writeDword(0x12000, 0x100005); c.flushTlb();
         bool rejected = false;
         try { c.writeLinear(0x40000000, 0xa5); } catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 7 && c.cr2 == 0x40000000; }
         check(rejected && c.mem[0x100000] == 0x5a, "User writes to read-only pages must fault with CR2 and P/W/U error bits");
@@ -1113,6 +1113,33 @@ void cpu386Tests(CpuModel model) {
         for (unsigned i = 0; i < 1024; ++i) c.writeDword(0x20000 + i * 4, (i << 12) | 7);
         c.cr3 = 0x10000; c.msw |= 0x80000000u;
     };
+    for (bool invlpg : {true, false}) {
+        // TLB：改页表后在 INVLPG（仅 486）或 MOV CR3 之前仍使用旧翻译；执行后立即生效。
+        if (invlpg && model != CpuModel::I486) continue;
+        auto c = protectedMachine({0xf4}); paging(c); c.halted = false;
+        c.mem[0x30000] = 0x11; c.mem[0x40000] = 0x22;
+        check(c.readSegment(DS, 0x30000, 1) == 0x11, "TLB test identity mapping");
+        c.writeDword(0x20000 + 0x30 * 4, 0x40007);
+        check(c.readSegment(DS, 0x30000, 1) == 0x11, "A cached translation must survive page-table edits until the guest invalidates it");
+        const uint8_t invalidate[] = {0x0f, 0x01, 0x3b}, reload[] = {0x0f, 0x22, 0xd8}; // INVLPG [EBX] / MOV CR3,EAX
+        std::copy_n(invlpg ? invalidate : reload, 3, c.mem.begin() + 0x3000);
+        c.ip = 0x3000; c.r32(BX, 0x30000); c.r32(AX, 0x10000); c.step();
+        check(c.ip == 0x3003 && c.readSegment(DS, 0x30000, 1) == 0x22,
+            invlpg ? "INVLPG must drop the stale translation" : "MOV CR3 must flush every cached translation");
+    }
+    {
+        // 监督态访问填入的条目不能放宽用户态权限检查，用户态写入也必须重新检查 R/W。
+        auto c = protectedMachine({0xf4}); paging(c);
+        c.writeDword(0x20000 + 0x30 * 4, 0x30003); c.writeDword(0x20000 + 0x31 * 4, 0x31005);
+        c.mem[0x30000] = 0x77; c.mem[0x31000] = 0x66;
+        check(c.readLinear(0x30000) == 0x77 && c.readLinear(0x31000) == 0x66, "Supervisor reads through supervisor and read-only pages");
+        c.cpl = 3; bool denied = false, readOnly = false;
+        try { c.readLinear(0x30000); } catch (const CpuFault& f) { denied = f.vector == 14 && f.code == 5 && c.cr2 == 0x30000; }
+        check(c.readLinear(0x31000) == 0x66, "User read through a cached user read-only page");
+        try { c.writeLinear(0x31000, 1); } catch (const CpuFault& f) { readOnly = f.vector == 14 && f.code == 7 && c.cr2 == 0x31000; }
+        check(denied && readOnly && c.mem[0x31000] == 0x66,
+            "TLB entries must keep enforcing U/S and R/W for user accesses");
+    }
     for (uint8_t type : {uint8_t(14), uint8_t(15)}) {
         auto c = systemMachine(); gate(c, 0x8180, 0x123450, 8, uint8_t(0x80 | type));
         c.mem[0x123450] = 0xcf; c.setEflags(0x14202);
@@ -1171,7 +1198,7 @@ void cpu386Tests(CpuModel model) {
         check(c.cpl == 0 && c.ip == 0x12000 && c.r32(SP) == 0x1effec,
             "IDT, GDT and TSS reads and kernel stack writes must use supervisor linear translation");
         c.step(); check(c.cpl == 3 && c.ip == 0x4002, "Paged interrupt/IRETD must return to the user mapping");
-        c.writeDword(0x20020, 0);
+        c.writeDword(0x20020, 0); c.flushTlb();
         bool rejected = false;
         try { c.interrupt(0x30, -1, false, true); }
         catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 0 && c.cr2 == 0x8185; }
@@ -2551,13 +2578,13 @@ void pagedBiosTests(const std::filesystem::path& disk) {
         std::equal(sector.begin(), sector.end(), c.mem.begin() + 0x201fff) && c.mem[0x1fff] == 0xdd,
         "EDD packets, data buffers and status must follow VM86 paging instead of physical aliases");
     c.wbF(0, 0x608, 2); c.r[AX] = 0x4300;
-    p.hard->read(2, sector.data()); c.writeDword(0x11008, 0);
+    p.hard->read(2, sector.data()); c.writeDword(0x11008, 0); c.flushTlb();
     bool writeFault = false;
     try { c.trap(0x13); } catch (const CpuFault& f) { writeFault = f.vector == 14 && c.cr2 == 0x2000; }
     std::array<uint8_t, 512> unchanged{}; p.hard->read(2, unchanged.data());
     check(writeFault && unchanged == sector, "EDD must stage all guest source bytes before changing disk sectors");
-    c.writeDword(0x11008, 0x202007);
-    c.mem[0x201fff] = 0x55; c.mem[0x202000] = 0x66; c.writeDword(0x11008, 0x202005);
+    c.writeDword(0x11008, 0x202007); c.flushTlb();
+    c.mem[0x201fff] = 0x55; c.mem[0x202000] = 0x66; c.writeDword(0x11008, 0x202005); c.flushTlb();
     bool rejected = false;
     try { c.wwF(0x100, 0xfff, 0xabcd); }
     catch (const CpuFault& f) { rejected = f.vector == 14 && f.code == 7 && c.cr2 == 0x2000; }

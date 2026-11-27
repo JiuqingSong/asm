@@ -30,6 +30,25 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
     bool supervisor = false;
     if constexpr (!Operand) supervisor = access;
     const bool user = !supervisor && (cpl == 3 || virtual8086());
+
+    // TLB 命中且本次访问的权限、D 位都已满足时直接返回；其余情况走完整页表遍历，
+    // 由遍历产生精确的 #PF 并更新 A/D 位。外部直接改写 CR3/CR0 或 MMIO 窗口时整体失效。
+    // 设置了写观察器或只写 MMIO 时不使用 TLB：它们可能在一次访问中途改写页表。
+    if (cr3 != tlbCr3 || (msw & 0x80010000u) != tlbMsw || mmioStart != tlbMmioStart || mmioEnd != tlbMmioEnd) flushTlb();
+    const auto page = address >> 12;
+    auto& entry = tlb[page & (TlbEntries - 1)];
+    const bool cacheable = !onWrite && (!mmioWrite || mmioRead);
+    if (entry.page == page && cacheable) {
+        const unsigned bits = entry.bits;
+        bool allowed = !user || ((bits & 4) && (!write || (bits & 2)));
+        if (write && allowed) allowed = (bits & 0x40) &&
+            (user || model != CpuModel::I486 || !(msw & 0x10000) || (bits & 2));
+        if (allowed) {
+            if constexpr (Operand) *access = true;
+            return entry.frame | (address & 4095);
+        }
+    }
+
     auto missing = [&](bool present) {
         cr2 = address; fault(14, (present ? 1 : 0) | (write ? 2 : 0) | (user ? 4 : 0));
     };
@@ -50,7 +69,17 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
     if (!(pde & 0x20)) writeDword(directory, pde | 0x20);
     auto updated = pte | 0x20 | (write ? 0x40 : 0);
     if (updated != pte) writeDword(table, updated);
-    return (pte & 0xfffff000u) | (address & 4095);
+    // 只有完整通过权限检查的遍历才填入 TLB；产生 #PF 的访问不会留下条目。
+    // 页表或目标页位于 MMIO 时每次访问都重新遍历：MMIO 读取可能中途改写页表，必须立即生效。
+    const auto frame = pte & 0xfffff000u;
+    if (cacheable && physicalRam(directory, 4) && physicalRam(table, 4) && physicalRam(frame, 1))
+        entry = {page, frame, uint8_t((pde & pte & 6) | (updated & 0x40))};
+    return frame | (address & 4095);
+}
+
+void Cpu::flushTlb() {
+    for (auto& entry : tlb) entry.page = ~0u;
+    tlbCr3 = cr3; tlbMsw = msw & 0x80010000u; tlbMmioStart = mmioStart; tlbMmioEnd = mmioEnd;
 }
 
 uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
@@ -302,7 +331,7 @@ void Cpu::taskSwitch386(uint16_t selector, bool nested, bool returning) {
     tr = {selector, d.base, d.limit, uint8_t(d.access | 2)}; msw |= 8;
     ip = nextIp; setEflags(nextFlags | (nested ? 0x4000 : 0));
     for (unsigned i = 0; i < 8; ++i) r32(i, registers[i]);
-    s = selectors; cr3 = nextCr3 & 0xfffff000u;
+    s = selectors; cr3 = nextCr3 & 0xfffff000u; flushTlb();
     taskCommitted = true; startIp = ip; cpl = virtual8086() ? 3 : selectors[CS] & 3;
     debugRegisters[7] &= ~0x155u;
     try { loadLdt(nextLdt, 10); }
@@ -490,7 +519,7 @@ void Cpu::system386() {
         else {
             auto value = r32(rm);
             if (reg == 2) cr2 = value;
-            else if (reg == 3) cr3 = value & (model == CpuModel::I486 ? 0xfffff018u : 0xfffff000u);
+            else if (reg == 3) { cr3 = value & (model == CpuModel::I486 ? 0xfffff018u : 0xfffff000u); flushTlb(); }
             else {
                 setControl0(value);
             }
@@ -504,7 +533,7 @@ void Cpu::system386() {
         modrm();
         if (reg == 7 && model == CpuModel::I486 && mod != 3) {
             if (lockPrefix) fault(6);
-            requireRing0(); return;
+            requireRing0(); flushTlb(); return;
         }
         if (reg == 4) { setRM(mod == 3 ? size : 2, msw & 0xffff); return; }
         if (reg == 6) { requireRing0(); auto value = getRM(2); setControl0((msw & ~15u) | (value & 15) | (msw & 1)); return; }
@@ -797,5 +826,6 @@ void Cpu::setControl0(uint32_t value) {
         hiddenSegments = 0; cpl = 0;
     } else if ((msw & 1) && !(value & 1)) { hiddenSegments = 63; cpl = 0; }
     msw = (value & (model == CpuModel::I486 ? 0xe005002fu : 0x8000000fu)) | 0x10;
+    flushTlb();
 }
 }

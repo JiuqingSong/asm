@@ -12,6 +12,8 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <map>
+#include <algorithm>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -660,6 +662,32 @@ int headless(const std::filesystem::path& script) {
             std::cout << "Realtime " << speed << ": host="
                 << std::chrono::duration<double>(ExecutionTiming::HostClock::now() - started).count()
                 << "s guest=" << (pc->clock - beforeClock) / ExecutionTiming::PitHz << "s\n";
+        } else if (op == "profile") {
+            // 诊断：按宿主实时全速运行，统计端口读写（含值）、IRQ 向量，并每毫秒采样一次 EIP；结束后恢复原回调。
+            int milliseconds = std::stoi(arg);
+            std::map<unsigned, uint64_t> reads, writes, irqs; std::map<uint32_t, uint64_t> eips;
+            auto in = pc->cpu.in; auto out = pc->cpu.out; auto inWide = pc->cpu.inWide; auto outWide = pc->cpu.outWide; auto irq = pc->cpu.irq;
+            pc->cpu.in = [&](uint16_t p) { ++reads[p]; return in(p); };
+            pc->cpu.out = [&](uint16_t p, uint8_t v) { ++writes[p | (unsigned(v) << 16)]; out(p, v); };
+            pc->cpu.inWide = [&](uint16_t p, unsigned s) { if (p == 0x1f0 || p == 0x170) ++reads[p | 0x10000]; return inWide(p, s); };
+            pc->cpu.outWide = [&](uint16_t p, uint32_t v, unsigned s) { if (p == 0x1f0 || p == 0x170) ++writes[p | 0x1000000]; outWide(p, v, s); };
+            pc->cpu.irq = [&]() { int v = irq(); ++irqs[unsigned(v)]; return v; };
+            ExecutionTiming timing; timing.reset(*pc);
+            auto deadline = ExecutionTiming::HostClock::now() + std::chrono::milliseconds(milliseconds);
+            auto beforeClock = pc->clock; auto beforeSteps = pc->instructions;
+            while (ExecutionTiming::HostClock::now() < deadline) {
+                timing.run(*pc, true, std::chrono::milliseconds(1), stableTiming);
+                ++eips[pc->cpu.ip];
+            }
+            pc->cpu.in = in; pc->cpu.out = out; pc->cpu.inWide = inWide; pc->cpu.outWide = outWide; pc->cpu.irq = irq;
+            std::cout << std::dec << "profile guest=" << (pc->clock - beforeClock) / ExecutionTiming::PitHz << "s steps=" << pc->instructions - beforeSteps << std::hex << '\n';
+            for (auto [p, n] : reads) std::cout << " in " << p << " x" << std::dec << n << std::hex << '\n';
+            for (auto [p, n] : writes) std::cout << " out " << (p & 0xffff) << '=' << (p >> 16) << " x" << std::dec << n << std::hex << '\n';
+            for (auto [p, n] : irqs) std::cout << " irq " << p << " x" << std::dec << n << std::hex << '\n';
+            std::vector<std::pair<uint64_t, uint32_t>> top; for (auto [e, n] : eips) top.push_back({n, e});
+            std::sort(top.rbegin(), top.rend());
+            for (size_t i = 0; i < top.size() && i < 25; ++i) std::cout << " eip " << top[i].second << " x" << std::dec << top[i].first << std::hex << '\n';
+            std::cout << std::dec;
         } else if (op == "wait") {
             uint64_t count = 0;
             while (pc->text().find(arg) == std::string::npos && count < 1000000000) {

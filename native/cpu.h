@@ -55,6 +55,10 @@ public:
     std::function<uint8_t(uint32_t)> mmioRead;
     std::function<void(uint32_t, uint8_t)> mmioWrite;
 
+    // 分页 TLB：缓存线性页到物理页的翻译，不属于架构状态（快照不保存）。
+    // MOV CR3、CR0 写入、任务切换、INVLPG 和复位时清空；CR3/CR0 被外部直接改写时也自动清空。
+    void flushTlb();
+
     uint8_t rb(uint16_t seg, uint16_t off) const;
     uint16_t rw(uint16_t seg, uint16_t off) const;
     void wb(uint16_t seg, uint16_t off, uint8_t value);
@@ -114,6 +118,12 @@ private:
     std::array<uint32_t, 8> debugRegisters{};
     uint32_t upperFlags = 0;
     uint8_t hiddenSegments = 0;
+
+    // 直接映射 TLB。bits：PDE&PTE 的 U/S(4)、R/W(2)；0x40 表示 PTE 的 D 位已置。
+    struct TlbEntry { uint32_t page = ~0u, frame = 0; uint8_t bits = 0; };
+    static constexpr unsigned TlbEntries = 256;
+    std::array<TlbEntry, TlbEntries> tlb{};
+    uint32_t tlbCr3 = 0, tlbMsw = 0, tlbMmioStart = 0, tlbMmioEnd = 0;
 
     // 单条指令的译码暂存：ModR/M、有效地址、前缀、起始 IP 和默认操作数宽度。
     int mod = 0, reg = 0, rm = 0, eaSeg = DS, overrideSeg = -1;

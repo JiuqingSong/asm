@@ -818,6 +818,7 @@ void Pc::setCirrus(bool enabled) {
 }
 
 void Pc::mapPci() {
+    cpu.flushTlb(); // PCI 窗口移动后，原先指向普通 RAM 的 TLB 翻译可能落入 MMIO。
     cpu.pciWindows = {};
     if (vga.cirrus() && (pciCommand & 2)) {
         if (!(pciRomAddress & 1)) cpu.pciWindows[0] = {pciFramebuffer, uint64_t(pciFramebuffer) + 0x2000000};

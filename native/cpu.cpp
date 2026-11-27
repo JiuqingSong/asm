@@ -91,6 +91,7 @@ void Cpu::reset() {
     msw = supports386() ? 0x10 : 0xfff0; cr2 = cr3 = upperFlags = 0;
     upperR.fill(0); cpl = 0; hiddenSegments = 0;
     if (model == CpuModel::I486) { msw = 0x60000010; r[DX] = 0x400; }
+    flushTlb();
     fpuIrqInhibited = false;
     fpu.init();
     updateFpuIrq();
