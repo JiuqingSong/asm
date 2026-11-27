@@ -107,8 +107,11 @@ That verifies protected-mode boot-loader save/resume, **not** kernel startup or
 completed NT installation. A real Windows 98 desktop at 128 MiB and 1024x768x8
 was also saved and resumed: 100,000 instructions of restored execution produced
 a byte-identical snapshot to uninterrupted execution, followed by verified APM
-shutdown. The original disk image remained unchanged. Neither test implies
-unrestricted OS/device compatibility.
+shutdown. The original disk image remained unchanged. A separate Windows 2000
+graphical-setup kernel snapshot also survived a byte-identical load/save
+roundtrip and continued for 100,000 instructions plus two real-time seconds,
+with kernel/user-mode execution and the original COW unchanged. These tests do
+not imply completed NT installation or unrestricted OS/device compatibility.
 
 For an isolated build using the already built numerical library:
 `.\native\build.ps1 -Zig $zig -OutputDirectory .\native\build\snapshots
@@ -272,7 +275,8 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
 386/486 可用 `--memory 16/32/64/128/256`（MiB）或 `run.ps1 -Memory` 配置 RAM；
 未指定时仍为 16 MiB，8088/286 仍为 1/16 MiB，不接受内存覆盖。
 内存选项不保存到用户偏好；本次 GUI 会话切换到 8088/286 使用原始大小，切回 386/486 恢复指定值。
-BIOS E820 返回真实 RAM、VGA/ROM 保留区与高端复位 ROM；无 EBDA，常规内存为 640 KiB。
+BIOS E820 返回真实 RAM、实际 BIOS ROM 与高端复位 ROM；VGA/扩展 ROM 窗口是未列出的
+设备空洞，不声明为 RAM 或固件占用资源；无 EBDA，常规内存为 640 KiB。
 E801 与 CMOS 34h/35h 报告 16 MiB 以上的 64 KiB 块，AH=88h 饱和至 63 MiB，
 CMOS 17h/18h、30h/31h 的扩展内存 KiB 值饱和至 FFFFh。
 Windows 2000 安装尚未完成；更大的内存不代表 NT 内核与设备驱动已兼容。
@@ -306,7 +310,7 @@ NT 的 BIOS 中断模拟器会把 IVT 中的段:偏移双字写入返回 EIP；
 
 创建分区、格式化及文件复制尚未端到端自动验证，图形安装向导完成与桌面仍未验证，
 因此不能宣称已经能完整安装或运行 Windows 2000。
-在图形安装“请稍候”阶段的 240 秒观测中，时钟继续推进，CPU 主要运行空闲线程，
+早期图形安装“请稍候”阶段的 240 秒观测中，时钟继续推进，CPU 主要运行空闲线程，
 硬盘读取停止增长但仍有少量周期写入；`setup.exe` 的主线程在等待工作线程，
 尚未定位该工作线程等待的根因，不能将其解释为单纯速度慢。
 前端仅在客体启用 COM1 串口鼠标后捕获鼠标，此时鼠标未启用，因此点击不捕获
@@ -316,6 +320,9 @@ Windows 2000 Standard PC HAL 实际从 CMOS `37h` 读取世纪，现与 `32h` �
 BCD / 二进制世纪值；此前世纪为零，内核系统时间落在 1600 年末。
 独立 COW 实测修正后内核日期恢复到 2026 年，`svchost.exe` 也进入进程列表，
 但不能仅据此宣称图形安装等待已完全解决。
+延长至 900 秒的早期观测仍停在“请稍候”；应用世纪寄存器、E820 和虚拟 RTC 修正后，
+重新进行 300 秒独立 COW 观测也未进入下一页。已保存并成功恢复该图形安装阶段的
+内核快照，便于继续诊断，但目前等待的根因仍未解决。
 
 ### Windows NT 3.51 初步验证
 
@@ -337,6 +344,8 @@ INT 13h/AH=08h 的扩展 DPT 缺少最大磁道号，NT 把该字段读成 0 后
 
 现有 DOS、Windows 3.1、Windows 95 回归通过。Windows 98 已分别实测默认 16 MiB 与
 128 MiB，系统属性正确显示对应 RAM，保留 800×600×8、32 位文件系统/虚拟内存与正常 APM 关机。
+本轮还以用户当前的 1024×768×8 配置验证了 128 MiB 桌面、快照恢复和 APM 关机，
+未为了匹配旧测试的分辨率而修改底盘设置。
 `--boot a/c/cd` 仅在 `--headless` 脚本模式自动引导，GUI 仍需菜单启动：
 
 - **Disks > Create C: hard disk > 31.5 / 126 / 504 MiB / 2 / 8 / 32 GiB**：
