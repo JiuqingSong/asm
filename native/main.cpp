@@ -17,7 +17,7 @@
 // Win32 前端与无界面脚本共用 Pc；模拟执行、输入、绘图由同一消息线程协调。
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768 };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768, BootCd };
 std::unique_ptr<Pc> pc;
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
@@ -56,12 +56,21 @@ std::wstring wide(const std::string& value) {
     std::wstring result(n, L'\0'); MultiByteToWideChar(CP_UTF8, 0, value.data(), int(value.size()), result.data(), n); return result;
 }
 
+uint8_t selectedBootDrive(const std::wstring& value) {
+    if (value == L"a") return 0;
+    if (value == L"c") return 0x80;
+    if (value == L"cd") return Pc::CdBootDrive;
+    throw std::runtime_error("Boot drive must be a, c or cd");
+}
+
 void title(HWND hwnd) {
     // 客体时间来自 PIT clock，实测 MIPS 来自宿主时间差；两者不是同一个计时指标。
     std::wstring value = pc->cpu.model == CpuModel::I486 ? L"Asm86 native - 80486DX / AT (experimental)"
         : pc->cpu.model == CpuModel::I386 ? L"Asm86 native - 80386 / AT (experimental)"
         : pc->at() ? L"Asm86 native - 80286 / AT" : L"Asm86 native - 8088";
-    value += L" | A: " + (pc->floppy ? pc->floppy->path.filename().wstring() : L"(empty)");
+    auto a = pc->floppyDisk(), b = pc->floppyDisk(1);
+    value += L" | A: " + (a ? a->path.filename().wstring() : L"(empty)");
+    if (b) value += L" | B: " + b->path.filename().wstring();
     value += L" | C: " + (pc->hard ? pc->hard->path.filename().wstring() : L"(empty)");
     if (pc->hard && pc->hard->hasOverlay()) value += L" | Overlay: " + pc->hard->overlayPath().filename().wstring();
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
@@ -251,7 +260,7 @@ void execute(HWND hwnd) {
     if (hadDisc != (pc->cdrom.medium() != nullptr)) title(hwnd);
     if (pc->rebootRequested) {
         if (pc->hard) pc->hard->flush();
-        pc->boot(pc->floppy ? 0 : 0x80);
+        pc->boot(pc->restartDrive());
         executionTiming.reset(*pc); resetStats();
     }
     if (!pc->notice.empty()) {
@@ -307,11 +316,11 @@ void command(HWND hwnd, int id) {
         }
         break;
     }
-    case BootA: case BootC: case CtrlAltDel:
+    case BootA: case BootC: case BootCd: case CtrlAltDel:
         if (id == CtrlAltDel && !poweredOn) break;
         if (poweredOn && !confirmChange(hwnd, L"Restart the machine and discard its current state?\nShut down Windows first to avoid filesystem corruption.")) break;
         releaseMouse(hwnd); releaseKeyboard();
-        pc->boot(id == BootA || (id == CtrlAltDel && pc->floppy) ? 0 : 0x80);
+        pc->boot(id == CtrlAltDel ? pc->restartDrive() : id == BootCd ? Pc::CdBootDrive : id == BootA ? 0 : 0x80);
         executionTiming.reset(*pc); resetStats();
         poweredOn = running = true; paused = false; break;
     case PauseResume:
@@ -540,7 +549,7 @@ int headless(const std::filesystem::path& script) {
         auto arg = split == std::string::npos ? std::string() : line.substr(split + 1);
         if (op == "run") {
             uint64_t count = std::stoull(arg);
-            while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80); }
+            while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->restartDrive()); }
         } else if (op == "realtime" || op == "wait-realtime" || op == "boot-normal") {
             std::istringstream input(arg); int milliseconds = 0; std::string speed = "full", extra, text;
             bool waiting = op == "wait-realtime", booting = op == "boot-normal";
@@ -578,7 +587,7 @@ int headless(const std::filesystem::path& script) {
                 if (remaining <= ExecutionTiming::HostClock::duration::zero()) break;
                 timing.run(*pc, speed == "full", std::min(remaining,
                     std::chrono::duration_cast<ExecutionTiming::HostClock::duration>(std::chrono::milliseconds(8))), stableTiming);
-                if (pc->rebootRequested) { pc->boot(pc->floppy ? 0 : 0x80); timing.reset(*pc); }
+                if (pc->rebootRequested) { pc->boot(pc->restartDrive()); timing.reset(*pc); }
                 if (speed == "normal") Sleep(1);
             }
             if (waiting && pc->text().find(text) == std::string::npos)
@@ -593,7 +602,7 @@ int headless(const std::filesystem::path& script) {
             while (pc->text().find(arg) == std::string::npos && count < 1000000000) {
                 if (pc->powerOffRequested) throw std::runtime_error("Guest powered off while waiting for: " + arg);
                 pc->run(10000); count += 10000;
-                if (pc->rebootRequested) pc->boot(pc->floppy ? 0 : 0x80);
+                if (pc->rebootRequested) pc->boot(pc->restartDrive());
             }
             if (count >= 1000000000) throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": timed out waiting for: " + arg);
         } else if (op == "dump") {
@@ -680,7 +689,7 @@ int headless(const std::filesystem::path& script) {
         else if (op == "eject") pc->floppy.reset();
         else if (op == "mount-cd") pc->cdrom.insert(std::filesystem::u8path(arg));
         else if (op == "eject-cd") pc->cdrom.eject();
-        else if (op == "boot") pc->boot(arg == "c" ? 0x80 : 0);
+        else if (op == "boot") pc->boot(selectedBootDrive(wide(arg)));
         else if (op == "screen") {
             std::ofstream out(std::filesystem::u8path(arg)); out << pc->text();
             if (!out) throw std::runtime_error("Cannot save screen text");
@@ -796,8 +805,7 @@ int application(int argc, wchar_t** argv) {
             defaultVideo = false;
         }
         else if (option == L"--boot") {
-            if (value != L"a" && value != L"c") throw std::runtime_error("--boot must be a or c");
-            pc->bootDrive = value == L"c" ? 0x80 : 0; start = true;
+            pc->bootDrive = selectedBootDrive(value.wstring()); start = true;
         } else if (option == L"--headless") script = value;
         else throw std::runtime_error("Unknown command-line option");
     }
@@ -902,6 +910,7 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(disks, MF_SEPARATOR, 0, nullptr); AppendMenuW(disks, MF_STRING, Quit, L"Exit");
     AppendMenuW(machine, MF_STRING, BootA, L"Boot / restart from A:");
     AppendMenuW(machine, MF_STRING, BootC, L"Boot / restart from C:");
+    AppendMenuW(machine, MF_STRING, BootCd, L"Boot / restart from CD-ROM");
     AppendMenuW(machine, MF_STRING, CtrlAltDel, L"Ctrl+Alt+Del\tRight Ctrl+Del");
     AppendMenuW(machine, MF_STRING, Reset, L"Power off");
     AppendMenuW(machine, MF_STRING, PauseResume, L"Pause");

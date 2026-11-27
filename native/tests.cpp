@@ -2900,6 +2900,137 @@ void diskFirmwareTests(const std::filesystem::path& path) {
     std::cout << "Guest BIOS disk PIO / IRQ14 EOI / caller state / errors-timeouts / translated CHS checks passed\n";
 }
 
+void cdBootTests(const std::filesystem::path& base) {
+    auto path = std::filesystem::path(base.native() + L".boot.iso");
+    auto put32 = [](std::vector<uint8_t>& data, size_t offset, uint32_t value) {
+        for (unsigned i = 0; i < 4; ++i) data[offset + i] = uint8_t(value >> (i * 8));
+    };
+    auto image = [&](uint8_t media) {
+        unsigned bytes = media ? (media == 1 ? 1200 : media == 2 ? 1440 : 2880) * 1024 : 2048;
+        std::vector<uint8_t> data((24 + bytes / 2048 + 1) * 2048);
+        for (unsigned lba : {16u, 17u, 18u, 19u}) {
+            auto start = lba * 2048;
+            data[start] = lba == 16 ? 1 : lba == 17 ? 2 : lba == 19 ? 255 : 0;
+            std::copy_n("CD001", 5, data.begin() + start + 1); data[start + 6] = 1;
+        }
+        std::copy_n("EL TORITO SPECIFICATION", 23, data.begin() + 18 * 2048 + 7);
+        put32(data, 18 * 2048 + 0x47, 21);
+        unsigned cat = 21 * 2048;
+        data[cat] = 1; data[cat + 30] = 0x55; data[cat + 31] = 0xaa;
+        unsigned checksum = 0;
+        for (unsigned i = 0; i < 32; i += 2) checksum += data[cat + i] | unsigned(data[cat + i + 1]) << 8;
+        auto negative = uint16_t(0u - checksum);
+        data[cat + 28] = uint8_t(negative); data[cat + 29] = uint8_t(negative >> 8);
+        data[cat + 32] = 0x88; data[cat + 33] = media;
+        if (!media) { data[cat + 35] = 0x10; data[cat + 38] = 4; }
+        put32(data, cat + 40, 24);
+        // C6 06 00 05 5A=MOV BYTE [0500h],5Ah；FA=CLI；F4=HLT：验证真正执行光盘引导程序。
+        const uint8_t code[] = {0xc6,0x06,0,5,0x5a,0xfa,0xf4};
+        std::copy(std::begin(code), std::end(code), data.begin() + 24 * 2048);
+        data[24 * 2048 + 1536] = 0x35;
+        if (media) {
+            data[24 * 2048 + 510] = 0x55; data[24 * 2048 + 511] = 0xaa;
+            std::fill_n(data.begin() + 24 * 2048 + 512, 512, 0xa5);
+        }
+        std::fill_n(data.end() - 2048, 2048, 0xc7);
+        return data;
+    };
+    auto save = [&](const std::vector<uint8_t>& data) {
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+        file.close(); check(bool(file), "Write El Torito fixture");
+    };
+    try {
+        for (uint8_t media : {0, 1, 2, 3}) {
+            auto data = image(media); save(data);
+            Pc p; p.setModel(CpuModel::I486);
+            std::vector<uint8_t> physical(1440 * 1024);
+            physical[510] = 0x55; physical[511] = 0xaa; physical[0] = 0xf4;
+            p.floppy = std::make_unique<Disk>(base, std::move(physical));
+            auto original = p.floppy.get();
+            p.cdrom.insert(path); p.boot(Pc::CdBootDrive);
+            auto& c = p.cpu;
+            check(c.r[DX] == (media ? 0 : Pc::CdBootDrive) && c.s[CS] == (media ? 0 : 0x1000),
+                "CD boot must set the emulated BIOS drive and honor the no-emulation load segment");
+            p.runCpu(20); check(c.halted && c.mem[0x500] == 0x5a, "CD boot must execute its entry point");
+            if (!media) check(c.mem[0x10600] == 0x35, "No-emulation boot must load all catalog-specified 512-byte sectors without a 55AA signature");
+            check(p.restartDrive() == Pc::CdBootDrive, "CD-selected resets must continue booting from CD");
+            auto interrupt = [&](uint16_t ax, uint8_t drive) {
+                c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.loadSegment(DS, 0); c.loadSegment(ES, 0);
+                c.ip = 0x600; c.r[SP] = 0x9000; c.r[SI] = 0x700; c.r[AX] = ax; c.r[DX] = drive;
+                c.mem[0x600] = 0xcd; c.mem[0x601] = 0x13; c.mem[0x602] = 0xf4;
+                c.halted = false; c.setFlags(2); p.runCpu(200000);
+                check(c.halted, "CD BIOS interrupt must return");
+                return !(c.flags & CF);
+            };
+            auto drive = media ? uint8_t(0) : Pc::CdBootDrive;
+            if (media) {
+                check(p.floppyDisk() != original && p.floppyDisk(1) == original,
+                    "CD emulation must preserve the physical floppy and remap it to BIOS B:");
+                c.out(0x70, 0x10);
+                check(c.in(0x71) == (media == 1 ? 0x20 : media == 2 ? 0x40 : 0x50),
+                    "CMOS must describe the actual single FDC drive, not a second drive for the BIOS-only B: alias");
+                c.r[BX] = 0x2000; c.r[CX] = 2;
+                check(interrupt(0x0201, 0) && c.mem[0x2000] == 0xa5, "Emulated CHS reads must address the boot floppy");
+                std::fill_n(c.mem.begin() + 0x2000, 512, 0x96);
+                check(interrupt(0x0301, 0), "Emulated floppy writes must succeed in RAM");
+                std::array<uint8_t, 512> sector{};
+                check(p.floppyDisk()->read(1, sector.data()) && sector[0] == 0x96, "Emulated writes must persist within the boot session");
+                check(p.cdrom.medium()->read(24 * 2048 + 512, sector.data(), 512) && sector[0] == 0xa5,
+                    "Emulated writes must never modify the original ISO");
+                check(interrupt(0x0800, 0) && (c.r[CX] & 63) == (media == 1 ? 15 : media == 2 ? 18 : 36)
+                    && c.reg8(2) == 2, "Emulated geometry and BIOS floppy count must match the selected media");
+            } else {
+                auto packet = [&](uint16_t offset, uint32_t lba) {
+                    c.ww(0, 0x700, 16); c.ww(0, 0x702, 1); c.ww(0, 0x704, offset); c.ww(0, 0x706, 0);
+                    c.writeDword(0x708, lba); c.writeDword(0x70c, 0);
+                };
+                c.r[BX] = 0x55aa;
+                check(interrupt(0x4100, drive) && c.r[BX] == 0xaa55 && c.r[CX] == 1, "No-emulation CD must advertise EDD packet access");
+                c.ww(0, 0x700, 26);
+                check(interrupt(0x4800, drive) && c.rw(0, 0x718) == 2048 && c.readDword(0x710) == data.size() / 2048,
+                    "CD EDD parameters must report 2048-byte logical blocks and the full optical capacity");
+                packet(0x2000, uint32_t(data.size() / 2048 - 1));
+                check(interrupt(0x4200, drive) && std::all_of(c.mem.begin() + 0x2000, c.mem.begin() + 0x2800,
+                    [](uint8_t value) { return value == 0xc7; }), "CD EDD must read a complete final optical block");
+                check(!interrupt(0x4300, drive) && c.reg8(4) == 3, "CD EDD writes must return write protection");
+                packet(0x2000, 0xffffffff);
+                check(!interrupt(0x4200, drive) && c.reg8(4) == 4 && !c.rw(0, 0x702), "CD EDD must reject out-of-range LBA and clear the transfer count");
+                packet(0xfc01, 24);
+                check(!interrupt(0x4200, drive) && c.reg8(4) == 9, "CD EDD must enforce the 64 KiB buffer boundary using 2048-byte blocks");
+            }
+            check(interrupt(0x4b01, drive) && c.rb(0, 0x700) == 0x13 && c.rb(0, 0x701) == media
+                && c.readDword(0x704) == 24, "El Torito status must return its actual boot media and image LBA");
+            check(interrupt(0x4b00, drive) && p.floppyDisk() == original && !p.floppyDisk(1),
+                "Terminating El Torito emulation must restore the physical floppy mapping");
+            check(!interrupt(0x4b01, drive), "Terminated CD boot status must not return a success-shaped packet");
+            p.boot(0); check(p.bootDrive == 0 && p.floppyDisk() == original, "Normal floppy boot must clear CD boot state");
+        }
+        using Corruption = std::function<void(std::vector<uint8_t>&)>;
+        const Corruption invalid[] = {
+            [](auto& data) { data[21 * 2048 + 28] ^= 1; },
+            [](auto& data) { data[21 * 2048 + 1] = 1; --data[21 * 2048 + 28]; },
+            [](auto& data) { data[21 * 2048 + 32] = 0; },
+            [](auto& data) { data[21 * 2048 + 33] = 4; },
+            [&](auto& data) { put32(data, 18 * 2048 + 0x47, 0xffffffff); },
+            [&](auto& data) { put32(data, 21 * 2048 + 40, 0xffffffff); },
+            [](auto& data) { data[21 * 2048 + 35] = 0xa0; },
+            [](auto& data) { data[21 * 2048 + 33] = 3; }
+        };
+        for (const auto& corrupt : invalid) {
+            auto data = image(0); corrupt(data); save(data);
+            Pc p; p.setModel(CpuModel::I486); p.cdrom.insert(path);
+            p.cpu.ip = 0x1234; p.cpu.mem[0x500] = 0xcc;
+            bool rejected = false;
+            try { p.boot(Pc::CdBootDrive); } catch (const std::runtime_error&) { rejected = true; }
+            check(rejected && p.cpu.ip == 0x1234 && p.cpu.mem[0x500] == 0xcc,
+                "Invalid El Torito media must fail explicitly before resetting the guest");
+        }
+    } catch (...) { std::filesystem::remove(path); throw; }
+    std::filesystem::remove(path);
+    std::cout << "El Torito floppy-no-emulation boot / entry execution / EDD / volatile writes / media validation / termination checks passed\n";
+}
+
 void atapiTests(const std::filesystem::path& path) {
     // ATAPI 包/数据相位、IRQ15、传输上限、sense/TOC/锁盘与介质更换均通过设备端口验证。
     std::vector<uint8_t> expected(4096);
@@ -3533,7 +3664,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); diskFirmwareTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); cirrusFirmwareTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); diskFirmwareTests(path); cdBootTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); cirrusFirmwareTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

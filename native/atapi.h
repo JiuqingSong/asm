@@ -13,11 +13,11 @@ namespace asm86 {
 class IsoImage {
 public:
     explicit IsoImage(const std::filesystem::path& path);
-    bool read(uint64_t offset, uint8_t* data, unsigned length);
+    bool read(uint64_t offset, uint8_t* data, unsigned length) const;
     std::filesystem::path path;
     uint32_t sectors = 0;
 private:
-    std::ifstream file;
+    mutable std::ifstream file;
     uint64_t bytes = 0;
 };
 class AtapiCdrom {

@@ -530,8 +530,26 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::file
         throw std::runtime_error("Disk image must contain whole 512-byte sectors and be at most 32 GiB");
     }
     sectors = uint32_t(size.QuadPart / 512);
+    if (floppy) sectors = floppyPayloadSectors(file, sectors);
+    setGeometry(floppy);
+    if (!overlay.empty()) openOverlay();
+    } catch (...) {
+        if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
+        CloseHandle(file); throw;
+    }
+}
+
+Disk::Disk(const std::filesystem::path& p, std::vector<uint8_t> floppyImage)
+    : path(p), identity(++nextDiskIdentity), memory(std::move(floppyImage)) {
+    // El Torito 的模拟软盘只在 RAM 中写入，关闭或重新引导即丢弃，不修改 ISO。
+    if (memory.empty() || memory.size() % 512 || memory.size() > 2880u * 1024)
+        throw std::runtime_error("Invalid emulated boot floppy size");
+    sectors = uint32_t(memory.size() / 512);
+    setGeometry(true);
+}
+
+void Disk::setGeometry(bool floppy) {
     if (floppy) {
-        sectors = floppyPayloadSectors(file, sectors);
         switch (sectors) {
         case 320: heads = 1; spt = 8; floppyType = 1; break;
         case 360: heads = 1; spt = 9; floppyType = 1; break;
@@ -540,19 +558,15 @@ Disk::Disk(const std::filesystem::path& p, bool floppy, bool ro, const std::file
         case 1440: heads = 2; spt = 9; floppyType = 3; break;
         case 2400: heads = 2; spt = 15; floppyType = 2; break;
         case 2880: heads = 2; spt = 18; floppyType = 4; break;
+        case 5760: heads = 2; spt = 36; floppyType = 5; break;
         default: throw std::runtime_error("Unsupported floppy geometry");
         }
     } else { heads = 16; spt = 63; }
     cylinders = int(sectors / unsigned(heads * spt));
-    if (!floppy && (cylinders < 1 || (size.QuadPart <= 504LL * 1024 * 1024 && sectors % unsigned(heads * spt)))) {
+    if (!floppy && (cylinders < 1 || (uint64_t(sectors) * 512 <= 504ULL * 1024 * 1024 && sectors % unsigned(heads * spt)))) {
         throw std::runtime_error("Hard disk images up to 504 MiB require complete 16-head/63-sector cylinders");
     }
     if (!floppy) cylinders = std::min(cylinders, 16383);
-    if (!overlay.empty()) openOverlay();
-    } catch (...) {
-        if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
-        CloseHandle(file); throw;
-    }
 }
 
 void Disk::openOverlay() {
@@ -644,6 +658,12 @@ int Disk::biosCylinders() const { return std::min(1024, int(sectors / unsigned(b
 bool Disk::transfer(uint32_t lba, uint8_t* data, bool writing) {
     // ATA 与 BIOS 共用此扇区入口；差分读先查最新记录，未命中才读底盘。
     if (lba >= sectors || (writing && readOnly)) return false;
+    if (!memory.empty()) {
+        auto sector = memory.data() + size_t(lba) * 512;
+        if (writing) std::copy(data, data + 512, sector);
+        else std::copy(sector, sector + 512, data);
+        return true;
+    }
     if (hasOverlay()) {
         if (writing) {
             std::array<uint8_t, 520> record{};
@@ -673,11 +693,11 @@ bool Disk::write(uint32_t lba, const uint8_t* p) {
 }
 
 void Disk::flush() {
-    if (!readOnly && !FlushFileBuffers(hasOverlay() ? overlayFile : file)) throw osError("Disk flush failed");
+    if (memory.empty() && !readOnly && !FlushFileBuffers(hasOverlay() ? overlayFile : file)) throw osError("Disk flush failed");
 }
 
 Pc::Pc() {
-    fdc.disk = [this]() { return floppy.get(); };
+    fdc.disk = [this]() { return floppyDisk(); };
     fdc.interrupt = [this](bool raised) {
         if (raised) pic[0].raise(6);
         else pic[0].pending &= uint8_t(~0x40);
@@ -882,13 +902,75 @@ unsigned Pc::biosPage() { return cpu.rbF(0x40, 0x62) & 7; }
 
 unsigned Pc::biosCursor() { return cpu.rwF(0x40, uint16_t(0x50 + biosPage() * 2)); }
 
+Disk* Pc::floppyDisk(uint8_t drive) const {
+    if (!drive) return cdFloppy ? cdFloppy.get() : floppy.get();
+    return drive == 1 && cdFloppy ? floppy.get() : nullptr;
+}
+
 void Pc::boot(uint8_t drive) {
-    // 重建 BIOS ROM/IVT/BDA 与设备复位状态，再将引导扇区载入 0000:7C00。
-    Disk* d = drive == 0 ? floppy.get() : drive == 0x80 ? hard.get() : nullptr;
-    if (!d) throw std::runtime_error("No image mounted in the selected boot drive");
-    std::array<uint8_t, 512> sector{};
-    d->read(0, sector.data());
-    if (sector[510] != 0x55 || sector[511] != 0xaa) throw std::runtime_error("Boot sector has no 55AA signature");
+    // 先验证并读取映像，再重建 BIOS；坏目录或越界引导映像不能破坏当前客体状态。
+    std::vector<uint8_t> sector(512);
+    std::unique_ptr<Disk> emulated;
+    uint8_t media = 0xff;
+    uint16_t loadSegment = 0x7c0, loadCount = 1;
+    uint32_t imageLba = 0;
+    if (drive == CdBootDrive) {
+        if (!at()) throw std::runtime_error("CD boot requires a 286, 386 or 486 CPU");
+        auto iso = cdrom.medium();
+        if (!iso) throw std::runtime_error("No optical image mounted");
+        std::array<uint8_t, 2048> descriptor{};
+        uint32_t catalog = 0;
+        bool found = false;
+        for (uint32_t lba = 16; lba < iso->sectors; ++lba) {
+            if (!iso->read(uint64_t(lba) * 2048, descriptor.data(), unsigned(descriptor.size())))
+                throw std::runtime_error("Cannot read ISO volume descriptor");
+            if (!std::equal(descriptor.begin() + 1, descriptor.begin() + 6, "CD001") || descriptor[6] != 1)
+                throw std::runtime_error("Invalid ISO volume descriptor");
+            if (!descriptor[0] && std::equal(descriptor.begin() + 7, descriptor.begin() + 30, "EL TORITO SPECIFICATION")) {
+                catalog = diskWord(descriptor.data() + 0x47); found = true; break;
+            }
+            if (descriptor[0] == 255) break;
+        }
+        if (!found) throw std::runtime_error("Optical image has no El Torito boot record");
+        std::array<uint8_t, 64> entry{};
+        if (catalog >= iso->sectors || !iso->read(uint64_t(catalog) * 2048, entry.data(), unsigned(entry.size())))
+            throw std::runtime_error("El Torito boot catalog is outside the optical image");
+        unsigned checksum = 0;
+        for (unsigned i = 0; i < 32; i += 2) checksum += entry[i] | unsigned(entry[i + 1]) << 8;
+        if (entry[0] != 1 || entry[1] != 0 || entry[30] != 0x55 || entry[31] != 0xaa || (checksum & 0xffff))
+            throw std::runtime_error("Invalid El Torito x86 validation entry or checksum");
+        if (entry[32] != 0x88) throw std::runtime_error("El Torito default entry is not bootable");
+        media = entry[33];
+        if (media > 3) throw std::runtime_error("El Torito hard-disk emulation or unknown boot media is not supported");
+        loadSegment = uint16_t(entry[34] | uint16_t(entry[35]) << 8);
+        if (!loadSegment) loadSegment = 0x7c0;
+        imageLba = diskWord(entry.data() + 40);
+        if (!media) {
+            loadCount = uint16_t(entry[38] | uint16_t(entry[39]) << 8);
+            if (!loadCount) loadCount = 1;
+        }
+        unsigned bootBytes = unsigned(loadCount) * 512;
+        if (uint32_t(loadSegment) * 16 < 0x500 || uint32_t(loadSegment) * 16 + bootBytes > 0xa0000)
+            throw std::runtime_error("El Torito boot program must fit above the BIOS data area in conventional memory");
+        static constexpr unsigned floppyBytes[] = {0, 1200 * 1024, 1440 * 1024, 2880 * 1024};
+        sector.resize(media ? floppyBytes[media] : bootBytes);
+        if (!iso->read(uint64_t(imageLba) * 2048, sector.data(), unsigned(sector.size())))
+            throw std::runtime_error("El Torito boot image is outside the optical image");
+        if (media) {
+            if (sector[510] != 0x55 || sector[511] != 0xaa)
+                throw std::runtime_error("El Torito boot floppy has no 55AA signature");
+            emulated = std::make_unique<Disk>(iso->path, std::move(sector));
+            sector.resize(512);
+            if (!emulated->read(0, sector.data())) throw std::runtime_error("Cannot read emulated boot floppy");
+        }
+    } else {
+        Disk* d = drive == 0 ? floppy.get() : drive == 0x80 ? hard.get() : nullptr;
+        if (!d) throw std::runtime_error("No image mounted in the selected boot drive");
+        if (!d->read(0, sector.data())) throw std::runtime_error("Cannot read selected boot sector");
+        if (sector[510] != 0x55 || sector[511] != 0xaa) throw std::runtime_error("Boot sector has no 55AA signature");
+    }
+    cdFloppy = std::move(emulated); cdBootMedia = media; cdStatus = 0;
+    cdLoadSegment = loadSegment; cdLoadCount = loadCount; cdImageLba = imageLba;
     cpu.reset(); std::fill(cpu.mem.begin(), cpu.mem.end(), 0);
     vga.setMode(3);
     serialMouse.reset();
@@ -978,7 +1060,7 @@ void Pc::boot(uint8_t drive) {
     cpu.ww(0, 0x13 * 4, 0x860);
     if (at()) installDiskFirmware(cpu);
     cpu.ww(0x40, 0, 0x3f8); cpu.wb(0x40, 0x7c, 1);
-    cpu.ww(0x40, 0x10, uint16_t(0x221 | (floppy ? 1 : 0) | (cpu.hasFpu() ? 2 : 0)));
+    cpu.ww(0x40, 0x10, uint16_t(0x221 | (floppyDisk() ? 1 : 0) | (floppyDisk(1) ? 0x40 : 0) | (cpu.hasFpu() ? 2 : 0)));
     cpu.ww(0x40, 0x13, 640); cpu.ww(0x40, 0x1a, 0x1e); cpu.ww(0x40, 0x1c, 0x1e);
     cpu.ww(0x40, 0x80, 0x1e); cpu.ww(0x40, 0x82, 0x3e);
     cpu.wb(0x40, 0x49, 3); cpu.ww(0x40, 0x4a, 80); cpu.ww(0x40, 0x4c, 4096);
@@ -990,7 +1072,7 @@ void Pc::boot(uint8_t drive) {
 
     // DPT 是数据，不是机器码：步进/卸载、加载、停转等待、N=2（512 字节）、每道扇区数、
     // 读写 gap、DTL、格式化 gap、填充值 F6h、磁头稳定等待、电机启动等待。
-    const uint8_t dpt[] = {0xdf, 2, 0x25, 2, 18, 0x1b, 0xff, 0x6c, 0xf6, 15, 8};
+    const uint8_t dpt[] = {0xdf, 2, 0x25, 2, uint8_t(floppyDisk() ? floppyDisk()->spt : 18), 0x1b, 0xff, 0x6c, 0xf6, 15, 8};
     std::copy(std::begin(dpt), std::end(dpt), cpu.mem.begin() + 0xfefc7);
     cpu.ww(0, 0x1e * 4, 0xefc7); cpu.ww(0, 0x1e * 4 + 2, 0xf000);
     if (hard) {
@@ -1005,11 +1087,14 @@ void Pc::boot(uint8_t drive) {
     std::copy(std::begin(reset), std::end(reset), cpu.mem.begin() + 0xffff0);
     cpu.wb(0xf000, 0x600, 0xf1); cpu.wb(0xf000, 0x601, 0x19); // BIOS_TRAP 19h：重新引导。
     for (unsigned i = 0; i < 0x4000; i += 2) cpu.ww(0xb800, uint16_t(i), 0x0720);
-    std::copy(sector.begin(), sector.end(), cpu.mem.begin() + 0x7c00);
+    std::copy(sector.begin(), sector.end(), cpu.mem.begin() + uint32_t(loadSegment) * 16);
     if (at()) std::copy(cpu.mem.begin() + 0xf0000, cpu.mem.begin() + 0x100000, cpu.mem.begin() + 0xff0000);
     for (auto seg : {ES, CS, SS, DS}) cpu.loadSegment(seg, 0);
-    cpu.ip = 0x7c00; cpu.r[SP] = 0x7c00;
-    cpu.r[DX] = drive; cpu.setFlags(0x0202);
+    if ((drive == CdBootDrive && !media) || loadSegment != 0x7c0) {
+        cpu.loadSegment(CS, loadSegment); cpu.ip = 0;
+    } else cpu.ip = 0x7c00;
+    cpu.r[SP] = 0x7c00;
+    cpu.r[DX] = drive == CdBootDrive && media ? 0 : drive; cpu.setFlags(0x0202);
 }
 
 void Pc::run(unsigned budget, double untilClock) {
@@ -1521,43 +1606,79 @@ bool Pc::disk() {
     // INT 13h：00/0D 复位、01 状态、02/03 读写、04 校验、05 格式化、08 几何。
     // 扩展 41 检测、42/43 LBA 读写、44 校验、47 寻道、48 参数；状态通过 AH 和栈上的 CF 返回。
     auto& c = cpu; auto& r = c.r; uint8_t drive = c.reg8(2), ah = c.reg8(4);
-    bool hd = drive & 0x80; Disk* d = drive == 0 ? floppy.get() : drive == 0x80 ? hard.get() : nullptr;
+    if (ah == 0x4b) {
+        // DS:SI 指向 13h 字节的 El Torito 状态包；AL=0 结束模拟，AL=1 只查询。
+        auto al = c.reg8(0);
+        auto si = r[SI];
+        if (cdBootMedia > 3 || al > 1 || si > 0xffed ||
+            (drive != 0x7f && drive != (cdBootMedia ? 0 : CdBootDrive))) {
+            c.reg8(4, 1); c.stackedFlag(CF, true); return true;
+        }
+        std::array<uint8_t, 0x13> packet{};
+        packet[0] = 0x13; packet[1] = cdBootMedia;
+        packet[2] = cdBootMedia ? 0 : CdBootDrive; packet[3] = 1; // 第二 IDE 通道、主设备。
+        diskWord(packet.data() + 4, cdImageLba);
+        packet[0x0c] = uint8_t(cdLoadSegment); packet[0x0d] = uint8_t(cdLoadSegment >> 8);
+        packet[0x0e] = uint8_t(cdLoadCount); packet[0x0f] = uint8_t(cdLoadCount >> 8);
+        if (cdFloppy) {
+            packet[0x10] = uint8_t(cdFloppy->biosCylinders() - 1);
+            packet[0x11] = uint8_t(cdFloppy->spt); packet[0x12] = uint8_t(cdFloppy->heads - 1);
+        }
+        for (unsigned i = 0; i < packet.size(); ++i) c.wbF(c.s[DS], uint16_t(si + i), packet[i]);
+        if (!al) {
+            cdFloppy.reset(); cdBootMedia = 0xff;
+            c.wwF(0x40, 0x10, uint16_t((c.rwF(0x40, 0x10) & ~0xc1u) | (floppy ? 1 : 0)));
+            cmos[0x10] = floppy ? uint8_t(floppy->floppyType << 4) : 0;
+            cmos[0x14] = uint8_t((cmos[0x14] & ~0xc1u) | (floppy ? 1 : 0));
+            c.wbF(0xf000, 0xefcb, uint8_t(floppy ? floppy->spt : 18));
+        }
+        c.reg8(4, 0); c.stackedFlag(CF, false); return true;
+    }
+    bool optical = drive == CdBootDrive && cdBootMedia == 0;
+    auto iso = optical ? cdrom.medium() : nullptr;
+    bool hd = drive & 0x80; Disk* d = drive < 2 ? floppyDisk(drive) : drive == 0x80 ? hard.get() : nullptr;
     auto status = [&](uint8_t code) {
-        c.reg8(4, code); c.stackedFlag(CF, code != 0); c.wbF(0x40, hd ? 0x74 : 0x41, code);
+        c.reg8(4, code); c.stackedFlag(CF, code != 0);
+        if (optical) cdStatus = code;
+        else c.wbF(0x40, hd ? 0x74 : 0x41, code);
     };
     int cylinder = c.reg8(5) | ((c.reg8(1) & 0xc0) << 2), head = c.reg8(6), sector = c.reg8(1) & 63;
-    if (ah == 0 || ah == 0x0d) { status(d || drive == 0 ? 0 : 1); return true; }
-    if (ah == 1) { auto v = c.rbF(0x40, hd ? 0x74 : 0x41); status(v); return true; }
+    if (ah == 0 || ah == 0x0d) { status(d || optical || drive == 0 ? 0 : 1); return true; }
+    if (ah == 1) { auto v = optical ? cdStatus : c.rbF(0x40, hd ? 0x74 : 0x41); status(v); return true; }
     if (ah == 8) {
         if (!d && drive != 0) { r[DX] = 0; status(1); return true; }
         int cy = d ? d->biosCylinders() - 1 : 79, heads = d ? d->biosHeads() : 2, spt = d ? d->spt : 18;
         r[CX] = uint16_t(((cy & 255) << 8) | ((cy >> 2) & 0xc0) | spt);
-        r[DX] = uint16_t(((heads - 1) << 8) | (hd ? (hard ? 1 : 0) : 1));
+        r[DX] = uint16_t(((heads - 1) << 8) | (hd ? (hard ? 1 : 0) : floppyDisk(1) ? 2 : 1));
         if (!hd) { c.reg8(3, d ? uint8_t(d->floppyType) : 4); c.loadSegment(ES, 0xf000); r[DI] = 0xefc7; }
         status(0); return true;
     }
     if (ah == 0x15) {
-        c.stackedFlag(CF, false); c.reg8(4, d ? (hd ? 3 : 2) : drive == 0 ? 2 : 0);
+        c.stackedFlag(CF, false); c.reg8(4, optical ? 2 : d ? (hd ? 3 : 2) : drive == 0 ? 2 : 0);
         if (d && hd) { r[CX] = uint16_t(d->sectors >> 16); r[DX] = uint16_t(d->sectors); }
         return true;
     }
-    if (!d) { status(hd ? 1 : 0x80); return true; }
-    if (ah == 0x16) { auto changed = d->changed; d->changed = false; status(changed ? 6 : 0); return true; }
-    if (ah == 0x17 || ah == 0x18) { if (ah == 0x18) { c.loadSegment(ES, 0xf000); r[DI] = 0xefc7; } status(0); return true; }
+    if (!d && !iso) { status(optical ? 0xaa : hd ? 1 : 0x80); return true; }
+    if (!optical && ah == 0x16) { auto changed = d->changed; d->changed = false; status(changed ? 6 : 0); return true; }
+    if (!optical && (ah == 0x17 || ah == 0x18)) { if (ah == 0x18) { c.loadSegment(ES, 0xf000); r[DI] = 0xefc7; } status(0); return true; }
+    unsigned sectorBytes = optical ? 2048 : 512;
+    uint32_t totalSectors = optical ? iso->sectors : d->sectors;
     if (ah == 0x41) {
         if (!hd || r[BX] != 0x55aa) { status(1); return true; }
-        r[BX] = 0xaa55; r[CX] = 5; status(0); c.reg8(4, 0x21); return true;
+        r[BX] = 0xaa55; r[CX] = optical ? 1 : 5; status(0); c.reg8(4, 0x21); return true;
     }
     if (hd && ah == 0x48) {
         auto ds = c.s[DS], si = r[SI];
         if (si > 0xffe6 || c.rwF(ds, si) < 26) { status(1); return true; }
         std::array<uint8_t, 26> parameters{};
         parameters[0] = 26;
-        auto heads = d->biosHeads(), cylinders = d->biosCylinders();
-        parameters[2] = uint64_t(heads) * cylinders * d->spt == d->sectors ? 2 : 0;
-        diskWord(parameters.data() + 4, unsigned(cylinders)); diskWord(parameters.data() + 8, unsigned(heads));
-        diskWord(parameters.data() + 12, unsigned(d->spt)); diskWord(parameters.data() + 16, d->sectors);
-        parameters[25] = 2;
+        auto heads = optical ? 0xffffffffu : unsigned(d->biosHeads());
+        auto cylinders = optical ? 0xffffffffu : unsigned(d->biosCylinders());
+        parameters[2] = optical ? 4 : uint64_t(heads) * cylinders * d->spt == d->sectors ? 2 : 0;
+        diskWord(parameters.data() + 4, cylinders); diskWord(parameters.data() + 8, heads);
+        diskWord(parameters.data() + 12, optical ? 0xffffffffu : unsigned(d->spt));
+        diskWord(parameters.data() + 16, totalSectors);
+        parameters[24] = uint8_t(sectorBytes); parameters[25] = uint8_t(sectorBytes >> 8);
         for (unsigned i = 0; i < parameters.size(); ++i) c.wbF(ds, uint16_t(si + i), parameters[i]);
         status(0); return true;
     }
@@ -1571,18 +1692,19 @@ bool Pc::disk() {
         for (unsigned i = 0; i < 8; ++i) lba |= uint64_t(c.rbF(ds, uint16_t(si + 8 + i))) << (8 * i);
         auto failure = [&](uint8_t code) { c.wwF(ds, uint16_t(si + 2), 0); status(code); return true; };
         if (!count || count > 127 || (ah == 0x43 && c.reg8(0) > 1)) return failure(1);
-        if (lba >= d->sectors || count > d->sectors - lba) return failure(4);
-        if ((ah == 0x42 || ah == 0x43) && uint32_t(offset) + uint32_t(count) * 512 > 0x10000) return failure(9);
-        if (ah == 0x43 && d->readOnly) return failure(3);
+        if (lba >= totalSectors || count > totalSectors - lba) return failure(4);
+        if ((ah == 0x42 || ah == 0x43) && uint32_t(offset) + uint32_t(count) * sectorBytes > 0x10000) return failure(9);
+        if (ah == 0x43 && (optical || d->readOnly)) return failure(3);
         if (ah == 0x47) { status(0); return true; }
-        std::vector<uint8_t> data(unsigned(count) * 512);
+        std::vector<uint8_t> data(unsigned(count) * sectorBytes);
         auto address = (uint32_t(segment) << 4) + offset;
         if (ah == 0x43) {
             // 完整读取客体缓冲区后才落盘，避免第二页故障造成半次磁盘写入。
             for (unsigned i = 0; i < data.size(); ++i) data[i] = c.readLinear(address + i);
         }
         for (unsigned i = 0; i < count; ++i) {
-            bool ok = ah == 0x43 ? d->write(uint32_t(lba) + i, data.data() + i * 512)
+            bool ok = optical ? iso->read((lba + i) * 2048, data.data() + i * 2048, 2048)
+                : ah == 0x43 ? d->write(uint32_t(lba) + i, data.data() + i * 512)
                 : d->read(uint32_t(lba) + i, data.data() + i * 512);
             if (!ok) { c.wwF(ds, uint16_t(si + 2), uint16_t(i)); status(4); return true; }
         }
@@ -1599,6 +1721,7 @@ bool Pc::disk() {
         }
         status(0); return true;
     }
+    if (optical) { status(ah == 3 || ah == 5 ? 3 : 1); return true; }
     if (ah == 9 || ah == 0x0c || (ah >= 0x10 && ah <= 0x14)) { status(0); return true; }
     if (ah < 2 || ah > 5) { status(1); notice = "Unsupported INT 13h function " + std::to_string(ah); return true; }
     if (cylinder >= d->biosCylinders() || head >= d->biosHeads() || sector < 1 || sector > d->spt) { status(4); c.reg8(0, 0); return true; }

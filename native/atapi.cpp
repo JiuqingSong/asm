@@ -14,7 +14,7 @@ IsoImage::IsoImage(const std::filesystem::path& value) : path(value), file(value
     bytes = uint64_t(length); sectors = uint32_t(bytes / 2048);
 }
 
-bool IsoImage::read(uint64_t offset, uint8_t* data, unsigned length) {
+bool IsoImage::read(uint64_t offset, uint8_t* data, unsigned length) const {
     if (offset > bytes || length > bytes - offset) return false;
     file.seekg(std::streamoff(offset));
     file.read(reinterpret_cast<char*>(data), std::streamsize(length));

@@ -24,6 +24,7 @@ namespace asm86 {
 class Disk {
 public:
     Disk(const std::filesystem::path& path, bool floppy, bool readOnly, const std::filesystem::path& overlay = {});
+    Disk(const std::filesystem::path& path, std::vector<uint8_t> floppyImage);
     ~Disk();
     Disk(const Disk&) = delete;
     Disk& operator=(const Disk&) = delete;
@@ -51,7 +52,9 @@ private:
     HANDLE overlayFile = INVALID_HANDLE_VALUE;
     std::filesystem::path differential;
     std::unordered_map<uint32_t, uint64_t> overlayIndex;
+    std::vector<uint8_t> memory;
     uint64_t overlayEnd = 64;
+    void setGeometry(bool floppy);
     void openOverlay();
     bool transfer(uint32_t lba, uint8_t* data, bool writing);
 };
@@ -71,6 +74,7 @@ public:
     uint64_t instructions = 0;
     double clock = 0;
     uint8_t bootDrive = 0;
+    static constexpr uint8_t CdBootDrive = 0xe0;
     bool rebootRequested = false;
     bool powerOffRequested = false;
     std::string notice;
@@ -79,6 +83,8 @@ public:
     void setCirrus(bool enabled);
     bool at() const { return cpu.model != CpuModel::I8088; }
     void boot(uint8_t drive);
+    uint8_t restartDrive() const { return bootDrive == CdBootDrive ? CdBootDrive : floppy ? 0 : 0x80; }
+    Disk* floppyDisk(uint8_t drive = 0) const;
     void run(unsigned budget, double untilClock = std::numeric_limits<double>::infinity());
     void runCpu(unsigned budget);
     void advanceClock(double target);
@@ -129,6 +135,10 @@ private:
     void pciWrite(unsigned offset, uint8_t value);
     bool pciBios(bool protectedCall);
     bool disk();
+    std::unique_ptr<Disk> cdFloppy;
+    uint8_t cdBootMedia = 0xff, cdStatus = 0;
+    uint16_t cdLoadSegment = 0, cdLoadCount = 0;
+    uint32_t cdImageLba = 0;
     unsigned biosColumns();
     unsigned biosPage();
     unsigned biosCursor();

@@ -16,8 +16,10 @@ void Pc::resetAt() {
     keyboardLatch = 0; keyboardRead = false;
     pendingReset = false; cpu.a20 = false;
     cmos.fill(0); cmos[0x0a] = 0x26; cmos[0x0b] = 2; cmos[0x0d] = 128;
-    cmos[0x10] = floppy ? uint8_t(floppy->floppyType << 4) : 0;
-    cmos[0x12] = hard ? 0xf0 : 0; cmos[0x14] = uint8_t(0x20 | (floppy ? 1 : 0) | (cpu.hasFpu() ? 2 : 0));
+    auto a = floppyDisk();
+    // FDC 仅连接驱动器 0；光盘启动的 BIOS B: 映射不能冒充第二个 FDC 驱动器。
+    cmos[0x10] = a ? uint8_t(a->floppyType << 4) : 0;
+    cmos[0x12] = hard ? 0xf0 : 0; cmos[0x14] = uint8_t(0x20 | (a ? 1 : 0) | (cpu.hasFpu() ? 2 : 0));
     cmos[0x15] = 0x80; cmos[0x16] = 2; cmos[0x18] = cmos[0x31] = at() ? 0x3c : 0;
     rtcEpoch = std::time(nullptr); nextRtc = std::numeric_limits<double>::infinity();
 }
