@@ -9,6 +9,7 @@ class Disk;
 
 // ATA 第一通道主盘，IRQ 回调只报告电平；由 Pc 转接到级联 PIC 的 IRQ14。
 class IdeChannel {
+    friend class Snapshot;
 public:
     std::function<Disk*()> disk;
     std::function<void(bool)> interrupt;

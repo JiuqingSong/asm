@@ -2,11 +2,17 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
 
 // 第二 IDE 通道的 ATAPI PIO 光驱：ATA 外壳传输 12 字节 SCSI/MMC 命令包，ISO 按需读取。
 namespace asm86 {
 IsoImage::IsoImage(const std::filesystem::path& value) : path(value), file(value, std::ios::binary) {
     if (!file) throw std::runtime_error("Cannot open optical image: " + path.u8string());
+    auto handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot lock optical image against writes: " + path.u8string());
+    mediaLock = std::shared_ptr<void>(handle, [](void* h) { CloseHandle(h); });
     file.seekg(0, std::ios::end);
     auto length = file.tellg();
     if (!file || length <= 0 || uint64_t(length) % 2048 || uint64_t(length) / 2048 > 0xffffffffu)

@@ -11,6 +11,7 @@ class Disk;
 
 // 主板只挂载 A:，仍模拟四个单元的寻道/复位状态供驱动探测。
 class FloppyController {
+    friend class Snapshot;
 public:
     FloppyController() { reset(); }
     std::function<Disk*()> disk;

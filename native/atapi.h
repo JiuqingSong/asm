@@ -11,16 +11,19 @@
 namespace asm86 {
 // ISO 固定 2048 字节逻辑扇区，流式读取，避免把整张安装光盘加载到 RAM。
 class IsoImage {
+    friend class Snapshot;
 public:
     explicit IsoImage(const std::filesystem::path& path);
     bool read(uint64_t offset, uint8_t* data, unsigned length) const;
     std::filesystem::path path;
     uint32_t sectors = 0;
 private:
+    std::shared_ptr<void> mediaLock;
     mutable std::ifstream file;
     uint64_t bytes = 0;
 };
 class AtapiCdrom {
+    friend class Snapshot;
 public:
     std::function<void(bool)> interrupt;
     double nextEvent = std::numeric_limits<double>::infinity();

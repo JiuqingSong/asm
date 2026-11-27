@@ -8,6 +8,7 @@
 namespace asm86 {
 // Deliberately SB 2.01, not SB16: fixed A220/I5/D1, unsigned 8-bit mono PCM only.
 class SoundBlaster {
+    friend class Snapshot;
 public:
     static constexpr double PitHz = 1193182.0;
     static constexpr unsigned OutputRate = 48000;

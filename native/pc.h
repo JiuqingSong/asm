@@ -23,6 +23,7 @@
 namespace asm86 {
 // 扇区后端由 BIOS、ATA 和 FDC 共用；文件句柄独占可写方，复制 Disk 会破坏所有权。
 class Disk {
+    friend class Snapshot;
 public:
     Disk(const std::filesystem::path& path, bool floppy, bool readOnly, const std::filesystem::path& overlay = {});
     Disk(const std::filesystem::path& path, std::vector<uint8_t> floppyImage);
@@ -55,12 +56,15 @@ private:
     std::unordered_map<uint32_t, uint64_t> overlayIndex;
     std::vector<uint8_t> memory;
     uint64_t overlayEnd = 64;
+    bool ownedOverlay = false;
+    std::array<uint8_t, 32> snapshotHash() const;
     void setGeometry(bool floppy);
     void openOverlay();
     bool transfer(uint32_t lba, uint8_t* data, bool writing);
 };
 
 class Pc {
+    friend class Snapshot;
 public:
 
     // 设备共用以 PIT 输入频率为单位的虚拟时钟；CPU 指令数与宿主耗时分别计量。

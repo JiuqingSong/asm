@@ -6,6 +6,7 @@
 namespace asm86 {
 // 端口状态公开给 BIOS 生成配置表，显存平面/锁存器保留在设备内部。
 class Vga {
+    friend class Snapshot;
 public:
     Vga();
     void enableCirrus(bool enabled);

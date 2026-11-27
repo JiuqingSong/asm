@@ -4,6 +4,7 @@
 namespace asm86 {
 // 8259 PIC：IRR=pending、IMR=mask、ISR=service；取中断和发送 EOI 是两个不同阶段。
 class Pic {
+    friend class Snapshot;
 public:
     uint8_t mask = 0, pending = 0, service = 0, base = 8;
     void reset(uint8_t vector, bool standalone) {

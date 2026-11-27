@@ -16,6 +16,7 @@ enum class CpuModel { I8088, I286, I386, I486 };
 struct CpuFault { uint8_t vector; int code; };
 
 class Cpu {
+    friend class Snapshot;
 public:
 
     // 架构可见状态：通用/段寄存器、控制寄存器、描述符表和 x87。

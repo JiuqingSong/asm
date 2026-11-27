@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <ctime>
 #include <cmath>
 #include <sstream>
@@ -626,6 +627,17 @@ void Disk::discardOverlay() {
 Disk::~Disk() {
     if (overlayFile != INVALID_HANDLE_VALUE) CloseHandle(overlayFile);
     if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    if (ownedOverlay && !DeleteFileW(differential.c_str())) {
+        auto error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+            std::fprintf(stderr, "Snapshot: cannot delete resume overlay (Windows error %lu)\n", error);
+    }
+}
+
+std::array<uint8_t, 32> Disk::snapshotHash() const {
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size)) throw osError("Cannot size snapshot base disk");
+    return diskHash(file, uint64_t(size.QuadPart));
 }
 
 void Disk::create(const std::filesystem::path& p, unsigned cylinders) {
@@ -1972,9 +1984,9 @@ bool Pc::bios(uint8_t n) {
     case 0x19: rebootRequested = true; return true;
     case 0x1a: {
         if (ah == 0xb1) return pciBios(false);
-        // AH=0/1 读写 BDA tick；AH=2/4 取宿主本地时间/日期并编码成 BIOS BCD 字段。
+        // AH=0/1 读写 BDA tick；日期与 CMOS 共用虚拟 RTC，暂停/快照恢复不补宿主时间。
         auto bcd = [](int v) { return uint8_t((v / 10) * 16 + v % 10); };
-        auto now = std::time(nullptr); std::tm t{}; localtime_s(&t, &now);
+        auto now = rtcEpoch + std::time_t(clock / 1193182.0); std::tm t{}; localtime_s(&t, &now);
         if (ah == 0) { r[CX] = c.rwF(0x40, 0x6e); r[DX] = c.rwF(0x40, 0x6c); c.reg8(0, c.rbF(0x40, 0x70)); c.wbF(0x40, 0x70, 0); }
         else if (ah == 1) { c.wwF(0x40, 0x6e, r[CX]); c.wwF(0x40, 0x6c, r[DX]); }
         else if (ah == 2) { r[CX] = uint16_t((unsigned(bcd(t.tm_hour)) << 8) | bcd(t.tm_min)); r[DX] = uint16_t(unsigned(bcd(t.tm_sec)) << 8); }

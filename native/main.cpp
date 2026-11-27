@@ -3,6 +3,7 @@
 #include "preferences.h"
 #include "timing.h"
 #include "audio.h"
+#include "snapshot.h"
 #include <commdlg.h>
 #include <shellapi.h>
 #include <windowsx.h>
@@ -18,7 +19,7 @@
 // Win32 前端与无界面脚本共用 Pc；模拟执行、输入、绘图由同一消息线程协调。
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768, BootCd };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768, BootCd, SaveSnapshot, LoadSnapshot };
 std::unique_ptr<Pc> pc;
 AudioOutput audioOutput;
 std::unique_ptr<Preferences> preferences;
@@ -30,6 +31,7 @@ bool poweredOn = false;
 bool paused = false;
 
 std::function<bool()> confirmationDecision;
+std::function<std::filesystem::path()> snapshotSelection;
 
 auto statsOrigin = ExecutionTiming::HostClock::now();
 uint64_t statsInstructions = 0, statsDisk = 0, statsReads = 0, statsWrites = 0;
@@ -166,12 +168,13 @@ void centerMouse(HWND hwnd) {
         throw std::runtime_error("Cannot center captured mouse pointer");
 }
 
-std::filesystem::path choose(HWND hwnd, bool save, bool optical = false, bool overlay = false) {
+std::filesystem::path choose(HWND hwnd, bool save, bool optical = false, bool overlay = false, bool snapshot = false) {
+    if (snapshot && snapshotSelection) return snapshotSelection();
     wchar_t path[32768]{};
     OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = hwnd;
-    dialog.lpstrFilter = optical ? L"Optical images (*.iso)\0*.iso\0All files\0*.*\0"
+    dialog.lpstrFilter = snapshot ? L"Asm86 snapshots (*.asnp)\0*.asnp\0All files\0*.*\0" : optical ? L"Optical images (*.iso)\0*.iso\0All files\0*.*\0"
         : overlay ? L"Asm86 overlays (*.cow)\0*.cow\0All files\0*.*\0" : L"Disk images (*.img;*.ima)\0*.img;*.ima\0All files\0*.*\0";
-    dialog.lpstrFile = path; dialog.nMaxFile = DWORD(std::size(path)); dialog.lpstrDefExt = optical ? L"iso" : overlay ? L"cow" : L"img";
+    dialog.lpstrFile = path; dialog.nMaxFile = DWORD(std::size(path)); dialog.lpstrDefExt = snapshot ? L"asnp" : optical ? L"iso" : overlay ? L"cow" : L"img";
     dialog.Flags = OFN_EXPLORER | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | (save ? (overlay ? 0 : OFN_OVERWRITEPROMPT) : OFN_FILEMUSTEXIST);
     if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) return path;
     if (CommDlgExtendedError()) throw std::runtime_error("File selection dialog failed");
@@ -281,6 +284,41 @@ void execute(HWND hwnd) {
 void command(HWND hwnd, int id) {
     // 更换 CPU/硬盘和回滚必须真正关机；软盘/光盘可热换，但由设备检查忙碌/锁盘状态。
     switch (id) {
+    case SaveSnapshot: case LoadSnapshot: {
+        if (id == SaveSnapshot && !poweredOn) {
+            MessageBoxW(hwnd, L"Boot the machine before saving a snapshot.", L"Snapshot", MB_OK); break;
+        }
+        releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
+        bool wasRunning = running;
+        running = false;
+        try {
+            audioOutput.clear();
+            auto path = choose(hwnd, id == SaveSnapshot, false, false, true);
+            if (!path.empty()) {
+                if (id == SaveSnapshot) Snapshot::save(*pc, path);
+                else {
+                    auto restored = Snapshot::load(path);
+                    if (restored->sound.enabled) audioOutput.open();
+                    restored->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
+                    restored->sound.clearOutput = [] { audioOutput.clear(); };
+                    audioOutput.clear();
+                    pc = std::move(restored);
+                    poweredOn = !pc->powerOffRequested; paused = poweredOn;
+                    wasRunning = false;
+                    pressedKeys.fill(false); mouseFractionX = mouseFractionY = 0;
+                    configuredMemory = pc->cpu.supports386() ? unsigned(pc->cpu.mem.size() >> 20) : 0;
+                    defaultVideo = false;
+                    if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu486, Cpu8088 + unsigned(pc->cpu.model), MF_BYCOMMAND))
+                        throw std::runtime_error("Cannot update snapshot CPU menu");
+                    original(hwnd);
+                }
+            }
+        } catch (const std::exception& error) {
+            MessageBoxW(hwnd, wide(error.what()).c_str(), L"Snapshot failed", MB_OK | MB_ICONERROR);
+        }
+        running = wasRunning; executionTiming.reset(*pc); resetStats();
+        break;
+    }
     case LoadFloppy: {
         auto p = choose(hwnd, false);
         if (!p.empty()) {
@@ -562,7 +600,17 @@ int headless(const std::filesystem::path& script) {
         if (line.empty() || line[0] == '#') continue;
         auto split = line.find(' '); auto op = line.substr(0, split);
         auto arg = split == std::string::npos ? std::string() : line.substr(split + 1);
-        if (op == "run") {
+        if (op == "save-snapshot") {
+            if (arg.empty()) throw std::runtime_error("save-snapshot needs a path");
+            Snapshot::save(*pc, std::filesystem::u8path(arg));
+            std::cout << "Saved snapshot at instruction " << pc->instructions << '\n';
+        } else if (op == "load-snapshot") {
+            if (arg.empty()) throw std::runtime_error("load-snapshot needs a path");
+            auto restored = Snapshot::load(std::filesystem::u8path(arg));
+            // Headless execution intentionally has no host audio sink.
+            audioOutput.clear(); pc = std::move(restored);
+            std::cout << "Loaded snapshot at instruction " << pc->instructions << '\n';
+        } else if (op == "run") {
             uint64_t count = std::stoull(arg);
             while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->restartDrive()); }
         } else if (op == "realtime" || op == "wait-realtime" || op == "boot-normal") {
@@ -773,7 +821,26 @@ void headlessRegressionTests() {
 int application(int argc, wchar_t** argv) {
     // 先完整解析参数再打开硬盘，让 --hard 与 --overlay 顺序无关，并避免误开成可写底盘。
     pc = std::make_unique<Pc>();
-    std::filesystem::path script, hardPath, overlayPath; bool start = false, uiTest = false, discardOverlay = false, overlaySpecified = false;
+    bool loadingSnapshot = false;
+    for (int i = 1; i < argc; ++i) {
+        std::wstring option = argv[i];
+        if (option == L"--load-snapshot") loadingSnapshot = true;
+        if (option != L"--ui-test" && option != L"--discard-overlay" && option != L"--experimental-386" &&
+            option != L"--full-speed" && option != L"--normal-speed" && option != L"--stable-timing" && option != L"--real-time-timing") {
+            ++i;
+            if (option == L"--create-hard" && i + 1 < argc && std::wstring(argv[i + 1]).rfind(L"--", 0) != 0) ++i;
+        }
+    }
+    if (loadingSnapshot) {
+        for (int i = 1; i < argc; ++i) {
+            std::wstring option = argv[i];
+            if (option != L"--load-snapshot" && option != L"--save-snapshot" && option != L"--headless" &&
+                option != L"--full-speed" && option != L"--normal-speed" && option != L"--stable-timing" && option != L"--real-time-timing")
+                throw std::runtime_error("--load-snapshot supplies machine/media state; only headless, save-snapshot and speed/timing options may accompany it");
+            if (option == L"--load-snapshot" || option == L"--save-snapshot" || option == L"--headless") ++i;
+        }
+    }
+    std::filesystem::path script, hardPath, overlayPath, loadSnapshot, saveSnapshot; bool start = false, uiTest = false, discardOverlay = false, overlaySpecified = false;
     bool cpuSpecified = false, speedSpecified = false, timingSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring option = argv[i];
@@ -831,9 +898,16 @@ int application(int argc, wchar_t** argv) {
         else if (option == L"--boot") {
             pc->bootDrive = selectedBootDrive(value.wstring()); start = true;
         } else if (option == L"--headless") script = value;
+        else if (option == L"--load-snapshot") loadSnapshot = value;
+        else if (option == L"--save-snapshot") saveSnapshot = value;
         else throw std::runtime_error("Unknown command-line option");
     }
-    if (pc->sound.enabled) {
+    if (!loadSnapshot.empty() && (hardSpecified || floppySpecified || overlaySpecified || cpuSpecified || configuredMemory ||
+        !defaultVideo || pc->sound.enabled || pc->cdrom.medium() || start || discardOverlay || experimental386 || uiTest))
+        throw std::runtime_error("--load-snapshot supplies machine/media state; do not combine it with CPU, memory, video, sound, disk, boot or UI-test options");
+    if (!saveSnapshot.empty() && script.empty())
+        throw std::runtime_error("--save-snapshot requires --headless (saved after successful script completion)");
+    if (pc->sound.enabled && script.empty()) {
         audioOutput.open();
         pc->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
         pc->sound.clearOutput = [] { audioOutput.clear(); };
@@ -871,7 +945,7 @@ int application(int argc, wchar_t** argv) {
             std::cerr << std::dec << '\n';
         };
     }
-    if (!uiTest && script.empty()) {
+    if (!uiTest && script.empty() && loadSnapshot.empty()) {
         // 仅交互 GUI 恢复/保存用户偏好；headless 与 ui-test 完全隔离真实用户设置。
         preferences = std::make_unique<Preferences>();
         if (!cpuSpecified) pc->setModel(preferences->cpu());
@@ -910,10 +984,23 @@ int application(int argc, wchar_t** argv) {
     }
     if (configuredMemory && (uiTest || !script.empty())) pc->setModel(pc->cpu.model, configuredMemory);
     if (defaultVideo) pc->setCirrus(pc->cpu.supports386());
+    if (!loadSnapshot.empty()) {
+        pc = Snapshot::load(loadSnapshot);
+        if (script.empty()) {
+            configuredMemory = pc->cpu.supports386() ? unsigned(pc->cpu.mem.size() >> 20) : 0;
+            defaultVideo = false;
+            if (pc->sound.enabled) audioOutput.open();
+            pc->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
+            pc->sound.clearOutput = [] { audioOutput.clear(); };
+            poweredOn = !pc->powerOffRequested; paused = poweredOn;
+        }
+    }
     if (!script.empty()) {
         if (pc->vga.cirrus() && !pc->cpu.supports386()) throw std::runtime_error("PCI Cirrus requires a 386 or 486 CPU");
         if (start) pc->boot(pc->bootDrive);
-        return headless(script);
+        auto result = headless(script);
+        if (!saveSnapshot.empty()) Snapshot::save(*pc, saveSnapshot);
+        return result;
     }
     if (uiTest) headlessRegressionTests();
     if (pc->vga.cirrus() && !pc->cpu.supports386()) throw std::runtime_error("PCI Cirrus requires a 386 or 486 CPU");
@@ -945,6 +1032,8 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(machine, MF_STRING, CtrlAltDel, L"Ctrl+Alt+Del\tRight Ctrl+Del");
     AppendMenuW(machine, MF_STRING, Reset, L"Power off");
     AppendMenuW(machine, MF_STRING, PauseResume, L"Pause");
+    AppendMenuW(machine, MF_STRING, SaveSnapshot, L"Save snapshot...");
+    AppendMenuW(machine, MF_STRING, LoadSnapshot, L"Load snapshot (paused)...");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed, L"Full speed (real-time timers)");
     AppendMenuW(machine, MF_STRING | (stableTiming ? MF_CHECKED : MF_UNCHECKED), StableTiming, L"Stable CPU timing (Windows 98)");
@@ -971,7 +1060,7 @@ int application(int argc, wchar_t** argv) {
     for (unsigned i = 0; i < 256; ++i) {
         char ch = char(i); MultiByteToWideChar(437, 0, &ch, 1, &glyphs[i], 1); if (i == 0) glyphs[i] = L' ';
     }
-    if (!running) { pc->cpu.ww(0x40, 0x4a, 80); pc->cpu.wb(0x40, 0x60, 0x20); }
+    if (!running && loadSnapshot.empty()) { pc->cpu.ww(0x40, 0x4a, 80); pc->cpu.wb(0x40, 0x60, 0x20); }
     original(hwnd); title(hwnd); ShowWindow(hwnd, SW_SHOW); UpdateWindow(hwnd);
     executionTiming.reset(*pc); resetStats();
     if (!SetTimer(hwnd, 1, 16, nullptr)) throw std::runtime_error("Cannot start execution timer");
@@ -1480,6 +1569,43 @@ int application(int argc, wchar_t** argv) {
         running = false; removeResetImages();
         std::cout << "Ctrl+Alt+Del menu / Right-Ctrl+Del / capture release / floppy-first / hard-disk fallback / CPU-speed preservation checks passed\n";
         pc = std::move(savedPc);
+        for (auto snapshotModel : {CpuModel::I8088, CpuModel::I286, CpuModel::I486}) {
+            auto snapshotPath = std::filesystem::current_path() / (L"snapshot-ui-" + std::to_wstring(GetCurrentProcessId()) + L".asnp");
+            struct Cleanup {
+                std::filesystem::path path;
+                ~Cleanup() { snapshotSelection = {}; std::error_code error; std::filesystem::remove(path, error); }
+            } cleanup{snapshotPath};
+            pc = std::make_unique<Pc>(); pc->setModel(snapshotModel, snapshotModel == CpuModel::I486 ? 64 : 0);
+            auto& c = pc->cpu;
+            for (auto segment : {ES, CS, SS, DS}) c.loadSegment(segment, 0);
+            c.ip = 0x500; c.r[SP] = 0x9000;
+            const uint8_t loop[] = {0xff, 0x06, 0, 0x60, 0xeb, 0xfa};
+            std::copy(std::begin(loop), std::end(loop), c.mem.begin() + 0x500);
+            poweredOn = running = true; paused = false;
+            pc->runCpu(20);
+            auto savedInstructions = pc->instructions; auto savedClock = pc->clock; auto savedCounter = c.rw(0, 0x6000);
+            snapshotSelection = [&] { return snapshotPath; };
+            SendMessageW(hwnd, WM_COMMAND, SaveSnapshot, 0);
+            if (!std::filesystem::exists(snapshotPath) || !running || paused)
+                throw std::runtime_error("Snapshot save menu must persist state and preserve execution mode");
+            pc->runCpu(20);
+            SendMessageW(hwnd, WM_COMMAND, LoadSnapshot, 0);
+            if (!poweredOn || running || !paused || pc->instructions != savedInstructions || pc->clock != savedClock ||
+                pc->cpu.rw(0, 0x6000) != savedCounter)
+                throw std::runtime_error("Snapshot load menu must restore the full machine paused");
+            Sleep(50); SendMessageW(hwnd, WM_TIMER, 1, 0);
+            if (pc->clock != savedClock || pc->instructions != savedInstructions)
+                throw std::runtime_error("Loaded paused snapshot must not catch up elapsed host time");
+            SendMessageW(hwnd, WM_COMMAND, PauseResume, 0); SendMessageW(hwnd, WM_TIMER, 1, 0);
+            if (!running || pc->instructions <= savedInstructions || pc->clock - savedClock > ExecutionTiming::PitHz * 0.05)
+                throw std::runtime_error("GUI snapshot resume must execute without host-time catch-up");
+            poweredOn = running = paused = false;
+            SendMessageW(hwnd, WM_COMMAND, Cpu386, 0);
+            if (pc->cpu.model != CpuModel::I386 || pc->cpu.mem.size() != (snapshotModel == CpuModel::I486 ? 64u : 16u) * 1024 * 1024
+                || pc->vga.cirrus())
+                throw std::runtime_error("Snapshot CPU selection must preserve supported RAM and explicit VGA policy");
+            std::cout << "Snapshot save-load menus / guest rewind / paused load / no host catch-up / resumed guest checks passed\n";
+        }
         unsigned acceptedClose = 0;
         confirmationDecision = [&] { ++acceptedClose; return true; };
         poweredOn = true;

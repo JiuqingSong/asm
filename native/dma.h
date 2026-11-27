@@ -8,6 +8,7 @@ namespace asm86 {
 enum class DmaDirection : uint8_t { Verify, ToMemory, FromMemory };
 struct DmaResult { unsigned bytes = 0; bool terminal = false, error = false; };
 class DmaController {
+    friend class Snapshot;
 public:
 
     // 绑定 Cpu::readBus/writeBus，而非应用 CPU A20 的 readPhysical/writePhysical。

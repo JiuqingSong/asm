@@ -17,6 +17,7 @@ struct FpuContext {
 struct FpuMemoryOperation { unsigned size; bool write; };
 
 class Fpu {
+    friend class Snapshot;
 public:
 
     // registers/tags 按物理槽存放，ST(i)=(TOP+i)&7；control 默认屏蔽六类浮点异常。

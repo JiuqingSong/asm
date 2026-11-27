@@ -32,6 +32,90 @@ Windows 95 已完成真实安装，验证窗口/全屏 DOS 命令、`EXIT` 返�
 Windows 95 OSR2 完整安装由用户确认。Windows 9x 支持仍属实验性，不代表所有驱动或应用兼容。
 Windows 98 的完整安装、重新启动及安装后基本操作也已由用户验证。
 
+## Persistent native VM snapshots (version 1)
+
+Machine > **Save snapshot...** saves at an instruction boundary. **Load snapshot
+(paused)...** reconstructs a separate machine and resumes only after choosing
+**Resume**. Failed validation leaves the current machine/disks intact. File
+dialogs suspend execution; host timing is rebased afterward, never caught up.
+Mouse capture and host pressed-key tracking are released, and already-submitted
+host PCM is discarded; guest queues and the partially filled DSP PCM buffer are
+preserved. GUI snapshots release physical held keys before saving.
+
+Headless scripts accept `save-snapshot PATH` and `load-snapshot PATH`.
+`--load-snapshot PATH --headless SCRIPT` starts directly from saved state, without
+booting or opening remembered media. `--save-snapshot PATH --headless SCRIPT`
+saves only after the script succeeds. For example:
+
+```powershell
+.\native\build\asm86-native.exe --cpu 486 --memory 64 --hard "D:\ASM\Windows 2000.img" --overlay .\private.cow --boot c --headless .\capture.txt
+# capture.txt: run 5000000
+#              save-snapshot machine.asnp
+.\native\build\asm86-native.exe --load-snapshot .\machine.asnp --headless .\resume.txt
+# resume.txt: run 1000000
+.\native\run.ps1 -LoadSnapshot .\machine.asnp
+```
+
+`--load-snapshot` cannot accompany boot, CPU, RAM, video, sound or media options;
+it supplies those settings itself. Full-speed/stable-timing preferences are host
+execution policies, not snapshot contents, and may be selected separately.
+Script loading deliberately uses no host audio sink; guest SB2/DMA/IRQ state
+still advances. User preferences are not rewritten to point at resume forks.
+
+**Disk safety and exact limits:** writable file-backed disks **must use COW**;
+direct-write hard disks and writable file-backed floppies are rejected with an
+instruction to use `--hard BASE --overlay WRITES.cow`. Read-only disks/ISOs are
+referenced by absolute UTF-8 path and whole-file SHA256, not embedded: keep those
+base files at the saved paths with identical contents. Read locks prevent base
+mutation during capture/resume (including ISO media). The latest changed COW
+sectors are embedded, streamed one sector at a time. Load creates an independently
+owned `.resume.cow` sibling beside the snapshot; it never replaces, discards,
+rewinds or merges the original overlay/base. The snapshot directory therefore
+needs write permission for COW resume. Resume forks are deleted when that VM
+closes or its disk is replaced; **save another snapshot to retain new work**.
+Cleanup failures are logged; a crash or failed deletion can leave a resume fork.
+The volatile El Torito emulated floppy is embedded including its writes.
+Version 1 allows up to 256 MiB RAM, 4 MiB Cirrus VRAM, 1,048,576 distinct changed
+COW sectors (512 MiB), 65,536 entries per device queue, 32,768 UTF-8 bytes per
+path/notice, virtual clocks through 2^52 PIT ticks, and a 1 GiB total snapshot.
+It rejects larger captures rather than omitting state. Base hard disks may still
+be up to 32 GiB and are hashed/read in bounded chunks, never copied into RAM.
+
+The binary file has explicit little-endian fields, IEEE-754 virtual times,
+version/magic/length/reserved-field checks, payload CRC32, exact reads and bounded
+allocations. Saves flush a unique sibling file then atomically replace the
+destination; failures do not truncate an earlier snapshot. CRC32 detects
+accidental damage, **not authenticity**: only load snapshots you trust.
+All architectural/hidden CPU registers, task/segment caches, x87 registers/tags,
+RAM, VGA planes/latches/VRAM and partial BLTs, PIC/PIT/RTC/8042/serial/DMA,
+FDC/ATA/ATAPI commands and scheduled events, APM/PCI and SB2 state are serialized
+explicitly; pointers, host handles, C++ object layouts and callbacks are not.
+Device callbacks are rebound to the newly constructed `Pc`. RTC/BIOS dates
+advance with guest time rather than elapsed time while the snapshot is closed.
+
+Validation: `native-tests.exe --test-snapshots` covers an executing protected-mode
+guest with a changed GDT but live hidden DS cache, x87, partial
+ATA/ATAPI/FDC/BLT/PIT/8042/PIC/DSP commands, pending FDC/DSP DMA and IRQ, exact
+post-resume state equality, private COW rewind, atomic failure preservation,
+CRC/version/truncation/base mismatch and CRC-valid malformed allocation/boolean
+rejection. `asm86-native.exe --ui-test` also exercises both snapshot menu actions,
+paused load and no host-time catch-up. An installed Windows 2000 image was
+captured at 5,000,000 instructions and resumed for another 1,000,000: its complete
+post-resume snapshot matched uninterrupted execution byte-for-byte, and SHA256
+confirmed both the user's 2 GiB base and original private overlay were unchanged.
+That verifies protected-mode boot-loader save/resume, **not** kernel startup or
+completed NT installation. A real Windows 98 desktop at 128 MiB and 1024x768x8
+was also saved and resumed: 100,000 instructions of restored execution produced
+a byte-identical snapshot to uninterrupted execution, followed by verified APM
+shutdown. The original disk image remained unchanged. Neither test implies
+unrestricted OS/device compatibility.
+
+For an isolated build using the already built numerical library:
+`.\native\build.ps1 -Zig $zig -OutputDirectory .\native\build\snapshots
+-SoftFloatLibrary .\native\build\softfloat\softfloat.lib` (one command line).
+Then run `.\native\build\snapshots\native-tests.exe` and
+`.\native\build\snapshots\asm86-native.exe --ui-test`.
+
 ## 可选 ISA Sound Blaster PCM（首版）
 
 默认**关闭**，不改变现有 Windows/NT 客体的硬件探测。启动时用

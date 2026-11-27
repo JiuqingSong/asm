@@ -18,6 +18,7 @@
 // 实模式/VM86 默认 16 位；保护模式由 CS.D 决定，66h/67h 分别改变操作数/地址宽度。
 // GDT、TSS、页表、磁盘包和像素模式是数据，不可按指令反汇编；非法指令样本用于验证 #UD。
 using namespace asm86;
+void snapshotTests();
 namespace {
 void check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 
@@ -3976,12 +3977,16 @@ void unit() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--test-snapshots") {
+        try { snapshotTests(); return 0; }
+        catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
+    }
     try { if (argc == 2 && std::string(argv[1]) == "--test-sound") { soundTests(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--test-audio") { audioSmokeTest(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--benchmark-video") { videoBenchmarks(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--test-cirrus") { cirrusTests(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--benchmark") { benchmarks(); return 0; }
         if (argc == 2) return corpus(argv[1]); cirrusTests(); graphicsFrameTests(); physicalReadTests(); operandPagingTests(); preferenceTests(); timingTests(); cpu386Tests(CpuModel::I386); cpu386Tests(CpuModel::I486);
-        protectedTests(); atTests(CpuModel::I286); atTests(CpuModel::I386); atTests(CpuModel::I486); soundTests(); unit(); return 0; }
+        protectedTests(); atTests(CpuModel::I286); atTests(CpuModel::I386); atTests(CpuModel::I486); soundTests(); snapshotTests(); unit(); return 0; }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

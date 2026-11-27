@@ -7,6 +7,7 @@
 namespace asm86 {
 // UART 寄存器和串口鼠标共用一套接收时间轴；回调由 Pc 路由到 IRQ4。
 class SerialMouse {
+    friend class Snapshot;
 public:
     void reset();
     uint8_t input(unsigned offset, double now);
