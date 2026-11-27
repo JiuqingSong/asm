@@ -29,7 +29,7 @@ private:
     enum class Action { None, Reset, Id, Transfer, Format };
     Phase phase = Phase::Command;
     Action action = Action::None;
-    uint8_t dor = 0x0c, rate = 0, perpendicular = 0;
+    uint8_t dor = 0x0c, rate = 0, perpendicular = 0, resetSense = 0;
     std::array<uint8_t, 4> cylinder{}, seekTarget{}, seekHead{};
     std::array<double, 4> seekTime{};
     std::array<uint8_t, 2> specify{}, config{0x20,0};

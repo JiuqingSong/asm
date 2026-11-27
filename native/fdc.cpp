@@ -8,7 +8,11 @@
 namespace asm86 {
 void FloppyController::signal() { if (interrupt) interrupt(irqPending && (dor & 8) && (dor & 4)); }
 
-void FloppyController::irq(bool raised) { irqPending = raised; signal(); }
+void FloppyController::irq(bool raised) {
+    // 新完成中断取代复位轮询状态，不影响 pending 中其它寻道完成事件。
+    if (raised) resetSense = 0;
+    irqPending = raised; signal();
+}
 
 void FloppyController::deadlines() {
     nextEvent = due;
@@ -24,7 +28,7 @@ void FloppyController::softReset() {
     if (dirty) { auto* image = activeDisk(); if (image) image->flush(); }
     phase = Phase::Command; action = Action::None;
     command.clear(); active.clear(); result.clear(); buffer.clear(); sectors.clear();
-    pending = {{{0xc0,0}},{{0xc1,0}},{{0xc2,0}},{{0xc3,0}}};
+    pending.clear(); resetSense = 0;
     seekTime.fill(std::numeric_limits<double>::infinity());
     due = nextEvent = std::numeric_limits<double>::infinity();
     if (!locked) config = {0x20,0};
@@ -148,7 +152,8 @@ void FloppyController::execute(double now) {
             | ((!image || image->heads > 1) ? 8 : 0) | (image && image->readOnly ? 0x40 : 0))}, false); return;
     case 8: { // SENSE INTERRUPT STATUS：消费一个复位/寻道完成的 ST0+PCN。
         irq(false);
-        if (pending.empty()) finish({0x80}, false);
+        if (resetSense) { auto drive = uint8_t(4 - resetSense--); finish({uint8_t(0xc0 | drive),0}, false); }
+        else if (pending.empty()) finish({0x80}, false);
         else { auto value = pending.front(); pending.pop_front(); finish({value[0],value[1]}, false); }
         return;
     }
@@ -190,7 +195,7 @@ void FloppyController::advance(double now) {
     if (now < due) { deadlines(); return; }
     auto next = action; action = Action::None; due = std::numeric_limits<double>::infinity(); deadlines();
     if (next == Action::None) return;
-    if (next == Action::Reset) { phase = Phase::Command; irq(true); return; }
+    if (next == Action::Reset) { phase = Phase::Command; irq(true); resetSense = 4; return; }
     auto* image = activeDisk();
     if (!image) { status(4, 0, cylinder[active[1] & 3], (active[1] >> 2) & 1, 1, 2); return; }
     if (next == Action::Id) {

@@ -762,6 +762,14 @@ void cpu386Tests(CpuModel model) {
         check(c.r[AX] == 0x1234 && c.s[op == 0xb2 ? SS : op == 0xb4 ? FS : GS] == 0x2000,
             "LSS/LFS/LGS must load the offset and segment of a real-mode far pointer");
     }
+    for (uint8_t op : {uint8_t(0xc4), uint8_t(0xc5)}) {
+        auto c = real(); c.r32(AX, 0x12345678);
+        c.onFault = [](CpuFault f, uint32_t) { throw f; };
+        bool rejected = false;
+        try { run(c, {op,0xc4}); } catch (const CpuFault& f) { rejected = f.vector == 6; }
+        check(rejected && c.ip == 0x500 && c.r32(AX) == 0x12345678 && !c.s[ES] && !c.s[DS],
+            "16-bit LES/LDS with a register source must raise #UD without modifying the destination");
+    }
     {
         auto c = real(); c.writeDword(0x4000, 0x12345678); c.writeWord(0x4004, 0x2000);
         const uint8_t code[] = {0x66,0x0f,0xb2,0x26,0,0x40,0x90}; // LSS ESP,[4000h] / NOP：检查 SS 中断影子。
@@ -1240,8 +1248,8 @@ void cpu386Tests(CpuModel model) {
             && c.readDword(0x9020) == (committed ? 0x3007u : 0xfeedfaceu),
             "Task-switch faults before commit must restart the caller; invalid incoming segments must fault in the new task");
     }
-    auto vm = [&](Cpu& c, uint32_t flags = 0x202) {
-        const uint32_t frame[] = {0x4000, 0, flags | 0x20000, 0xabcd8000, 0, 0x200, 0x300, 0x400, 0x500};
+    auto vm = [&](Cpu& c, uint32_t flags = 0x202, uint32_t offset = 0x4000) {
+        const uint32_t frame[] = {offset, 0, flags | 0x20000, 0xabcd8000, 0, 0x200, 0x300, 0x400, 0x500};
         auto sp = c.r32(SP) - uint32_t(sizeof(frame));
         for (unsigned i = 0; i < std::size(frame); ++i) c.writeSegment(SS, sp + i * 4, frame[i], 4);
         c.r32(SP, sp); c.mem[c.ip] = 0xcf; c.step();
@@ -1253,6 +1261,13 @@ void cpu386Tests(CpuModel model) {
         // VM86 仍按 segment<<4+IP 放代码；执行时再走用户态分页和 64 KiB 段界限检查。
         std::copy(code.begin(), code.end(), c.mem.begin() + (uint32_t(c.s[CS]) << 4) + c.ip);
     };
+    {
+        auto c = systemMachine(); vm(c, 0x3202, 0xf0004000);
+        check(c.ip == 0x4000 && c.r32(SP) == 0xabcd8000 && c.eflags() == 0x23202,
+            "IRETD from ring 0 to VM86 must discard high EIP bits without truncating ESP or EFLAGS");
+        vmCode(c, {0x90}); c.step();
+        check(c.ip == 0x4001, "VM86 must fetch the resumed instruction at the low 16-bit IP");
+    }
     auto bitmap = [&](Cpu& c, uint32_t limit = 0x2068) {
         systemDescriptor(c, 0x38, 0x9000, limit, 0x89);
         c.r[AX] = 0x38; c.mem[c.ip] = 0x0f; c.mem[c.ip + 1] = 0; c.mem[c.ip + 2] = 0xd8; c.step();
@@ -1324,6 +1339,15 @@ void cpu386Tests(CpuModel model) {
             && c.r32(SP) == 0xabcd8000 + (wide ? 12u : 6u) && (c.flags & CF) && !(c.flags & 0x4000)
             && bool(c.eflags() & 0x10000) == wide,
             "VM86 IRET/IRETD at IOPL 3 must ignore NT and retain VM/IOPL while restoring real-mode CS:IP");
+    }
+    {
+        auto c = systemMachine(); gate(c, c.idtr.base + 6 * 8, 0x12000, 8, 0x8e);
+        vm(c, 0x3202); c.r32(AX, 0x12345678); vmCode(c, {0xc4,0xc4});
+        c.step(); auto sp = c.r32(SP);
+        check(c.cpl == 0 && c.ip == 0x12000 && c.r32(AX) == 0x12345678
+            && c.readDword(sp) == 0x4000 && c.readDword(sp + 4) == 0
+            && (c.readDword(sp + 8) & 0x20000) && c.readDword(sp + 12) == 0xabcd8000,
+            "NT's C4 C4 VM86 BIOS exit must deliver #UD to the monitor at the faulting IP without an error-code slot");
     }
     for (uint8_t op : {uint8_t(0xcc), uint8_t(0xce), uint8_t(0xcd)}) {
         auto c = systemMachine(); unsigned vector = op == 0xcc ? 3 : op == 0xce ? 4 : 0x21;
@@ -1961,6 +1985,94 @@ void x87Tests() {
     std::cout << "x87 discovery / extended precision / integer rounding / save-restore / #NM-#MF / paged VM86 atomicity / protected SIB checks passed\n";
 }
 
+void memoryFirmwareTests(const std::filesystem::path& disk) {
+    for (unsigned mib : {16u, 32u, 64u, 128u, 256u}) {
+        Pc p; p.setModel(CpuModel::I486, mib); auto& c = p.cpu;
+        p.hard = std::make_unique<Disk>(disk, false, true); p.boot(0x80);
+        auto bytes = size_t(mib) << 20;
+        auto call = [&](uint32_t ax) {
+            c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.loadSegment(ES, 0);
+            c.r[SP] = 0x9000; c.ip = 0x500; c.halted = c.waiting = false; c.setFlags(CF | DF | 2);
+            c.mem[0x500] = 0xcd; c.mem[0x501] = 0x15; c.mem[0x502] = 0xf4; c.r32(AX, ax);
+            p.runCpu(100);
+            check(c.halted && c.r[SP] == 0x9000 && (c.flags & DF), "Memory BIOS must return through IRET preserving its stack and unrelated flags");
+        };
+        check(c.mem.size() == bytes, "Boot must retain configured physical RAM");
+        c.a20 = true; c.writePhysical(uint32_t(bytes - 1), 0x5a);
+        check(c.readPhysical(uint32_t(bytes - 1)) == 0x5a && c.readPhysical(uint32_t(bytes)) == 0xff,
+            "The last configured RAM byte must be writable without mapping bytes above RAM");
+        if (mib > 16) {
+            c.writePhysical(0x1000000, 0xa5);
+            check(c.readPhysical(0x1000000) == 0xa5 && c.readPhysical(0) != 0xa5, "RAM above 16 MiB must not wrap onto low memory");
+        }
+        call(0x8800);
+        check(!(c.flags & CF) && c.r[AX] == std::min<size_t>((bytes - 0x100000) >> 10, 0xfc00),
+            "AH=88h must report actual extended RAM with its legacy 63 MiB limit");
+        call(0xe801);
+        check(!(c.flags & CF) && c.r[AX] == 15360 && c.r[CX] == c.r[AX]
+            && c.r[BX] == (bytes - 0x1000000) >> 16 && c.r[DX] == c.r[BX],
+            "E801 must split RAM at 16 MiB and return both AX/BX and CX/DX");
+        call(0xc000);
+        check(!(c.flags & CF) && c.reg8(4) == 0 && c.s[ES] == 0xf000 && c.r[BX] == 0xe6f5
+            && c.rw(c.s[ES], c.r[BX]) == 8 && c.rb(c.s[ES], uint16_t(c.r[BX] + 2)) == c.mem[0xffffe]
+            && c.rb(c.s[ES], uint16_t(c.r[BX] + 5)) == 0x60,
+            "AT configuration discovery must return a valid ROM table advertising only implemented ISA/PIC/RTC features");
+        auto cmosWord = [&](uint8_t index) {
+            c.out(0x70, index); auto low = c.in(0x71); c.out(0x70, uint8_t(index + 1));
+            return low | (unsigned(c.in(0x71)) << 8);
+        };
+        check(cmosWord(0x17) == std::min<size_t>((bytes - 0x100000) >> 10, 0xffff)
+            && cmosWord(0x30) == cmosWord(0x17) && cmosWord(0x34) == (bytes - 0x1000000) >> 16,
+            "Both CMOS extended-memory copies and high-memory blocks must agree with physical RAM");
+        for (unsigned length : {20u, 24u}) {
+            uint32_t token = 0; uint64_t usable = 0;
+            for (unsigned entry = 0; entry < 4; ++entry) {
+                std::fill(c.mem.begin() + 0x6000, c.mem.begin() + 0x6018, 0xa5);
+                c.r32(BX, token); c.r32(CX, length); c.r32(DX, 0x534d4150); c.r[DI] = 0x6000;
+                call(0xe820);
+                auto base = uint64_t(c.readDword(0x6000)) | (uint64_t(c.readDword(0x6004)) << 32);
+                auto size = uint64_t(c.readDword(0x6008)) | (uint64_t(c.readDword(0x600c)) << 32);
+                auto type = c.readDword(0x6010);
+                check(!(c.flags & CF) && c.r32(AX) == 0x534d4150 && c.r32(CX) == length && c.r[DI] == 0x6000,
+                    "E820 must honor its signature, output size and caller buffer pointer");
+                if (type == 1) {
+                    check((base == 0 && size == 0xa0000) || (base == 0x100000 && base + size == bytes),
+                        "E820 usable ranges must exclude VGA/ROM and stop at installed RAM");
+                    usable += size;
+                } else check(type == 2 && ((base == 0xa0000 && size == 0x60000) || (base == 0xffff0000 && size == 0x10000)),
+                    "E820 must mark both low firmware/MMIO and the high reset ROM reserved");
+                check(c.readDword(0x6014) == (length == 24 ? 1u : 0xa5a5a5a5u), "E820 must enable extended entries without overwriting a 20-byte buffer");
+                token = c.r32(BX);
+                check(entry == 3 ? token == 0 : token != 0, "E820 continuation must terminate exactly at the final range");
+            }
+            check(usable == bytes - 0x60000, "E820 must enumerate all installed usable RAM exactly once");
+        }
+        for (unsigned invalid = 0; invalid < 5; ++invalid) {
+            c.r32(BX, invalid == 1 ? 4 : 0); c.r32(CX, invalid == 2 ? 19 : 24);
+            c.r32(DX, invalid == 0 ? 0 : 0x534d4150); c.r[DI] = invalid == 3 ? 0xfff0 : 0x6000;
+            auto offset = c.r[DI]; c.mem[offset] = 0xa5;
+            call(invalid == 4 ? 0x1e820 : 0xe820);
+            check((c.flags & CF) && c.reg8(4) == 0x86 && c.mem[offset] == 0xa5,
+                "Invalid E820 signature, continuation, size, segment boundary or EAX must fail without writing the buffer");
+        }
+        p.boot(0x80);
+        check(c.mem.size() == bytes && cmosWord(0x34) == (bytes - 0x1000000) >> 16,
+            "Cold restart must preserve RAM selection and regenerate matching CMOS");
+    }
+    Pc p; p.setModel(CpuModel::I386, 128); auto& c = p.cpu; c.a20 = true;
+    c.writeDword(0x1000, 0x2003); c.writeDword(0x2004, 0x7fff003);
+    c.writePhysical(0x7fff123, 0x42); c.cr3 = 0x1000; c.msw |= 0x80000001u;
+    check(c.readLinear(0x1123) == 0x42, "386 paging must reach physical RAM above the original 16 MiB limit");
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
+        p.setModel(model); auto size = p.cpu.mem.size();
+        bool rejected = false;
+        try { p.setModel(model, model < CpuModel::I386 ? 128 : 17); } catch (const std::runtime_error&) { rejected = true; }
+        check(rejected && p.cpu.model == model && p.cpu.mem.size() == size, "Invalid RAM configuration must preserve the previous CPU and allocation");
+        check(size == size_t(model == CpuModel::I8088 ? 1 : 16) << 20, "Omitted RAM selection must retain legacy defaults");
+    }
+    std::cout << "Configurable RAM / high physical paging / E820 enumeration and rejection / E801 / AH88 / CMOS / restart checks passed\n";
+}
+
 void x87IrqTests(const std::filesystem::path& disk) {
     // CR0.NE=0 走 AT 外部错误锁存/IRQ13，NE=1 走 #MF；清锁存不等同于清 x87 状态。
     Pc p; p.setModel(CpuModel::I486); p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
@@ -2441,6 +2553,9 @@ void graphicsBiosTests() {
     // 字体、像素 XOR、滚屏及字符读回验证 BIOS 功能与 VGA 内存布局的一致性。
     Pc p; auto& c = p.cpu;
     auto bios = [&](uint16_t ax) { c.r[AX] = ax; check(c.trap(0x10), "Graphics BIOS call was not handled"); };
+    c.r[BX] = 0x1234; c.r[CX] = 0x5678; c.r[DX] = 0x9abc; bios(0x2000);
+    check(c.r[AX] == 0x2000 && c.r[BX] == 0x1234 && c.r[CX] == 0x5678 && c.r[DX] == 0x9abc,
+        "NT optional display-extension probe must report absence without modifying caller registers");
     for (uint16_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
         bios(mode);
         unsigned height = c.rw(0x40, 0x85), columns = c.rw(0x40, 0x4a), rows = c.rb(0x40, 0x84) + 1;
@@ -3256,6 +3371,13 @@ void fdcTests(const std::filesystem::path& base) {
             send({8}); auto data = receive(2);
             check(data == std::vector<uint8_t>({0x20,1}) && c.in(0x3f7) == 0, "Seek completion must update PCN and clear a present medium's change line");
             c.out(0x20, 0x20); c.out(0x21, 0xff);
+            c.out(0x3f2, 0); c.out(0x3f2, 0x1c); tick();
+            send({8}); data = receive(2);
+            check(data == std::vector<uint8_t>({0xc0,0}), "Partial reset sensing must start at drive zero");
+            send({0x0f,0,1}); tick(); send({8}); data = receive(2);
+            check(data == std::vector<uint8_t>({0x20,1}),
+                "A new seek interrupt must replace unread reset statuses, not return another drive's reset status");
+            send({8}); check(receive(1)[0] == 0x80, "A seek completion must invalidate all remaining reset statuses");
             send({0x4a,0}); tick(); data = receive(7);
             check(data[0] == 0 && data[3] == 1 && data[6] == 2, "READ ID must use the current cylinder and 512-byte sector IDs");
             send({7,0}); tick(); send({8}); receive(2); send({3,0xdf,2});
@@ -3328,6 +3450,12 @@ void fdcTests(const std::filesystem::path& base) {
                 "BIOS floppy reads must turn on drive A's motor through the DOR before reading");
             check(call(0x0401, 0) == 0x1c && call(0x0201, 1) == 0x2d,
                 "BIOS floppy verify and drive B access must select the matching DOR motor");
+            check(call(0x0800, 0) == 0x0c && !(c.flags & CF) && c.s[ES] == 0xf000 &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 4)) == 18 &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 11)) == 79 &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 12)) == 0 &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 13)) == 4,
+                "Floppy AH=08 must return the extended DPT used by NT, including maximum track and transfer rate");
             check(call(0x0800, 0) == 0x0c && call(0x0000, 0) == 0x0c && call(0x0201, 2) == 0x0c && call(0x0201, 0x80) == 0x0c,
                 "BIOS parameter, reset, absent drive and hard disk calls must leave the DOR unchanged");
         }
@@ -3459,6 +3587,31 @@ void diskSizingTests(const std::filesystem::path& base) {
     auto floppyPath = std::filesystem::path(base.native() + L".footer");
     check(!std::filesystem::exists(floppyPath), "Footer fixture already exists");
     try {
+        Pc p; p.setModel(CpuModel::I486);
+        for (auto size : {360u, 1440u, 2880u}) {
+            {
+                std::vector<uint8_t> bytes(size * 1024);
+                std::ofstream f(floppyPath, std::ios::binary);
+                f.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+                check(bool(f), "Cannot write extended floppy parameter fixture");
+            }
+            p.floppy = std::make_unique<Disk>(floppyPath, true, false);
+            if (size == 360) {
+                std::array<uint8_t, 512> boot{}; boot[0] = 0xf4; boot[510] = 0x55; boot[511] = 0xaa;
+                check(p.floppy->write(0, boot.data()), "Cannot prepare extended floppy parameter fixture");
+                p.boot(0);
+            }
+            auto& c = p.cpu; c.loadSegment(CS, 0); c.ip = 0x500; c.halted = false;
+            c.r[AX] = 0x0800; c.r[DX] = 0; c.setFlags(2);
+            const uint8_t code[] = {0xcd, 0x13, 0xf4};
+            std::copy(std::begin(code), std::end(code), c.mem.begin() + c.ip); p.run(100);
+            check(c.halted && !(c.flags & CF) &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 4)) == (size == 360 ? 9 : size == 1440 ? 18 : 36) &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 11)) == (size == 360 ? 39 : 79) &&
+                c.rbF(c.s[ES], uint16_t(c.r[DI] + 12)) == (size == 360 ? 2 : size == 1440 ? 0 : 3),
+                "Extended DPT geometry and data rate must follow media replacement without rebooting");
+            p.floppy.reset(); std::filesystem::remove(floppyPath);
+        }
         std::vector<uint8_t> bytes(1440 * 1024 + 1024);
         bytes[11] = 0; bytes[12] = 2; bytes[19] = 0x40; bytes[20] = 0x0b;
         bytes[24] = 18; bytes[26] = 2; bytes[510] = 0x55; bytes[511] = 0xaa;
@@ -3664,7 +3817,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); diskFirmwareTests(path); cdBootTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); cirrusFirmwareTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); diskFirmwareTests(path); cdBootTests(path); atapiTests(path); memoryFirmwareTests(path); x87IrqTests(path); apmTests(path); cirrusFirmwareTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }

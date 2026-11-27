@@ -226,7 +226,6 @@ void Cpu::farReturn386(uint16_t adjustment, bool interruptReturn) {
     }
     if (interruptReturn && size == 4 && !cpl && (value & 0x20000)) {
         checkSegment(SS, sp, 36, false);
-        if (offset > 0xffff) fault(13, 0);
         auto newSp = at(12);
         std::array<uint16_t, 6> selectors{};
         selectors[CS] = selector; selectors[SS] = uint16_t(at(16));
@@ -234,7 +233,8 @@ void Cpu::farReturn386(uint16_t adjustment, bool interruptReturn) {
         selectors[FS] = uint16_t(at(28)); selectors[GS] = uint16_t(at(32));
         setEflags(value); cpl = 3;
         for (unsigned i = 0; i < selectors.size(); ++i) loadVirtualSegment(int(i), selectors[i]);
-        r32(SP, newSp); ip = offset; return;
+        // 返回 VM86 时硬件忽略 EIP 高 16 位，但保留完整 ESP。
+        r32(SP, newSp); ip = uint16_t(offset); return;
     }
     unsigned oldLevel = cpl, level = selector & 3;
     if (level < cpl) fault(13, selector & 0xfffc);

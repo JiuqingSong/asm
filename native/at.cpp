@@ -20,7 +20,11 @@ void Pc::resetAt() {
     // FDC 仅连接驱动器 0；光盘启动的 BIOS B: 映射不能冒充第二个 FDC 驱动器。
     cmos[0x10] = a ? uint8_t(a->floppyType << 4) : 0;
     cmos[0x12] = hard ? 0xf0 : 0; cmos[0x14] = uint8_t(0x20 | (a ? 1 : 0) | (cpu.hasFpu() ? 2 : 0));
-    cmos[0x15] = 0x80; cmos[0x16] = 2; cmos[0x18] = cmos[0x31] = at() ? 0x3c : 0;
+    cmos[0x15] = 0x80; cmos[0x16] = 2;
+    auto extended = at() ? std::min<size_t>((cpu.mem.size() - 0x100000) >> 10, 0xffff) : 0;
+    cmos[0x17] = cmos[0x30] = uint8_t(extended); cmos[0x18] = cmos[0x31] = uint8_t(extended >> 8);
+    auto high = cpu.mem.size() > 0x1000000 ? (cpu.mem.size() - 0x1000000) >> 16 : 0;
+    cmos[0x34] = uint8_t(high); cmos[0x35] = uint8_t(high >> 8);
     rtcEpoch = std::time(nullptr); nextRtc = std::numeric_limits<double>::infinity();
 }
 

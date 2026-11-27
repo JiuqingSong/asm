@@ -139,6 +139,8 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 .\native\run.ps1 -Cpu 486 -StableTiming -FullSpeed
 # 挂载 ISO；可用菜单从支持 El Torito 的光盘启动：
 .\native\run.ps1 -Cpu 486 -Cdrom 'D:\images\install.iso'
+# NT 安装兼容性测试：128 MiB 内存、基础 VGA，仍需菜单选择光盘启动：
+.\native\run.ps1 -Cpu 486 -Memory 128 -Video vga -Cdrom 'D:\images\windows2000.iso' -FullSpeed
 # 或直接指定映像：
 .\native\build\asm86-native.exe --hard 'D:\images\dos622.img' --boot c
 # 创建后续 Windows 安装用的 504 MiB 硬盘（目标必须不存在）：
@@ -147,6 +149,65 @@ $env:ZIG = 'C:\tools\zig\zig.exe'
 
 GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、屏幕全黑；
 `run.ps1` 或命令行加载映像也不会自动开机，用菜单选择启动设备。
+386/486 可用 `--memory 16/32/64/128/256`（MiB）或 `run.ps1 -Memory` 配置 RAM；
+未指定时仍为 16 MiB，8088/286 仍为 1/16 MiB，不接受内存覆盖。
+内存选项不保存到用户偏好；本次 GUI 会话切换到 8088/286 使用原始大小，切回 386/486 恢复指定值。
+BIOS E820 返回真实 RAM、VGA/ROM 保留区与高端复位 ROM；无 EBDA，常规内存为 640 KiB。
+E801 与 CMOS 34h/35h 报告 16 MiB 以上的 64 KiB 块，AH=88h 饱和至 63 MiB，
+CMOS 17h/18h、30h/31h 的扩展内存 KiB 值饱和至 FFFFh。
+Windows 2000 安装尚未完成；更大的内存不代表 NT 内核与设备驱动已兼容。
+AT 的 INT 15h/AH=C0h 返回 F000:E6F5 配置表，仅声明 ISA、从 PIC 和 RTC；
+NTDETECT 的 INT 10h/AX=2000h 可选显示探测按无扩展处理。
+
+### Windows 2000 初步验证
+
+使用用户提供的 Windows 2000 三合一光盘、独立 2 GiB 空白硬盘与 COW，
+以 486 / 128 MiB / 基础 VGA 引导 Professional 版，已验证：
+
+- El Torito 版本选择菜单、蓝色 `Windows 2000 Setup` 加载器与 F5 硬件类型选择页；
+- 可以明确选择 `Standard PC`，不需要先实现 ACPI/APIC；
+- NTDETECT 已越过显示扩展探测和 AT 配置表探测，NT 内核已开始执行；
+- 自动硬件选择路径已进入中文版安装欢迎页、许可协议与分区选择页；
+  Enter/F8 输入正常，安装程序通过原生 ATAPI 驱动识别独立测试用的 2 GiB ATA 硬盘。
+
+此前进入内核后的黑屏已定位为 `0x7F` 停机（#GP），不是单纯的设备等待：
+ring 0 的 IRETD 返回 VM86 时，应忽略栈上 EIP 的高 16 位并保留完整 ESP。
+NT 的 BIOS 中断模拟器会把 IVT 中的段:偏移双字写入返回 EIP；
+原先的 64 KiB 检查错误地拒绝了该地址。现已修正并增加 386/486 回归，
+实测停机消失、时钟和调度继续运行，安装画面与键盘交互正常。
+这一硬件行为也见于 [Bochs 的 VM86 实测说明](https://github.com/bochs-emu/Bochs/blob/master/bochs/cpu/vm8086.cc)，
+与部分 Intel 指令伪代码中的界限检查不同；仅修改进入 VM86 的 IRETD，不放宽普通段访问检查。
+
+用户完成文件复制后的 2 GiB NTFS 硬盘，已通过只读底盘与独立 COW 验证重启，
+进入 Windows 2000 Professional 图形安装的“请稍候”画面。此前的
+`Invalid partition table` 并非分区损坏，而是 VM86 BIOS 返回后的 `C4 C4`
+没有产生应有的 #UD，误执行了低端内存中的旧 MBR。16 位 LES/LDS 的寄存器源
+现已在 286/386/486 上正确拒绝，并覆盖实模式与 VM86 回归，不修改用户的分区表。
+
+创建分区、格式化及文件复制尚未端到端自动验证，图形安装向导完成与桌面仍未验证，
+因此不能宣称已经能完整安装或运行 Windows 2000。
+在图形安装“请稍候”阶段的 240 秒观测中，时钟继续推进，CPU 主要运行空闲线程，
+硬盘读取停止增长但仍有少量周期写入；`setup.exe` 的主线程在等待工作线程，
+尚未定位该工作线程等待的根因，不能将其解释为单纯速度慢。
+前端仅在客体启用 COM1 串口鼠标后捕获鼠标，此时鼠标未启用，因此点击不捕获
+并不意味着宿主消息循环卡死。
+
+### Windows NT 3.51 初步验证
+
+使用只读的三张 Server 安装软盘与独立硬盘 COW，已复现第二张软盘加载后的
+`0x7B / C0000034`，并定位到软驱没有被枚举：
+INT 13h/AH=08h 的扩展 DPT 缺少最大磁道号，NT 把该字段读成 0 后放弃该驱动器。
+现返回完整的基础参数与最大磁道号、数据率、驱动器类型，换盘后同步更新。
+同时修正 FDC 的复位 SENSE 状态：新寻道/传输中断须使未读的复位状态失效，
+但不能丢弃其它寻道完成事件；否则 NT 的重新校准会误读成其它单元的复位。
+
+上述修正后原来的 `0x7B` 已消失，安装程序继续到显卡初始化，
+但仍报告 `Setup has encountered a fatal error while initializing your computer's video`
+及 `(0, 0xc0000034)`；默认 Cirrus 与基础 VGA 均复现。
+尚未验证第三张安装盘、安装欢迎页或完整安装，不绕过客体的错误检查。
+
+现有 DOS、Windows 3.1、Windows 95 回归通过。Windows 98 已分别实测默认 16 MiB 与
+128 MiB，系统属性正确显示对应 RAM，保留 800×600×8、32 位文件系统/虚拟内存与正常 APM 关机。
 `--boot a/c/cd` 仅在 `--headless` 脚本模式自动引导，GUI 仍需菜单启动：
 
 - **Disks > Create C: hard disk > 31.5 / 126 / 504 MiB / 2 / 8 / 32 GiB**：

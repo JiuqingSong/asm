@@ -59,6 +59,16 @@ static std::runtime_error biosError(Cpu& c, uint8_t number) {
     return std::runtime_error(message.str());
 }
 
+static void installFloppyParameters(Cpu& cpu, const Disk* disk) {
+    auto type = disk ? disk->floppyType : 4;
+    const uint8_t dpt[] = {
+        0xdf, 2, 0x25, 2, uint8_t(disk ? disk->spt : 18), 0x1b, 0xff, 0x6c, 0xf6, 15, 8,
+        uint8_t(disk ? disk->biosCylinders() - 1 : 79),
+        uint8_t(type == 5 ? 3 : type == 1 || type == 3 ? 2 : 0), uint8_t(type)
+    };
+    std::copy(std::begin(dpt), std::end(dpt), cpu.mem.begin() + 0xfefc7);
+}
+
 static void installDiskFirmware(Cpu& cpu) {
     // ESDI_506 截获 INT 13h 期间的 IDE I/O，以关联 BIOS 80h 和主通道硬盘。
     // 按 diskrom.ts 的客体 PIO 路径实现传统读/写/校验，不能只从宿主复制扇区。
@@ -781,7 +791,7 @@ Pc::Pc() {
     };
 }
 
-void Pc::setModel(CpuModel model) { cpu.setModel(model); keys.clear(); resetAt(); }
+void Pc::setModel(CpuModel model, unsigned memoryMiB) { cpu.setModel(model, memoryMiB); keys.clear(); resetAt(); }
 
 void Pc::setCirrus(bool enabled) {
     vga.enableCirrus(enabled); pciAddress = 0; pciCommand = 3;
@@ -1071,9 +1081,8 @@ void Pc::boot(uint8_t drive) {
     cpu.ww(0x40, 0x6c, uint16_t(ticks)); cpu.ww(0x40, 0x6e, uint16_t(ticks >> 16));
 
     // DPT 是数据，不是机器码：步进/卸载、加载、停转等待、N=2（512 字节）、每道扇区数、
-    // 读写 gap、DTL、格式化 gap、填充值 F6h、磁头稳定等待、电机启动等待。
-    const uint8_t dpt[] = {0xdf, 2, 0x25, 2, uint8_t(floppyDisk() ? floppyDisk()->spt : 18), 0x1b, 0xff, 0x6c, 0xf6, 15, 8};
-    std::copy(std::begin(dpt), std::end(dpt), cpu.mem.begin() + 0xfefc7);
+    // 读写 gap、DTL、格式化 gap、填充值 F6h、磁头稳定/电机启动等待，以及扩展磁道/速率/类型。
+    installFloppyParameters(cpu, floppyDisk());
     cpu.ww(0, 0x1e * 4, 0xefc7); cpu.ww(0, 0x1e * 4 + 2, 0xf000);
     if (hard) {
         cpu.ww(0, 0x41 * 4, 0xe401); cpu.ww(0, 0x41 * 4 + 2, 0xf000);
@@ -1083,6 +1092,11 @@ void Pc::boot(uint8_t drive) {
     const char date[] = "11/08/82";
     std::copy(date, date + 8, cpu.mem.begin() + 0xffff5);
     cpu.mem[0xffffe] = at() ? 0xfc : 0xfe;
+    if (at()) {
+        // AT 配置表：ISA、从 PIC、RTC；不声明未实现的 EBDA、键盘拦截或 DMA 硬盘 BIOS。
+        const uint8_t configuration[] = {8, 0, 0xfc, 0, 0, 0x60, 0, 0, 0, 0};
+        std::copy(std::begin(configuration), std::end(configuration), cpu.mem.begin() + 0xfe6f5);
+    }
     const uint8_t reset[] = {0xea, 0x00, 0x06, 0x00, 0xf0}; // JMP FAR F000:0600（EA、offset16、segment16）。
     std::copy(std::begin(reset), std::end(reset), cpu.mem.begin() + 0xffff0);
     cpu.wb(0xf000, 0x600, 0xf1); cpu.wb(0xf000, 0x601, 0x19); // BIOS_TRAP 19h：重新引导。
@@ -1592,6 +1606,9 @@ bool Pc::video() {
     }
     case 0x1a: c.reg8(0, 0x1a); r[BX] = 8; return true;
     case 0x1b: c.reg8(0, 0); return true;
+    case 0x20:
+        if (!al) return true; // NTDETECT 可选显示扩展探测：无提供者，不返回支持签名。
+        break;
     case 0x4f: r[AX] = 0x014f; return true; // 尚无 VBE/SVGA（含 DDC），返回 VBE 失败状态。
     case 0x6f: r[BX] = 0; return true; // 无 Video Seven 扩展。
     case 0xef: return true; // 无 MSHERC 驻留接口，保留调用者的非 Hercules 哨兵。
@@ -1630,7 +1647,7 @@ bool Pc::disk() {
             c.wwF(0x40, 0x10, uint16_t((c.rwF(0x40, 0x10) & ~0xc1u) | (floppy ? 1 : 0)));
             cmos[0x10] = floppy ? uint8_t(floppy->floppyType << 4) : 0;
             cmos[0x14] = uint8_t((cmos[0x14] & ~0xc1u) | (floppy ? 1 : 0));
-            c.wbF(0xf000, 0xefcb, uint8_t(floppy ? floppy->spt : 18));
+            installFloppyParameters(c, floppy.get());
         }
         c.reg8(4, 0); c.stackedFlag(CF, false); return true;
     }
@@ -1650,7 +1667,10 @@ bool Pc::disk() {
         int cy = d ? d->biosCylinders() - 1 : 79, heads = d ? d->biosHeads() : 2, spt = d ? d->spt : 18;
         r[CX] = uint16_t(((cy & 255) << 8) | ((cy >> 2) & 0xc0) | spt);
         r[DX] = uint16_t(((heads - 1) << 8) | (hd ? (hard ? 1 : 0) : floppyDisk(1) ? 2 : 1));
-        if (!hd) { c.reg8(3, d ? uint8_t(d->floppyType) : 4); c.loadSegment(ES, 0xf000); r[DI] = 0xefc7; }
+        if (!hd) {
+            installFloppyParameters(c, d);
+            c.reg8(3, d ? uint8_t(d->floppyType) : 4); c.loadSegment(ES, 0xf000); r[DI] = 0xefc7;
+        }
         status(0); return true;
     }
     if (ah == 0x15) {
@@ -1856,9 +1876,37 @@ bool Pc::bios(uint8_t n) {
         c.reg8(4, input(0x3fd)); c.reg8(0, input(0x3fe)); return true;
     case 0x15:
 
-        // 53h=APM，88h=扩展内存 KiB，24h=A20，87h=按描述符拷贝 CX 个字的扩展内存块。
+        // E820/E801/88h 共用真实 RAM 大小；A0000h..FFFFFh 是 VGA/ROM 保留区，无 EBDA。
         if (ah == 0x53) return apm();
-        if (ah == 0x88) { r[AX] = at() ? 15360 : 0; c.stackedFlag(CF, false); }
+        if (at() && ah == 0xc0) {
+            c.loadSegment(ES, 0xf000); r[BX] = 0xe6f5; c.reg8(4, 0); c.stackedFlag(CF, false); return true;
+        }
+        if (c.supports386() && c.r32(AX) == 0xe820) {
+            unsigned length = c.r32(CX) >= 24 ? 24 : 20;
+            auto entry = c.r32(BX);
+            if (c.r32(DX) != 0x534d4150 || c.r32(CX) < 20 || entry >= 4 || unsigned(r[DI]) + length > 0x10000) {
+                c.reg8(4, 0x86); c.stackedFlag(CF, true); return true;
+            }
+            struct Range { uint64_t base, length; uint32_t type; };
+            const Range ranges[] = {{0, 0xa0000, 1}, {0xa0000, 0x60000, 2},
+                {0x100000, c.mem.size() - 0x100000, 1}, {0xffff0000, 0x10000, 2}};
+            auto put = [&](unsigned offset, uint64_t value, unsigned count) {
+                for (unsigned i = 0; i < count; ++i) c.wbF(c.s[ES], uint16_t(r[DI] + offset + i), uint8_t(value >> (i * 8)));
+            };
+            put(0, ranges[entry].base, 8); put(8, ranges[entry].length, 8); put(16, ranges[entry].type, 4);
+            if (length == 24) put(20, 1, 4);
+            c.r32(AX, 0x534d4150); c.r32(BX, entry == 3 ? 0 : entry + 1); c.r32(CX, length);
+            c.stackedFlag(CF, false);
+        }
+        else if (at() && r[AX] == 0xe801) {
+            r[AX] = r[CX] = uint16_t(std::min<size_t>(c.mem.size() - 0x100000, 0xf00000) >> 10);
+            r[BX] = r[DX] = uint16_t(c.mem.size() > 0x1000000 ? (c.mem.size() - 0x1000000) >> 16 : 0);
+            c.stackedFlag(CF, false);
+        }
+        else if (ah == 0x88) {
+            r[AX] = at() ? uint16_t(std::min<size_t>((c.mem.size() - 0x100000) >> 10, 0xfc00)) : 0;
+            c.stackedFlag(CF, false);
+        }
         else if (at() && ah == 0x24 && c.reg8(0) <= 3) {
             switch (c.reg8(0)) {
             case 0: case 1:

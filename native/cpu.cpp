@@ -568,7 +568,7 @@ void Cpu::execute(uint8_t op) {
     case 0xc0: case 0xc2: { auto n = fetch16(), off = pop(); ip = off; r[SP] += n; return; }
     case 0xc1: case 0xc3: ip = pop(); return;
     case 0xc4: case 0xc5: { // LES/LDS r16,m16:16：装载远指针的偏移与段。
-        modrm(); if (model == CpuModel::I286 && mod == 3) fault(6);
+        modrm(); if (model != CpuModel::I8088 && mod == 3) fault(6);
         auto off = rwS(eaSeg, eaOff), seg = rwS(eaSeg, uint16_t(eaOff + 2));
         loadSegment(op == 0xc4 ? ES : DS, seg); r[reg] = off; return;
     }

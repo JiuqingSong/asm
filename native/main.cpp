@@ -37,6 +37,7 @@ bool rightCtrlDown = false;
 bool fullSpeed = false;
 bool stableTiming = false;
 bool defaultVideo = true;
+unsigned configuredMemory = 0;
 bool mouseCaptured = false;
 std::array<bool, 128> pressedKeys{};
 double mouseFractionX = 0, mouseFractionY = 0;
@@ -75,6 +76,7 @@ void title(HWND hwnd) {
     if (pc->hard && pc->hard->hasOverlay()) value += L" | Overlay: " + pc->hard->overlayPath().filename().wstring();
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
     if (pc->vga.cirrus()) value += L" | PCI Cirrus GD5446";
+    value += L" | RAM: " + std::to_wstring(pc->cpu.mem.size() >> 20) + L" MiB";
     value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 && stableTiming ? L" | Normal speed (486 ~32 MIPS virtual)"
         : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
         : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
@@ -340,7 +342,8 @@ void command(HWND hwnd, int id) {
         poweredOn = running = paused = false; resetStats(); if (pc->hard) pc->hard->flush(); break;
     case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
         if (poweredOn || running) { MessageBoxW(hwnd, L"Power off the machine before changing the CPU (Machine > Power off).", L"CPU", MB_OK); break; }
-        pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088);
+        pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088,
+            id == Cpu386 || id == Cpu486 ? configuredMemory : 0);
         if (defaultVideo) pc->setCirrus(pc->cpu.supports386());
         poweredOn = false;
         if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu486, id, MF_BYCOMMAND))
@@ -623,7 +626,7 @@ int headless(const std::filesystem::path& script) {
             }
             pc->cpu.cr2 = cr2;
             std::cout << std::dec << " steps=" << pc->instructions << " video=" << unsigned(pc->vga.mode)
-                << " COM1-mouse=" << pc->serialMouse.active() << '\n';
+                << " COM1-mouse=" << pc->serialMouse.active() << " RAM-MiB=" << (pc->cpu.mem.size() >> 20) << '\n';
             if (pc->cpu.supports386()) {
                 std::cout << std::hex << "386 EFLAGS=" << pc->cpu.eflags() << " CR2=" << pc->cpu.cr2 << " CR3=" << pc->cpu.cr3;
                 for (int i = 0; i < 8; ++i) std::cout << ' ' << pc->cpu.r32(i);
@@ -804,6 +807,11 @@ int application(int argc, wchar_t** argv) {
             pc->setCirrus(value == L"cirrus");
             defaultVideo = false;
         }
+        else if (option == L"--memory") {
+            if (value != L"16" && value != L"32" && value != L"64" && value != L"128" && value != L"256")
+                throw std::runtime_error("--memory must be 16, 32, 64, 128 or 256 MiB");
+            configuredMemory = unsigned(std::stoul(value.wstring()));
+        }
         else if (option == L"--boot") {
             pc->bootDrive = selectedBootDrive(value.wstring()); start = true;
         } else if (option == L"--headless") script = value;
@@ -846,6 +854,7 @@ int application(int argc, wchar_t** argv) {
         // 仅交互 GUI 恢复/保存用户偏好；headless 与 ui-test 完全隔离真实用户设置。
         preferences = std::make_unique<Preferences>();
         if (!cpuSpecified) pc->setModel(preferences->cpu());
+        if (configuredMemory) pc->setModel(pc->cpu.model, configuredMemory);
         if (!speedSpecified) fullSpeed = preferences->fullSpeed();
         if (!timingSpecified) stableTiming = preferences->stableTiming();
         if (!hardSpecified) {
@@ -878,6 +887,7 @@ int application(int argc, wchar_t** argv) {
         if (hardSpecified) preferences->hard(pc->hard->path);
         if ((hardSpecified || overlaySpecified) && pc->hard) preferences->overlay(pc->hard->overlayPath());
     }
+    if (configuredMemory && (uiTest || !script.empty())) pc->setModel(pc->cpu.model, configuredMemory);
     if (defaultVideo) pc->setCirrus(pc->cpu.supports386());
     if (!script.empty()) {
         if (pc->vga.cirrus() && !pc->cpu.supports386()) throw std::runtime_error("PCI Cirrus requires a 386 or 486 CPU");

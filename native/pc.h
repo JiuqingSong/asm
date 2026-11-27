@@ -79,7 +79,7 @@ public:
     bool powerOffRequested = false;
     std::string notice;
     Pc();
-    void setModel(CpuModel model);
+    void setModel(CpuModel model, unsigned memoryMiB = 0);
     void setCirrus(bool enabled);
     bool at() const { return cpu.model != CpuModel::I8088; }
     void boot(uint8_t drive);

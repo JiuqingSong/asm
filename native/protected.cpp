@@ -6,7 +6,13 @@
 
 // 保护模式语义：段权限、描述符/门、特权栈、任务切换与可重启异常。
 namespace asm86 {
-void Cpu::setModel(CpuModel value) { model = value; mem.resize(value != CpuModel::I8088 ? 1 << 24 : 1 << 20); a20 = false; reset(); }
+void Cpu::setModel(CpuModel value, unsigned memoryMiB) {
+    if (memoryMiB && (value < CpuModel::I386 ||
+        (memoryMiB != 16 && memoryMiB != 32 && memoryMiB != 64 && memoryMiB != 128 && memoryMiB != 256)))
+        throw std::runtime_error("Memory must be 16, 32, 64, 128 or 256 MiB with a 386 or 486 CPU");
+    mem.resize(size_t(memoryMiB ? memoryMiB : value == CpuModel::I8088 ? 1 : 16) << 20);
+    model = value; a20 = false; reset();
+}
 
 void Cpu::setFlags(uint16_t value) {
     flags = uint16_t((value & (model == CpuModel::I8088 || (model == CpuModel::I286 && !protectedMode()) ? 0x0fd5 : 0x7fd5))

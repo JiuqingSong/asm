@@ -79,7 +79,7 @@ public:
     void push(uint16_t value);
     uint16_t pop();
     void interrupt(uint8_t number, int code = -1, bool software = false, bool external = false);
-    void setModel(CpuModel value);
+    void setModel(CpuModel value, unsigned memoryMiB = 0);
     bool supports386() const { return model >= CpuModel::I386; }
     void setFlags(uint16_t value);
     uint32_t inputPort(uint16_t port, unsigned size);
