@@ -1884,7 +1884,7 @@ bool Pc::bios(uint8_t n) {
         c.reg8(4, input(0x3fd)); c.reg8(0, input(0x3fe)); return true;
     case 0x15:
 
-        // E820/E801/88h 共用真实 RAM 大小；A0000h..FFFFFh 是 VGA/ROM 保留区，无 EBDA。
+        // VGA/扩展 ROM 窗口不列为 RAM，也不占用为固件资源；E820 只保留实际 BIOS ROM。
         if (ah == 0x53) return apm();
         if (at() && ah == 0xc0) {
             c.loadSegment(ES, 0xf000); r[BX] = 0xe6f5; c.reg8(4, 0); c.stackedFlag(CF, false); return true;
@@ -1896,7 +1896,7 @@ bool Pc::bios(uint8_t n) {
                 c.reg8(4, 0x86); c.stackedFlag(CF, true); return true;
             }
             struct Range { uint64_t base, length; uint32_t type; };
-            const Range ranges[] = {{0, 0xa0000, 1}, {0xa0000, 0x60000, 2},
+            const Range ranges[] = {{0, 0xa0000, 1}, {0xf0000, 0x10000, 2},
                 {0x100000, c.mem.size() - 0x100000, 1}, {0xffff0000, 0x10000, 2}};
             auto put = [&](unsigned offset, uint64_t value, unsigned count) {
                 for (unsigned i = 0; i < count; ++i) c.wbF(c.s[ES], uint16_t(r[DI] + offset + i), uint8_t(value >> (i * 8)));

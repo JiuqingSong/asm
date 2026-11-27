@@ -242,10 +242,14 @@ INT 13h/AH=08h 的扩展 DPT 缺少最大磁道号，NT 把该字段读成 0 后
 同时修正 FDC 的复位 SENSE 状态：新寻道/传输中断须使未读的复位状态失效，
 但不能丢弃其它寻道完成事件；否则 NT 的重新校准会误读成其它单元的复位。
 
-上述修正后原来的 `0x7B` 已消失，安装程序继续到显卡初始化，
-但仍报告 `Setup has encountered a fatal error while initializing your computer's video`
-及 `(0, 0xc0000034)`；默认 Cirrus 与基础 VGA 均复现。
-尚未验证第三张安装盘、安装欢迎页或完整安装，不绕过客体的错误检查。
+上述修正后原来的 `0x7B` 已消失。接着定位并修正了显卡初始化
+`(0, 0xc0000034)`：E820 错将 VGA / 扩展 ROM 窗口全部声明为固件保留资源，
+使 NT 的资源仲裁器拒绝 VGA 显存范围，删除 `\Device\Video0`。
+现只将实际 BIOS ROM 声明为固件保留，VGA / 扩展 ROM 窗口保持内存空洞，
+不声明为 RAM；这与 [SeaBIOS 的内存初始化策略](https://github.com/coreboot/seabios/blob/master/src/malloc.c)
+一致。独立 COW 已实测基础 VGA 与默认 PCI Cirrus 均成功进入 `Welcome to Setup`，
+没有绕过客体检查。
+第三张安装盘及完整安装尚未验证。
 
 现有 DOS、Windows 3.1、Windows 95 回归通过。Windows 98 已分别实测默认 16 MiB 与
 128 MiB，系统属性正确显示对应 RAM，保留 800×600×8、32 位文件系统/虚拟内存与正常 APM 关机。

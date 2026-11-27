@@ -2055,8 +2055,8 @@ void memoryFirmwareTests(const std::filesystem::path& disk) {
                     check((base == 0 && size == 0xa0000) || (base == 0x100000 && base + size == bytes),
                         "E820 usable ranges must exclude VGA/ROM and stop at installed RAM");
                     usable += size;
-                } else check(type == 2 && ((base == 0xa0000 && size == 0x60000) || (base == 0xffff0000 && size == 0x10000)),
-                    "E820 must mark both low firmware/MMIO and the high reset ROM reserved");
+                } else check(type == 2 && ((base == 0xf0000 && size == 0x10000) || (base == 0xffff0000 && size == 0x10000)),
+                    "E820 must reserve actual BIOS ROM without claiming VGA or option-ROM device resources");
                 check(c.readDword(0x6014) == (length == 24 ? 1u : 0xa5a5a5a5u), "E820 must enable extended entries without overwriting a 20-byte buffer");
                 token = c.r32(BX);
                 check(entry == 3 ? token == 0 : token != 0, "E820 continuation must terminate exactly at the final range");
