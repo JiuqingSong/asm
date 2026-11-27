@@ -353,6 +353,7 @@ void operandPagingTests() {
             if (address == 0x30002) c.writeDword(entry, 0x40027);
             return c.mem[address];
         };
+        c.validateTlb(); // 宿主改了 MMIO 窗口与钩子，按约定使 TLB 失效（Pc 在每段执行前自动做）。
         c.step();
         check(c.r32(AX) == 0x77665511 && c.ip == 0x8006 && reads == 3,
             "Instruction MMIO reads may remap the remaining immediate bytes and must not be prefetched");
@@ -743,6 +744,7 @@ void cpu386Tests(CpuModel model) {
     auto run = [](Cpu& c, const std::vector<uint8_t>& code, uint32_t at = 0x500) {
         // 限步保护：正常程序以 F4h（HLT）结束；故障样本由异常向量中的 HLT 结束。
         std::copy(code.begin(), code.end(), c.mem.begin() + at); c.ip = at; c.halted = false;
+        c.validateTlb(); // 与 Pc 每段执行前相同：测试可能在两段之间改了内存钩子。
         for (unsigned i = 0; i < 1000 && !c.halted; ++i) c.step();
         check(c.halted, "386 test program did not halt");
     };

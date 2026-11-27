@@ -31,7 +31,7 @@ public:
     void init();
     uint16_t statusWord() const;
     uint16_t tagWord() const;
-    bool pending() const;
+    bool pending() const { return (status & ~control & 0x3f) != 0; } // 未屏蔽的 x87 异常；每条指令都查询，保持内联。
     Float80 st(unsigned i = 0) const;
     uint8_t tag(unsigned i = 0) const;
 

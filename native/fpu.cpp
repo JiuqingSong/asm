@@ -85,7 +85,6 @@ uint16_t Fpu::tagWord() const {
     return word;
 }
 
-bool Fpu::pending() const { return (status & ~control & 0x3f) != 0; }
 
 Float80 Fpu::st(unsigned i) const { return registers[(top + i) & 7]; }
 

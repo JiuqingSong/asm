@@ -25,25 +25,6 @@ void Cpu::requireRing0() const { if (protectedMode() && cpl) fault(13, 0); }
 
 void Cpu::requireIo() const { if (protectedMode() && cpl > unsigned((flags >> 12) & 3)) fault(13, 0); }
 
-uint32_t Cpu::segmentBase(int segment) const {
-    return protectedMode() || (hiddenSegments & (1 << segment)) ? segments[segment].base : uint32_t(s[segment]) << 4;
-}
-
-void Cpu::checkSegment(int segment, uint32_t offset, unsigned size, bool write, bool execute) const {
-    if (!protectedMode() || virtual8086()) {
-        if (supports386() && uint64_t(offset) + size - 1 > segments[segment].limit) fault(segment == SS ? 12 : 13, 0);
-        return;
-    }
-    const auto& d = segments[segment]; uint8_t vector = segment == SS ? 12 : 13;
-    if (d.null || !(d.access & 0x80)) fault(vector, 0);
-
-    // LOADALL 可能给 CS 隐藏缓存安装可写数据描述符，执行检查不能假设它一定是代码段。
-    if (!execute && (write ? ((d.access & 8) || !(d.access & 2)) : ((d.access & 10) == 8))) fault(vector, 0);
-    uint64_t end = uint64_t(offset) + size - 1;
-    if ((d.access & 12) == 4) { if (offset <= d.limit || end > (d.attributes & 0x40 ? 0xffffffffu : 65535u)) fault(vector, 0); }
-    else if (end > d.limit) fault(vector, 0);
-}
-
 uint8_t Cpu::rbS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 1, false);
     return supports386() ? readLinear(segmentBase(segment) + offset) : readPhysical(segmentBase(segment) + offset);
@@ -53,6 +34,10 @@ uint16_t Cpu::rwS(int segment, uint32_t offset) {
     checkSegment(segment, offset, 2, false);
     auto base = segmentBase(segment);
     if (supports386()) {
+        if (((base + offset) & 4095) <= 4094)
+            if (auto* host = hostAddress(base + offset, false, userAccess())) {
+                checkAlignment(base + offset, 2); return uint16_t(host[0] | (host[1] << 8));
+            }
         std::array<uint32_t, 4> physical{};
         bool contiguous = translateOperand(base + offset, 2, false, physical);
         checkAlignment(base + offset, 2);
@@ -71,6 +56,10 @@ void Cpu::wbS(int segment, uint32_t offset, uint8_t value) {
 void Cpu::wwS(int segment, uint32_t offset, uint16_t value) {
     checkSegment(segment, offset, 2, true); auto base = segmentBase(segment);
     if (supports386()) {
+        if (((base + offset) & 4095) <= 4094)
+            if (auto* host = hostAddress(base + offset, true, userAccess())) {
+                checkAlignment(base + offset, 2); host[0] = uint8_t(value); host[1] = uint8_t(value >> 8); return;
+            }
         std::array<uint32_t, 4> physical{};
         translateOperand(base + offset, 2, true, physical);
         checkAlignment(base + offset, 2);
@@ -466,14 +455,21 @@ void Cpu::step() {
     // fault 与 trap 的返回位置不同：指令失败先恢复可见状态，再投递异常。
     // 异常投递再次失败可能升级为 #DF；投递 #DF 也失败则为三重故障/复位。
     if (model == CpuModel::I8088) { stepInstruction(); return; }
-    auto save = [&]() { return std::make_tuple(r, upperR, s, segments, ip, flags, upperFlags, cpl, hiddenSegments); };
-    auto restore = [&](const auto& state) {
-        std::tie(r, upperR, s, segments, ip, flags, upperFlags, cpl, hiddenSegments) = state;
+    // 每条指令都要保存回滚状态；直接按成员初始化结构体，避免 make_tuple 的临时对象和二次复制。
+    struct Rollback {
+        std::array<uint16_t, 8> r, upperR; std::array<uint16_t, 6> s; std::array<Segment, 6> segments;
+        uint32_t ip, upperFlags; unsigned cpl; uint16_t flags; uint8_t hiddenSegments;
+    };
+    auto save = [&]() { return Rollback{r, upperR, s, segments, ip, upperFlags, cpl, flags, hiddenSegments}; };
+    auto restore = [&](const Rollback& state) {
+        r = state.r; upperR = state.upperR; s = state.s; segments = state.segments; ip = state.ip;
+        upperFlags = state.upperFlags; cpl = state.cpl; flags = state.flags; hiddenSegments = state.hiddenSegments;
     };
     auto before = save(); auto oldAddress = segmentBase(CS) + ip;
     taskCommitted = false;
-    try { stepInstruction(); }
+    try { stepInstruction(); fetchCount = 0; }
     catch (const CpuFault& f) {
+        fetchCount = 0;
         if (!taskCommitted) restore(before);
         if (onFault) onFault(f, oldAddress);
         auto pending = f;

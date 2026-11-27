@@ -8,6 +8,9 @@ New-Item -ItemType Directory -Force $output | Out-Null
 $optimization = '-O2'
 if ($Debug) { $optimization = '-O0' }
 $common = @('c++', '-std=c++17', $optimization, '-g', '-Wall', '-Wextra', '-Werror', '-DUNICODE', '-D_UNICODE')
+# ThinLTO lets the CPU core inline across cpu.cpp / 386.cpp / protected.cpp / pc.cpp (about 10% faster).
+# Full -flto is avoided: with zig 0.14 on Windows it breaks C++ exception catching (CpuFault, runtime_error).
+if (-not $Debug) { $common += '-flto=thin' }
 $softfloat = $SoftFloatLibrary
 if ($softfloat) {
     $softfloat = (Resolve-Path -LiteralPath $softfloat).Path
@@ -21,6 +24,8 @@ if ($LASTEXITCODE -ne 0) { throw 'Native application build failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Native tests build failed' }
 & $Zig @common '-municode' @core "$root\image.cpp" "$root\test-os-disk.cpp" $softfloat -o "$output\os-disk-check.exe" -luser32 -ladvapi32
 if ($LASTEXITCODE -ne 0) { throw 'OS disk verifier build failed' }
+& $Zig @common '-municode' "$root\sampler.cpp" -o "$output\sampler.exe" -ldbghelp -lpsapi -lwinmm
+if ($LASTEXITCODE -ne 0) { throw 'Sampling profiler build failed' }
 if ($output -ne (Join-Path $root 'build')) {
     Copy-Item -LiteralPath "$root\build\softfloat-license.txt" -Destination (Join-Path $output 'softfloat-license.txt')
 }

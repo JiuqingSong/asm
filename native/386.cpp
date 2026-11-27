@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -23,6 +24,11 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
     // 线性地址拆成 10 位页目录索引、10 位页表索引、12 位页内偏移；仅支持 4 KiB 页。
     if (!supports386() || !(msw & 0x80000000u)) {
         if constexpr (Operand) *access = true;
+        // 分页关闭：缓存恒等映射，供 hostAddress 直接访问宿主内存。
+        if (supports386()) {
+            if (tlbStale()) flushTlb();
+            if (tlbEntry(address).key != tlbKey(address)) fillTlb(address, address & 0xfffff000u, 0x46);
+        }
         return address;
     }
 
@@ -32,13 +38,10 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
     const bool user = !supervisor && (cpl == 3 || virtual8086());
 
     // TLB 命中且本次访问的权限、D 位都已满足时直接返回；其余情况走完整页表遍历，
-    // 由遍历产生精确的 #PF 并更新 A/D 位。外部直接改写 CR3/CR0 或 MMIO 窗口时整体失效。
-    // 设置了写观察器或只写 MMIO 时不使用 TLB：它们可能在一次访问中途改写页表。
-    if (cr3 != tlbCr3 || (msw & 0x80010000u) != tlbMsw || mmioStart != tlbMmioStart || mmioEnd != tlbMmioEnd) flushTlb();
-    const auto page = address >> 12;
-    auto& entry = tlb[page & (TlbEntries - 1)];
-    const bool cacheable = !onWrite && (!mmioWrite || mmioRead);
-    if (entry.page == page && cacheable) {
+    // 由遍历产生精确的 #PF 并更新 A/D 位。外部直接改写 CR3/CR0、A20、MMIO 窗口或内存钩子时整体失效。
+    if (tlbStale()) flushTlb();
+    const auto& entry = tlbEntry(address);
+    if (entry.key == tlbKey(address)) {
         const unsigned bits = entry.bits;
         bool allowed = !user || ((bits & 4) && (!write || (bits & 2)));
         if (write && allowed) allowed = (bits & 0x40) &&
@@ -70,16 +73,25 @@ uint32_t Cpu::translatePage(uint32_t address, bool write, std::conditional_t<Ope
     auto updated = pte | 0x20 | (write ? 0x40 : 0);
     if (updated != pte) writeDword(table, updated);
     // 只有完整通过权限检查的遍历才填入 TLB；产生 #PF 的访问不会留下条目。
-    // 页表或目标页位于 MMIO 时每次访问都重新遍历：MMIO 读取可能中途改写页表，必须立即生效。
+    // 页表位于 MMIO 时每次访问都重新遍历：MMIO 读取可能中途改写页表，必须立即生效。
     const auto frame = pte & 0xfffff000u;
-    if (cacheable && physicalRam(directory, 4) && physicalRam(table, 4) && physicalRam(frame, 1))
-        entry = {page, frame, uint8_t((pde & pte & 6) | (updated & 0x40))};
+    if (physicalRam(directory, 4) && physicalRam(table, 4)) fillTlb(address, frame, uint8_t((pde & pte & 6) | (updated & 0x40)));
     return frame | (address & 4095);
 }
 
+void Cpu::fillTlb(uint32_t linear, uint32_t frame, uint8_t bits) {
+    // 写观察器或只写 MMIO 可能在一次访问中途改写页表；目标页含 MMIO 时须逐字节走总线。两者都不缓存。
+    if (onWrite || (mmioWrite && !mmioRead)) return;
+    auto* host = physicalRam(frame, 4096);
+    if (!host) return;
+    tlbEntry(linear) = {tlbKey(linear), const_cast<uint8_t*>(host), frame, bits};
+}
+
 void Cpu::flushTlb() {
-    for (auto& entry : tlb) entry.page = ~0u;
+    // 递增代号即可让所有条目失效；代号回绕时才真正清零。
+    if (++tlbGeneration == 0) { for (auto& entry : tlb) entry.key = 0; tlbGeneration = 1; }
     tlbCr3 = cr3; tlbMsw = msw & 0x80010000u; tlbMmioStart = mmioStart; tlbMmioEnd = mmioEnd;
+    tlbA20 = a20; tlbHooks = memoryHooks(); tlbMemory = mem.data();
 }
 
 uint32_t Cpu::translate(uint32_t address, bool write, bool supervisor) {
@@ -98,12 +110,18 @@ bool Cpu::translateOperand(uint32_t address, unsigned size, bool write, std::arr
 }
 
 uint32_t Cpu::fetchWide(unsigned size) {
+    if (ip - startIp + size <= fetchCount && ip - startIp < fetchCount) {
+        uint32_t value = 0; std::memcpy(&value, fetchHost + (ip - startIp), size); ip += size; return value;
+    }
     // 单页、段界限内、普通 RAM 才批量取指；否则逐字节访问以保留异常及 MMIO 顺序。
     auto linear = segmentBase(CS) + ip;
     const auto& code = segments[CS];
     if (supports386() && ip - startIp <= 15 - size && uint64_t(ip) + size - 1 <= code.limit
         && (code.access & 12) != 4 && (linear & 4095) <= 4096 - size) {
         checkSegment(CS, ip, size, false, true);
+        if (auto* host = hostAddress(linear, false, userAccess())) {
+            uint32_t value = 0; std::memcpy(&value, host, size); ip += size; return value;
+        }
         bool stable = false;
         auto physical = translatePage<true>(linear, false, &stable);
         if (stable) {
@@ -122,9 +140,15 @@ uint32_t Cpu::fetchWide(unsigned size) {
     return value;
 }
 
-uint8_t Cpu::readLinear(uint32_t address, bool supervisor) { return readPhysical(translate(address, false, supervisor)); }
+uint8_t Cpu::readLinear(uint32_t address, bool supervisor) {
+    if (auto* host = hostAddress(address, false, !supervisor && userAccess())) return *host;
+    return readPhysical(translate(address, false, supervisor));
+}
 
-void Cpu::writeLinear(uint32_t address, uint8_t value, bool supervisor) { writePhysical(translate(address, true, supervisor), value); }
+void Cpu::writeLinear(uint32_t address, uint8_t value, bool supervisor) {
+    if (auto* host = hostAddress(address, true, !supervisor && userAccess())) { *host = value; return; }
+    writePhysical(translate(address, true, supervisor), value);
+}
 
 void Cpu::checkAlignment(uint32_t address, unsigned size) const {
     if (model == CpuModel::I486 && protectedMode() && cpl == 3 && (msw & 0x40000)
@@ -153,6 +177,10 @@ uint32_t Cpu::readSegment(int segment, uint32_t offset, unsigned size) {
     if (size != 4) throw std::runtime_error("Invalid CPU memory operand size");
     checkSegment(segment, offset, size, false);
     auto base = segmentBase(segment); uint32_t value = 0;
+    if (((base + offset) & 4095) <= 4092)
+        if (auto* host = hostAddress(base + offset, false, userAccess())) {
+            checkAlignment(base + offset, size); std::memcpy(&value, host, 4); return value;
+        }
     std::array<uint32_t, 4> physical{};
     bool contiguous = translateOperand(base + offset, size, false, physical);
     checkAlignment(base + offset, size);
@@ -167,6 +195,9 @@ void Cpu::writeSegment(int segment, uint32_t offset, uint32_t value, unsigned si
     if (size == 2) { wwS(segment, offset, uint16_t(value)); return; }
     if (size != 4) throw std::runtime_error("Invalid CPU memory operand size");
     checkSegment(segment, offset, size, true);
+    const auto linear = segmentBase(segment) + offset;
+    if ((linear & 4095) <= 4092)
+        if (auto* host = hostAddress(linear, true, userAccess())) { checkAlignment(linear, size); std::memcpy(host, &value, 4); return; }
     std::array<uint32_t, 4> physical{};
     translateOperand(segmentBase(segment) + offset, size, true, physical);
     checkAlignment(segmentBase(segment) + offset, size);
@@ -639,12 +670,14 @@ void Cpu::system386() {
 
 bool Cpu::exec386(uint8_t op) {
     // 先承接需要宽度/保护检查的共同指令，剩余 16 位形式退回基础核心。
-    if (op == 0x0f) { system386(); return true; }
-    if (op == 0xcd) {
+    // 用 switch 直接跳转（GNU case 范围），避免每条指令依次比较二十多个条件；各分支都以 return 结束。
+    switch (op) {
+    case 0x0f: { system386(); return true; }
+    case 0xcd: {
         auto number = fetch8(); if (virtual8086()) requireIo();
         interrupt(number, -1, true); return true;
     }
-    if (op == 0x9c || op == 0x9d) {
+    case 0x9c: case 0x9d: {
         // PUSHF[D]/POPF[D]：VM86 受 IOPL 限制，压栈时不暴露 VM/RF 位。
         if (virtual8086()) requireIo();
         unsigned size = operand32 ? 4 : 2;
@@ -655,7 +688,7 @@ bool Cpu::exec386(uint8_t op) {
         }
         return true;
     }
-    if ((op >= 0x70 && op <= 0x7f) || op == 0xeb) {
+    case 0x70 ... 0x7f: case 0xeb: {
         auto displacement = int8_t(fetch8());
         if (op == 0xeb || cond(op & 15)) {
             auto target = operand32 ? ip + displacement : uint16_t(ip + displacement);
@@ -663,31 +696,31 @@ bool Cpu::exec386(uint8_t op) {
         }
         return true;
     }
-    if ((op >= 0xa4 && op <= 0xaf && op != 0xa8 && op != 0xa9) || (op >= 0x6c && op <= 0x6f)) {
+    case 0xa4 ... 0xa7: case 0xaa ... 0xaf: case 0x6c ... 0x6f: {
         string386(op); return true;
     }
-    if (op == 0x8c || op == 0x8e) {
+    case 0x8c: case 0x8e: {
         modrm(); if (reg > GS || (op == 0x8e && reg == CS)) fault(6);
         if (op == 0x8c) setRM(mod == 3 && operand32 ? 4 : 2, s[reg]);
         else { loadSegment(reg, uint16_t(getRM(2))); if (reg == SS) inhibit = true; }
         return true;
     }
-    if (op == 0x8d) { modrm(); if (mod == 3) fault(6); setReg(operand32 ? 4 : 2, reg, eaOff); return true; }
-    if (op == 0x8f) {
+    case 0x8d: { modrm(); if (mod == 3) fault(6); setReg(operand32 ? 4 : 2, reg, eaOff); return true; }
+    case 0x8f: {
         // POP [ESP+...] 的目标地址以出栈后的 ESP 计算，而非译码时的旧 ESP。
         modrm(); if (reg) fault(6);
         auto oldSp = r32(SP), value = popValue(operand32 ? 4 : 2);
         if (eaUsesSp) eaOff += r32(SP) - oldSp;
         setRM(operand32 ? 4 : 2, value); return true;
     }
-    if (op == 0xe8 || op == 0xe9) {
+    case 0xe8: case 0xe9: {
         auto displacement = fetch(operand32 ? 4 : 2);
         auto target = operand32 ? ip + displacement : uint16_t(ip + displacement);
         checkSegment(CS, target, 1, false, true);
         if (op == 0xe8) pushValue(ip, operand32 ? 4 : 2);
         ip = target; return true;
     }
-    if (op == 0xc8) {
+    case 0xc8: {
         // ENTER imm16,imm8：建立栈帧并复制嵌套帧链；C9 LEAVE 则恢复 BP/EBP。
         auto allocation = fetch16(); unsigned level = fetch8() & 31, size = operand32 ? 4 : 2;
         pushValue(getReg(int(size), BP), size); auto frame = stackPointer(), bp = getReg(int(size), BP);
@@ -698,11 +731,11 @@ bool Cpu::exec386(uint8_t op) {
         auto sp = stackPointer() - allocation; if (!(segments[SS].attributes & 0x40)) sp = uint16_t(sp);
         checkSegment(SS, sp, 1, true); setReg(int(size), BP, frame); stackPointer(sp); return true;
     }
-    if (op == 0xc9) {
+    case 0xc9: {
         stackPointer(segments[SS].attributes & 0x40 ? r32(BP) : r[BP]);
         setReg(operand32 ? 4 : 2, BP, popValue(operand32 ? 4 : 2)); return true;
     }
-    if (op >= 0xe0 && op <= 0xe3) {
+    case 0xe0 ... 0xe3: {
         auto displacement = int8_t(fetch8()); auto count = address32 ? r32(CX) : r[CX];
         if (op != 0xe3) { --count; if (address32) r32(CX, count); else { r[CX] = uint16_t(count); count = r[CX]; } }
         bool take = op == 0xe3 ? !count : count && (op == 0xe2 || (bool(flags & ZF) == (op == 0xe1)));
@@ -712,17 +745,20 @@ bool Cpu::exec386(uint8_t op) {
         }
         return true;
     }
-    if (op == 0xd7) { auto address = (address32 ? r32(BX) : r[BX]) + reg8(0); reg8(0, rbS(overrideSeg >= 0 ? overrideSeg : DS, address32 ? address : uint16_t(address))); return true; }
-    if (op >= 0xa0 && op <= 0xa3) {
+    case 0xd7: { auto address = (address32 ? r32(BX) : r[BX]) + reg8(0); reg8(0, rbS(overrideSeg >= 0 ? overrideSeg : DS, address32 ? address : uint16_t(address))); return true; }
+    case 0xa0 ... 0xa3: {
         auto address = address32 ? fetch32() : fetch16(); int size = op & 1 ? (operand32 ? 4 : 2) : 1, segment = overrideSeg >= 0 ? overrideSeg : DS;
         if (op & 2) writeSegment(segment, address, getReg(size, AX), unsigned(size));
         else setReg(size, AX, readSegment(segment, address, unsigned(size)));
         return true;
     }
+    default: break;
+    }
     if (!operand32) return false;
 
     // 以下只处理 32 位操作数版本：编码与基础核心相同，寄存器/栈元素宽度改为 4 字节。
-    if (op < 0x40 && (op & 7) < 6 && (op & 1)) {
+    switch (op) {
+    case 0x01: case 0x03: case 0x05: case 0x09: case 0x0b: case 0x0d: case 0x11: case 0x13: case 0x15: case 0x19: case 0x1b: case 0x1d: case 0x21: case 0x23: case 0x25: case 0x29: case 0x2b: case 0x2d: case 0x31: case 0x33: case 0x35: case 0x39: case 0x3b: case 0x3d: { // 00..3D 中的字/双字 ALU 形式。
         int kind = (op >> 3) & 7;
         if ((op & 7) >= 4) { auto value = alu32(kind, r32(AX), fetch32()); if (kind != 7) r32(AX, value); }
         else {
@@ -731,17 +767,16 @@ bool Cpu::exec386(uint8_t op) {
         }
         return true;
     }
-    if (op < 0x40 && (op & 7) == 6) { pushValue(s[(op >> 3) & 3], 4); return true; }
-    if (op < 0x20 && (op & 7) == 7) { auto value = popValue(4); loadSegment((op >> 3) & 3, uint16_t(value)); return true; }
-    if (op >= 0x40 && op <= 0x4f) {
+    case 0x06: case 0x0e: case 0x16: case 0x1e: case 0x26: case 0x2e: case 0x36: case 0x3e: { pushValue(s[(op >> 3) & 3], 4); return true; }
+    case 0x07: case 0x17: case 0x1f: { auto value = popValue(4); loadSegment((op >> 3) & 3, uint16_t(value)); return true; }
+    case 0x40 ... 0x4f: {
         auto carry = flags & CF; auto value = alu32(op & 8 ? 5 : 0, r32(op & 7), 1);
         r32(op & 7, value); flags = uint16_t((flags & ~CF) | carry); return true;
     }
-    if (op >= 0x50 && op <= 0x57) { pushValue(r32(op & 7), 4); return true; }
-    if (op >= 0x58 && op <= 0x5f) { auto value = popValue(4); r32(op & 7, value); return true; }
-    if (op >= 0xb8 && op <= 0xbf) { r32(op & 7, fetch32()); return true; }
-    if (op >= 0x91 && op <= 0x97) { auto value = r32(AX); r32(AX, r32(op & 7)); r32(op & 7, value); return true; }
-    switch (op) {
+    case 0x50 ... 0x57: { pushValue(r32(op & 7), 4); return true; }
+    case 0x58 ... 0x5f: { auto value = popValue(4); r32(op & 7, value); return true; }
+    case 0xb8 ... 0xbf: { r32(op & 7, fetch32()); return true; }
+    case 0x91 ... 0x97: { auto value = r32(AX); r32(AX, r32(op & 7)); r32(op & 7, value); return true; }
     case 0x60: { auto sp = r32(SP); for (unsigned i = 0; i < 8; ++i) pushValue(i == SP ? sp : r32(i), 4); break; } // PUSHAD：保存原 ESP。
     case 0x61: for (int i = 7; i >= 0; --i) { auto value = popValue(4); if (i != SP) r32(i, value); } break; // POPAD：跳过 ESP 槽。
     case 0x62: { // BOUND r32,m32&32：检查有符号上下界，越界触发 #BR。

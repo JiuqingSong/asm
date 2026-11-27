@@ -750,6 +750,7 @@ Pc::Pc() {
         else for (unsigned i = 0; i < size; ++i) cpu.out(uint16_t(port + i), uint8_t(value >> (i * 8)));
     };
     cpu.irq = [this]() { return acknowledge(); };
+    cpu.irqRequest = {&pic[0].pending, &pic[0].mask, &pic[1].pending, &pic[1].mask};
     cpu.trap = [this](uint8_t n) { return bios(n); };
     cpu.mmioStart = 0xa0000; cpu.mmioEnd = 0xc0000;
     cpu.mmioRead = [this](uint32_t a) {
@@ -1130,6 +1131,7 @@ void Pc::boot(uint8_t drive) {
 }
 
 void Pc::run(unsigned budget, double untilClock) {
+    cpu.validateTlb();
     // 兼容脚本的步数驱动：运行一步推进 3.6 个 PIT tick，闲置轮询推进 256 tick 以等待设备唤醒。
     for (unsigned i = 0; i < budget && !rebootRequested && !powerOffRequested && clock < untilClock; ++i) {
         stepCpu();
@@ -1143,6 +1145,7 @@ void Pc::stepCpu() {
 }
 
 void Pc::runCpu(unsigned budget) {
+    cpu.validateTlb();
     // 实时前端单独推进设备时钟；此入口只跑 CPU，遇 HLT/BIOS 等待立即让出而不自行快进时间。
     for (unsigned i = 0; i < budget && !rebootRequested && !powerOffRequested; ++i) {
         stepCpu();
@@ -1169,6 +1172,8 @@ void Pc::advanceClock(double target) {
 }
 
 int Pc::acknowledge() {
+    // CPU 每条指令都会询问；两片 PIC 都没有未屏蔽的请求时 next() 必为 -1，直接返回，省去优先级扫描。
+    if (!(pic[0].pending & ~pic[0].mask) && !(at() && (pic[1].pending & ~pic[1].mask))) return -1;
     // AT 从片 PIC 通过主片 IRQ2 级联；CPU 收到的是最终向量，不是 IRQ 线号。
     if (at() && pic[1].next() >= 0) pic[0].raise(2);
     int line = pic[0].take();

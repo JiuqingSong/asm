@@ -1,4 +1,5 @@
 #include "cpu.h"
+#include <algorithm>
 #include <stdexcept>
 
 // 8088/286 基础执行核心：取指、ModR/M 寻址、整数运算和单字节操作码分派。
@@ -107,11 +108,30 @@ void Cpu::reset() {
     eaOff = 0; eaSeg = DS;
 }
 
+void Cpu::openFetchWindow() {
+    fetchCount = 0;
+    if (!supports386()) return;
+    const auto& code = segments[CS];
+    // 与 checkSegment(CS, ..., execute) 一致：保护模式下须非空、存在且不是向下扩展段。
+    if (protectedMode() && !virtual8086() && (code.null || !(code.access & 0x80) || (code.access & 12) == 4)) return;
+    if (ip > code.limit) return;
+    const auto linear = segmentBase(CS) + ip;
+    auto* host = hostAddress(linear, false, userAccess());
+    if (!host) return;
+    uint64_t count = std::min<uint64_t>(15, uint64_t(code.limit) - ip + 1);
+    fetchHost = host; fetchCount = uint32_t(std::min<uint64_t>(count, 4096 - (linear & 4095)));
+}
+
 uint8_t Cpu::fetch8() {
+    if (ip - startIp < fetchCount) { auto v = fetchHost[ip - startIp]; ++ip; return v; }
     // 先验证代码段/分页权限，再推进 IP；386 指令（包括前缀）最多 15 字节。
     if (supports386() && ip - startIp >= 15) fault(13, 0);
     if (protectedMode() || supports386()) checkSegment(CS, ip, 1, false, true);
-    auto v = supports386() ? readLinear(segmentBase(CS) + ip) : readPhysical(segmentBase(CS) + ip);
+    uint8_t v;
+    if (supports386()) {
+        auto linear = segmentBase(CS) + ip;
+        if (auto* host = hostAddress(linear, false, userAccess())) v = *host; else v = readLinear(linear);
+    } else v = readPhysical(segmentBase(CS) + ip);
     ++ip; if (!supports386()) ip = uint16_t(ip); return v;
 }
 
@@ -146,7 +166,6 @@ uint16_t Cpu::pop() {
     auto value = rwS(SS, r[SP]); r[SP] += 2; return value;
 }
 
-void Cpu::flag(uint16_t mask, bool v) { flags = v ? flags | mask : flags & ~mask; }
 
 void Cpu::stackedFlag(uint16_t mask, bool v) {
     auto off = uint16_t(r[SP] + 4), f = rwS(SS, off);
@@ -423,7 +442,8 @@ void Cpu::stepInstruction() {
     // 指令边界先响应 IRQ；STI/MOV SS 等设置 inhibit，使紧随其后的指令先完成。
     repContinue = false;
     updateFpuIrq();
-    if (!inhibit && (flags & IF) && irq) {
+    if (!inhibit && (flags & IF) && irq && (!irqRequest[0]
+        || (*irqRequest[0] & ~*irqRequest[1]) || (*irqRequest[2] & ~*irqRequest[3]))) {
         int n = irq();
         if (n >= 0) { interrupt(uint8_t(n), -1, false, true); return; }
     }
@@ -431,6 +451,7 @@ void Cpu::stepInstruction() {
     if (halted) return;
     bool trace = flags & TF;
     startIp = ip; overrideSeg = -1; rep = 0; lockPrefix = false;
+    openFetchWindow();
     const bool bigCode = supports386() && !virtual8086() && (segments[CS].attributes & 0x40);
     operand32 = address32 = bigCode;
     for (int prefixes = 0; prefixes < 65536; ++prefixes) {

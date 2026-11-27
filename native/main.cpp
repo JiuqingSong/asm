@@ -615,6 +615,14 @@ int headless(const std::filesystem::path& script) {
         } else if (op == "run") {
             uint64_t count = std::stoull(arg);
             while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->restartDrive()); }
+        } else if (op == "bench") {
+            // 与 run 相同的确定性执行，另报告宿主耗时与 MIPS；不含快照加载/哈希时间。
+            uint64_t count = std::stoull(arg), before = pc->instructions;
+            auto started = std::chrono::steady_clock::now();
+            while (count && !pc->powerOffRequested) { auto n = unsigned(std::min<uint64_t>(count, 100000)); pc->run(n); count -= n; if (pc->rebootRequested) pc->boot(pc->restartDrive()); }
+            double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            std::cout << "bench instructions=" << pc->instructions - before << " seconds=" << seconds
+                << " MIPS=" << double(pc->instructions - before) / seconds / 1e6 << '\n';
         } else if (op == "realtime" || op == "wait-realtime" || op == "boot-normal") {
             std::istringstream input(arg); int milliseconds = 0; std::string speed = "full", extra, text;
             bool waiting = op == "wait-realtime", booting = op == "boot-normal";
@@ -634,7 +642,7 @@ int headless(const std::filesystem::path& script) {
             auto ready = [&] { return pc->vga.graphics() && pc->vga.width() >= 640 && pc->vga.height() >= 480; };
             ExecutionTiming timing; timing.reset(*pc);
             const auto started = ExecutionTiming::HostClock::now(), deadline = started + std::chrono::milliseconds(milliseconds);
-            const auto beforeClock = pc->clock;
+            const auto beforeClock = pc->clock; const auto beforeSteps = pc->instructions;
             while (!pc->powerOffRequested && ExecutionTiming::HostClock::now() < deadline &&
                 (!waiting || pc->text().find(text) == std::string::npos) && (!booting || !ready())) {
                 if (booting && !pc->vga.graphics()) {
@@ -659,9 +667,10 @@ int headless(const std::filesystem::path& script) {
                 throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": realtime timeout waiting for: " + text);
             if (booting && (pc->powerOffRequested || !ready()))
                 throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": timeout waiting for Windows graphics startup");
-            std::cout << "Realtime " << speed << ": host="
-                << std::chrono::duration<double>(ExecutionTiming::HostClock::now() - started).count()
-                << "s guest=" << (pc->clock - beforeClock) / ExecutionTiming::PitHz << "s\n";
+            const double hostSeconds = std::chrono::duration<double>(ExecutionTiming::HostClock::now() - started).count();
+            std::cout << "Realtime " << speed << ": host=" << hostSeconds
+                << "s guest=" << (pc->clock - beforeClock) / ExecutionTiming::PitHz << "s steps=" << pc->instructions - beforeSteps
+                << " MIPS=" << double(pc->instructions - beforeSteps) / std::max(hostSeconds, 1e-9) / 1e6 << '\n';
         } else if (op == "profile") {
             // 诊断：按宿主实时全速运行，统计端口读写（含值）、IRQ 向量，并每毫秒采样一次 EIP；结束后恢复原回调。
             int milliseconds = std::stoi(arg);
@@ -1651,6 +1660,12 @@ int application(int argc, wchar_t** argv) {
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    // 混合架构 CPU（如 12 代酷睿）上，窗口转入后台后 Windows 可能对进程启用 EcoQoS，把模拟线程调度到能效核，
+    // 速度约减半；长时间安装时用户常切到别的窗口。退出执行速度节流，让调度器继续优先使用性能核。
+    PROCESS_POWER_THROTTLING_STATE throttling{};
+    throttling.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    throttling.ControlMask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED; throttling.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &throttling, sizeof(throttling));
     int argc = 0; auto argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     try {
         if (!argv) throw std::runtime_error("Cannot parse command line");

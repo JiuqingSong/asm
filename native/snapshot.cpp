@@ -492,6 +492,7 @@ std::unique_ptr<Pc> Snapshot::load(const std::filesystem::path& value) {
     auto pc = std::make_unique<Pc>();
     SnapshotArchive archive(file.value, true, size - 32, path); state(archive, *pc);
     require(archive.position == archive.limit && uint64_t(~archive.crc) == get(24, 4), "payload layout mismatch");
+    pc->cpu.flushTlb(); // 恢复的内存与 PCI 窗口不同于构造时，TLB 从空开始。
     return pc;
 }
 }
