@@ -16,6 +16,7 @@ static std::atomic<uint64_t> nextDiskIdentity{0};
 static constexpr uint16_t font16Offset = 0x8000;
 static constexpr uint16_t font8Offset = 0x9000;
 static constexpr uint16_t font14Offset = 0x9800;
+static constexpr uint16_t cirrusFixupOffset = 0x180;
 
 static std::runtime_error osError(const char* operation) {
     return std::runtime_error(std::string(operation) + " (Windows error " + std::to_string(GetLastError()) + ")");
@@ -58,7 +59,269 @@ static std::runtime_error biosError(Cpu& c, uint8_t number) {
     return std::runtime_error(message.str());
 }
 
-static void installVideoFirmware(Cpu& cpu) {
+static void installDiskFirmware(Cpu& cpu) {
+    // ESDI_506 截获 INT 13h 期间的 IDE I/O，以关联 BIOS 80h 和主通道硬盘。
+    // 按 diskrom.ts 的客体 PIO 路径实现传统读/写/校验，不能只从宿主复制扇区。
+    // 栈布局：DI、SI、DX、CX、BX、ES、DS、AX、BP、IP、CS、FLAGS；BP 指向保存的 DI。
+    // 高端/跨 64 KiB 缓冲及其它功能保留原陷阱路径；等待 BSY/DRQ 有有限超时。
+    const uint8_t code[] = {
+        0x80,0xfa,0x80, // CMP DL,80h：只接主通道的第一块硬盘。
+        0x75,0x0a, // JNE trap。
+        0x80,0xfc,0x02, // CMP AH,2：传统读扇区。
+        0x72,0x05, // JB trap。
+        0x80,0xfc,0x04, // CMP AH,4：传统写/校验扇区。
+        0x76,0x05, // JBE harddisk。
+        0xea, // JMP FAR F000:0860：保留软盘、EDD、其它 BIOS 服务。
+        0x60,0x08,0x00,0xf0, // 小端远地址。
+        0x55, // PUSH BP：保存寄存器。
+        0x50, // PUSH AX。
+        0x1e, // PUSH DS。
+        0x06, // PUSH ES。
+        0x53, // PUSH BX。
+        0x51, // PUSH CX。
+        0x52, // PUSH DX。
+        0x56, // PUSH SI。
+        0x57, // PUSH DI。
+        0x8b,0xec, // MOV BP,SP：建立保存参数的栈帧。
+        0xfb, // STI：允许 IRQ14 及 BIOS 定时器中断。
+        0xbe,0x01,0xe4, // MOV SI,E401h：硬盘参数表。
+        0xf6,0xc2,0x01, // TEST DL,1：检测驱动器低位。
+        0x74,0x03, // JZ unit0。
+        0x83,0xc6,0x10, // ADD SI,16：第二张参数表。
+        0x2e,0x83,0x3c,0x00, // CMP WORD CS:[SI],0：零柱面表示没有盘。
+        0x75,0x0b, // JNE present。
+        0x5f, // POP DI：没有盘时恢复原参数并进入旧陷阱。
+        0x5e, // POP SI。
+        0x5a, // POP DX。
+        0x59, // POP CX。
+        0x5b, // POP BX。
+        0x07, // POP ES。
+        0x1f, // POP DS。
+        0x58, // POP AX。
+        0x5d, // POP BP。
+        0xeb,0xd3, // JMP trap。
+        0x80,0x7e,0x0e,0x00, // CMP BYTE [BP+14],0：扇区计数不能为零。
+        0x75,0x05, // JNE checkchs。
+        0xb4,0x04, // MOV AH,4：找不到扇区。
+        0xe9,0x86,0x01, // JMP fail0。
+        0x8a,0x46,0x07, // MOV AL,[BP+7]：CH 中的柱面低八位。
+        0x8a,0x66,0x06, // MOV AH,[BP+6]：CL 中的柱面高两位。
+        0xb1,0x06, // MOV CL,6。
+        0xd2,0xec, // SHR AH,CL：得到完整十位柱面号。
+        0x2e,0x3b,0x04, // CMP AX,CS:[SI]：检查柱面范围。
+        0x72,0x05, // JB checkhead。
+        0xb4,0x04, // MOV AH,4。
+        0xe9,0x72,0x01, // JMP fail0。
+        0x8a,0x46,0x05, // MOV AL,[BP+5]：DH 中的磁头号。
+        0x2e,0x3a,0x44,0x02, // CMP AL,CS:[SI+2]：检查磁头范围。
+        0x73,0xf2, // JAE badchs。
+        0x8a,0x46,0x06, // MOV AL,[BP+6]：CL 中的扇区号。
+        0x24,0x3f, // AND AL,3Fh。
+        0x2e,0x3a,0x44,0x0e, // CMP AL,CS:[SI+14]：检查每道扇区范围。
+        0x77,0xe7, // JA badchs。
+        0x0a,0xc0, // OR AL,AL：扇区从 1 开始。
+        0x74,0xe3, // JZ badchs。
+        0x8c,0xc0, // MOV AX,ES：检查高端实模式缓冲。
+        0x3d,0x00,0xf0, // CMP AX,F000h。
+        0x73,0x18, // JAE slowpath：保留旧 BIOS 的二十位地址回绕。
+        0x80,0x7e,0x0e,0x80, // CMP BYTE [BP+14],128：检查缓冲长度。
+        0x73,0x12, // JAE slowpath。
+        0x33,0xc0, // XOR AX,AX。
+        0x8a,0x46,0x0e, // MOV AL,[BP+14]：扇区计数。
+        0xb1,0x09, // MOV CL,9。
+        0xd3,0xe0, // SHL AX,CL：字节数 = 扇区数 × 512。
+        0x03,0x46,0x08, // ADD AX,[BP+8]：加缓冲偏移。
+        0x73,0x10, // JNC fastpath：没有跨越段边界。
+        0x0b,0xc0, // OR AX,AX：恰好到 10000h 也合法。
+        0x74,0x0c, // JZ fastpath。
+        0x5f, // POP DI：少见缓冲情况恢复参数后交旧 BIOS。
+        0x5e, // POP SI。
+        0x5a, // POP DX。
+        0x59, // POP CX。
+        0x5b, // POP BX。
+        0x07, // POP ES。
+        0x1f, // POP DS。
+        0x58, // POP AX。
+        0x5d, // POP BP。
+        0xe9,0x71,0xff, // JMP trap。
+        0xb4,0x01, // MOV AH,1：无效参数状态。
+        0x80,0x7e,0x0e,0x00, // CMP BYTE [BP+14],0。
+        0x75,0x03,0xe9,0x24,0x01, // JNE +3 / JMP fail0：8086 形式的远条件跳转。
+        0x8a,0x46,0x07, // MOV AL,[BP+7]：重新取原始 CH，不能使用已改动的 CX。
+        0x8a,0x66,0x06, // MOV AH,[BP+6]。
+        0xb1,0x06, // MOV CL,6。
+        0xd2,0xec, // SHR AH,CL：柱面号。
+        0x32,0xff, // XOR BH,BH。
+        0x2e,0x8a,0x5c,0x02, // MOV BL,CS:[SI+2]：磁头数。
+        0xf7,0xe3, // MUL BX：DX:AX = 柱面 × 磁头数。
+        0x8a,0x5e,0x05, // MOV BL,[BP+5]：磁头号。
+        0x03,0xc3, // ADD AX,BX。
+        0x83,0xd2,0x00, // ADC DX,0：不能丢失低字进位。
+        0x2e,0x8a,0x5c,0x0e, // MOV BL,CS:[SI+14]：每道扇区数。
+        0x8b,0xca, // MOV CX,DX：大盘翻译几何可令第一步乘积超过 65535。
+        0xf7,0xe3, // MUL BX：计算低字乘每道扇区数。
+        0x8b,0xf8, // MOV DI,AX：保存结果低字。
+        0x52, // PUSH DX：保存低字乘法的高字。
+        0x8b,0xc1, // MOV AX,CX。
+        0xf7,0xe3, // MUL BX：计算原高字的贡献。
+        0x5a, // POP DX。
+        0x03,0xd0, // ADD DX,AX：合并完整的三十二位乘积。
+        0x8b,0xc7, // MOV AX,DI。
+        0x8a,0x5e,0x06, // MOV BL,[BP+6]：扇区号。
+        0x80,0xe3,0x3f, // AND BL,3Fh。
+        0x75,0x05, // JNZ secok。
+        0xb4,0x04, // MOV AH,4。
+        0xe9,0xe9,0x00, // JMP fail0。
+        0xfe,0xcb, // DEC BL：LBA 的扇区从零开始。
+        0x03,0xc3, // ADD AX,BX。
+        0x83,0xd2,0x00, // ADC DX,0。
+        0x8b,0xd8, // MOV BX,AX：DI:BX 保存 LBA。
+        0x8b,0xfa, // MOV DI,DX。
+        0x8b,0xc7, // MOV AX,DI。
+        0x8a,0xc4, // MOV AL,AH：LBA 位 24..27。
+        0x24,0x0f, // AND AL,0Fh。
+        0x0c,0xe0, // OR AL,E0h：LBA 模式、主盘。
+        0xf6,0x46,0x04,0x01, // TEST BYTE [BP+4],1。
+        0x74,0x02, // JZ master。
+        0x0c,0x10, // OR AL,10h：从盘选择位。
+        0xba,0xf6,0x01, // MOV DX,1F6h：Device/Head。
+        0xee, // OUT DX,AL。
+        0xba,0xf2,0x01, // MOV DX,1F2h：Sector Count。
+        0x8a,0x46,0x0e, // MOV AL,[BP+14]。
+        0xee, // OUT DX,AL：写计数。
+        0x42, // INC DX。
+        0x8a,0xc3, // MOV AL,BL。
+        0xee, // OUT DX,AL：LBA 位 0..7。
+        0x42, // INC DX。
+        0x8a,0xc7, // MOV AL,BH。
+        0xee, // OUT DX,AL：LBA 位 8..15。
+        0x42, // INC DX。
+        0x8b,0xc7, // MOV AX,DI。
+        0xee, // OUT DX,AL：LBA 位 16..23。
+        0xba,0xf7,0x01, // MOV DX,1F7h：Command。
+        0xb0,0x20, // MOV AL,20h：READ SECTORS。
+        0x80,0x7e,0x0f,0x03, // CMP BYTE [BP+15],3。
+        0x72,0x06, // JB command。
+        0xb0,0x30, // MOV AL,30h：WRITE SECTORS。
+        0x74,0x02, // JE command。
+        0xb0,0x40, // MOV AL,40h：READ VERIFY SECTORS。
+        0xee, // OUT DX,AL：执行真正的 ATA 命令。
+        0x8b,0x7e,0x08, // MOV DI,[BP+8]：保留原 ES 段和分页语义。
+        0x33,0xf6, // XOR SI,SI：已传送扇区数。
+        0xfc, // CLD：传输向高地址进行，原 DF 由 IRET 恢复。
+        0x80,0x7e,0x0f,0x04, // CMP BYTE [BP+15],4。
+        0x74,0x3e, // JE finish：校验不传输数据。
+        0xba,0xf7,0x01, // MOV DX,1F7h：Status。
+        0xbb,0xff,0xff, // MOV BX,FFFFh：有限的轮询预算。
+        0xec, // IN AL,DX。
+        0xa8,0x80, // TEST AL,80h：BSY。
+        0x75,0x0a, // JNZ pollagain。
+        0xa8,0x01, // TEST AL,1：ERR。
+        0x75,0x68, // JNZ error。
+        0xa8,0x08, // TEST AL,8：DRQ。
+        0x74,0x02, // JZ pollagain。
+        0xeb,0x07, // JMP transfer。
+        0x4b, // DEC BX。
+        0x75,0xee, // JNZ waitdrq。
+        0xb4,0x80, // MOV AH,80h：BIOS 超时。
+        0xeb,0x77, // JMP errcount。
+        0xba,0xf0,0x01, // MOV DX,1F0h：Data。
+        0xb9,0x00,0x01, // MOV CX,256：每扇区 256 字。
+        0x80,0x7e,0x0f,0x03, // CMP BYTE [BP+15],3。
+        0x74,0x06, // JE writing。
+        0xed, // IN AX,DX：从同一个 ATA FIFO 读完整数据字。
+        0xab, // STOSW：写 ES:DI 并递增 DI。
+        0xe2,0xfc, // LOOP reading。
+        0xeb,0x08, // JMP next。
+        0x26,0x8b,0x05, // MOV AX,ES:[DI]：取待写的数据字。
+        0xef, // OUT DX,AX：写完整数据字。
+        0x47, // INC DI。
+        0x47, // INC DI。
+        0xe2,0xf8, // LOOP writing。
+        0x46, // INC SI：完成一个扇区。
+        0x8b,0xc6, // MOV AX,SI。
+        0x3a,0x46,0x0e, // CMP AL,[BP+14]。
+        0x72,0xc2, // JB sector。
+        0xba,0xf7,0x01, // MOV DX,1F7h：等待最终完成。
+        0xbb,0xff,0xff, // MOV BX,FFFFh。
+        0xec, // IN AL,DX。
+        0xa8,0x80, // TEST AL,80h。
+        0x75,0x27, // JNZ endagain。
+        0xa8,0x01, // TEST AL,1。
+        0x75,0x2a, // JNZ error。
+        0x80,0x7e,0x0f,0x03, // CMP BYTE [BP+15],3。
+        0x75,0x16, // JNE success。
+        0xb0,0xe7, // MOV AL,E7h：BIOS 写完成后 FLUSH CACHE，保持持久性约定。
+        0xee, // OUT DX,AL。
+        0xbb,0xff,0xff, // MOV BX,FFFFh。
+        0xec, // IN AL,DX。
+        0xa8,0x80, // TEST AL,80h。
+        0x74,0x07, // JZ flushend。
+        0x4b, // DEC BX。
+        0x75,0xf8, // JNZ flushwait。
+        0xb4,0x80, // MOV AH,80h：刷新超时。
+        0xeb,0x2e, // JMP errcount。
+        0xa8,0x01, // TEST AL,1。
+        0x75,0x0e, // JNZ error。
+        0x8a,0x46,0x0e, // MOV AL,[BP+14]：成功扇区数。
+        0x32,0xe4, // XOR AH,AH：成功状态。
+        0xeb,0x2b, // JMP done。
+        0x4b, // DEC BX。
+        0x75,0xd1, // JNZ waitend。
+        0xb4,0x80, // MOV AH,80h：完成超时。
+        0xeb,0x1c, // JMP errcount。
+        0xba,0xf1,0x01, // MOV DX,1F1h：Error。
+        0xec, // IN AL,DX。
+        0xb4,0x04, // MOV AH,4：IDNF 对应找不到扇区。
+        0xa8,0x10, // TEST AL,10h。
+        0x75,0x12, // JNZ errcount。
+        0xb4,0x01, // MOV AH,1：ABRT 默认表示无效命令。
+        0xa8,0x04, // TEST AL,4。
+        0x74,0x0a, // JZ baddata。
+        0x80,0x7e,0x0f,0x03, // CMP BYTE [BP+15],3。
+        0x75,0x06, // JNE errcount。
+        0xb4,0x03, // MOV AH,3：写只读盘的写保护错误。
+        0xeb,0x02, // JMP errcount。
+        0xb4,0x10, // MOV AH,10h：其它数据错误。
+        0x8b,0xd6, // MOV DX,SI。
+        0x8a,0xc2, // MOV AL,DL：实际完成扇区数。
+        0xeb,0x02, // JMP done。
+        0x32,0xc0, // XOR AL,AL：参数错误没有完成扇区。
+        0x89,0x46,0x0e, // MOV [BP+14],AX：修改保存的返回 AX。
+        0xbb,0x40,0x00, // MOV BX,40h。
+        0x8e,0xdb, // MOV DS,BX。
+        0x88,0x26,0x74,0x00, // MOV DS:[74h],AH：BDA 上次硬盘状态。
+        0x80,0x66,0x16,0xfe, // AND BYTE [BP+22],FEh：清调用者 CF。
+        0x0a,0xe4, // OR AH,AH。
+        0x74,0x04, // JZ popall。
+        0x80,0x4e,0x16,0x01, // OR BYTE [BP+22],1：失败时置 CF。
+        0x5f, // POP DI。
+        0x5e, // POP SI。
+        0x5a, // POP DX。
+        0x59, // POP CX。
+        0x5b, // POP BX。
+        0x07, // POP ES。
+        0x1f, // POP DS。
+        0x58, // POP AX。
+        0x5d, // POP BP。
+        0xcf, // IRET：恢复调用者及原 IF/DF，只改变返回 CF。
+    };
+    std::copy(std::begin(code), std::end(code), cpu.mem.begin() + 0xfa000);
+    cpu.ww(0, 0x13 * 4, 0xa000);
+
+    // BIOS 轮询数据时仍允许 IRQ14。EOI 也必须由客体 OUT 发出，否则 VPICD 不会解锁虚拟 IRQ。
+    const uint8_t irq[] = {
+        0x50,0x52, // PUSH AX / PUSH DX。
+        0xba,0xf7,0x01,0xec, // MOV DX,1F7h / IN AL,DX：确认 ATA 中断。
+        0xb0,0x20, // MOV AL,20h：非特定 EOI。
+        0xe6,0xa0,0xe6,0x20, // OUT A0h,AL / OUT 20h,AL：确认从 PIC 和级联主 PIC。
+        0x5a,0x58,0xcf // POP DX / POP AX / IRET。
+    };
+    std::copy(std::begin(irq), std::end(irq), cpu.mem.begin() + 0xf08c0);
+    cpu.ww(0, 0x76 * 4, 0x08c0);
+}
+
+static void installVideoFirmware(Cpu& cpu, bool cirrus) {
     // INT 10h/AH=00 的设模必须由客体 IN/OUT、显存写入完成，VM86 监控器才能更新其 VGA 缓存。
     // 表中跳转偏移是固定的；只增加注释/换行，不能插入或删除任何机器码字节。
     // F1 10 是解释器私有 BIOS 陷阱，CF 才是标准 IRET；其余字节均是 16 位 x86 指令。
@@ -134,12 +397,34 @@ static void installVideoFirmware(Cpu& cpu) {
         0xcf                 // IRET：恢复调用者 CS:IP 和 FLAGS。
     };
     std::copy(std::begin(handler), std::end(handler), cpu.mem.begin() + 0xf0900);
+    if (cirrus) {
+        // 原 0048h 的 MOV CX,8000h / JMP 00AEh 换成 CALL 0B00h / JMP 00B2h，保持其它分支位置不变。
+        const uint8_t callClear[] = {0xe8,0xb5,0x01,0xeb,0x65};
+        std::copy(std::begin(callClear), std::end(callClear), cpu.mem.begin() + 0xf0948);
+        const uint8_t clear[] = {
+            0x80,0xfb,0x5c,0x73,0x08, // CMP BL,5Ch / JAE banks：仅扩展模式需要遍历 4 MiB。
+            0x31,0xff,0xb9,0,0x80,0xf3,0xab,0xc3, // XOR DI,DI / MOV CX,8000h / REP STOSW / RET。
+            0xba,0xce,3,              // MOV DX,03CEh：GC 索引/数据端口。
+            0xb8,0x0b,0x20,0xef,      // MOV AX,200Bh / OUT DX,AX：单窗口、16 KiB bank 粒度。
+            0xbb,9,0,0xbe,0x40,0,     // MOV BX,0009h / MOV SI,64：从 bank 0 开始清除 64 个 64 KiB 窗口。
+            0x89,0xd8,0xef,           // MOV AX,BX / OUT DX,AX：写 GR9 的 bank 编号。
+            0x31,0xc0,0x31,0xff,      // XOR AX,AX / XOR DI,DI：每窗口从零地址填零。
+            0xb9,0,0x80,0xf3,0xab,    // MOV CX,8000h / REP STOSW：清除当前 64 KiB。
+            0x81,0xc3,0,4,0x4e,0x75,0xed, // ADD BX,0400h / DEC SI / JNE loop：bank 每次前进四个 16 KiB。
+            0xb8,9,0,0xef,            // MOV AX,0009h / OUT DX,AX：恢复 bank 0。
+            0xb8,0x0b,0,0xef,0xc3     // MOV AX,000Bh / OUT DX,AX / RET：恢复普通 4 KiB bank 粒度。
+        };
+        std::copy(std::begin(clear), std::end(clear), cpu.mem.begin() + 0xf0b00);
+    }
     cpu.ww(0, 0x10 * 4, 0x900);
     auto profile = std::make_unique<Vga>();
-    uint16_t address = 0x2028;
+    if (cirrus) profile->enableCirrus(true);
+    uint16_t address = 0x2100;
 
     // 每个模式存放：条目数 WORD，随后重复 {port WORD,value BYTE}；上面的 LODS/OUT 循环消费它。
-    for (uint8_t mode : {0, 1, 2, 3, 0x0d, 0x0e, 0x10, 0x12, 0x13}) {
+    for (uint8_t mode : {0, 1, 2, 3, 0x0d, 0x0e, 0x10, 0x12, 0x13, 0x5f, 0x5c, 0x60}) {
+        if (mode > 0x13 && !cirrus) continue;
+        if (address < font16Offset && unsigned(address) + 3000 > font16Offset) address = 0xc000;
         profile->setMode(mode);
         cpu.ww(0xf000, uint16_t(0x2000 + mode * 2), address);
         auto start = address; address += 2;
@@ -152,14 +437,22 @@ static void installVideoFirmware(Cpu& cpu) {
         indexed(0x3c4, 0, 1);
         port(0x3c2, profile->input(0x3cc));
         for (uint8_t i = 1; i < 5; ++i) indexed(0x3c4, i, profile->seq[i]);
+        if (cirrus) {
+            indexed(0x3c4, 6, 0x12); indexed(0x3c4, 7, profile->seq[7]);
+            indexed(0x3c4, 0x12, 0); indexed(0x3c4, 0x17, 0);
+        }
         indexed(0x3c4, 0, profile->seq[0]);
         indexed(0x3d4, 0x11, profile->crtc[0x11] & 0x7f);
         for (uint8_t i = 0; i < 25; ++i) indexed(0x3d4, i, profile->crtc[i]);
+        if (cirrus) { indexed(0x3d4, 0x1b, profile->crtc[0x1b]); indexed(0x3d4, 0x1d, 0); }
         for (uint8_t i = 0; i < 9; ++i) indexed(0x3ce, i, profile->gc[i]);
+        if (cirrus) { indexed(0x3ce, 9, 0); indexed(0x3ce, 10, 0); indexed(0x3ce, 11, 0); }
         for (uint8_t i = 0; i < 21; ++i) { port(0x3c0, i); port(0x3c0, profile->attr[i]); }
         port(0x3c0, 0x20); port(0x3c6, 255); port(0x3c8, 0);
         for (auto component : profile->dac) port(0x3c9, component);
         cpu.ww(0xf000, start, uint16_t((address - start - 2) / 3));
+        if ((start < font16Offset && address > font16Offset) || address > 0xef00)
+            throw std::runtime_error("Video firmware tables overlap reserved BIOS data");
     }
     for (unsigned ch = 0; ch < 256; ++ch)
         for (unsigned row = 0; row < 16; ++row)
@@ -412,8 +705,45 @@ Pc::Pc() {
     cpu.irq = [this]() { return acknowledge(); };
     cpu.trap = [this](uint8_t n) { return bios(n); };
     cpu.mmioStart = 0xa0000; cpu.mmioEnd = 0xc0000;
-    cpu.mmioRead = [this](uint32_t a) { return vga.read(a); };
-    cpu.mmioWrite = [this](uint32_t a, uint8_t v) { vga.write(a, v); };
+    cpu.mmioRead = [this](uint32_t a) {
+        if (vga.cirrus() && (pciCommand & 2)) {
+            if ((pciRomAddress & 1) && uint64_t(a) >= (pciRomAddress & ~1u) &&
+                uint64_t(a) < uint64_t(pciRomAddress & ~1u) + PciRomBytes) {
+                auto offset = a - (pciRomAddress & ~1u);
+                return offset < pciRom.size() ? pciRom[offset] : uint8_t(255);
+            }
+            if (!(pciRomAddress & 1) && uint64_t(a) >= pciFramebuffer && uint64_t(a) < uint64_t(pciFramebuffer) + 0x2000000) return vga.linearRead(a - pciFramebuffer);
+            if (uint64_t(a) >= pciRegisters && uint64_t(a) < uint64_t(pciRegisters) + 4096) {
+                unsigned off = a - pciRegisters;
+                if (off < 32) {
+                    auto port = uint16_t(0x3c0 + off);
+                    if ((off == 0x14 || off == 0x15 || off == 0x1a) && !(vga.input(0x3cc) & 1)) port -= 0x20;
+                    auto value = vga.input(port);
+                    return off == 0x1a ? uint8_t((uint64_t(clock) / 64) & 1 ? 9 : 0) : value;
+                }
+                return off >= 256 && off < 512 ? vga.registerRead(off - 256) : uint8_t(255);
+            }
+        }
+        return vga.cirrus() && (!(pciCommand & 2) || (pciRomAddress & 1)) ? uint8_t(255) : vga.read(a);
+    };
+    cpu.mmioWrite = [this](uint32_t a, uint8_t v) {
+        if (vga.cirrus() && (pciCommand & 2)) {
+            if ((pciRomAddress & 1) && uint64_t(a) >= (pciRomAddress & ~1u) &&
+                uint64_t(a) < uint64_t(pciRomAddress & ~1u) + PciRomBytes) return;
+            if (!(pciRomAddress & 1) && uint64_t(a) >= pciFramebuffer && uint64_t(a) < uint64_t(pciFramebuffer) + 0x2000000) { vga.linearWrite(a - pciFramebuffer, v); return; }
+            if (uint64_t(a) >= pciRegisters && uint64_t(a) < uint64_t(pciRegisters) + 4096) {
+                unsigned off = a - pciRegisters;
+                if (off < 32) {
+                    auto port = uint16_t(0x3c0 + off);
+                    if ((off == 0x14 || off == 0x15 || off == 0x1a) && !(vga.input(0x3cc) & 1)) port -= 0x20;
+                    vga.output(port, v);
+                }
+                else if (off >= 256 && off < 512) vga.registerWrite(off - 256, v);
+                return;
+            }
+        }
+        if (!vga.cirrus() || ((pciCommand & 2) && !(pciRomAddress & 1))) vga.write(a, v);
+    };
     serialMouse.setIrq = [this](bool raised) { if (raised) pic[0].raise(4); };
     ide.disk = [this]() { return hard.get(); };
     ide.interrupt = [this](bool raised) {
@@ -432,6 +762,113 @@ Pc::Pc() {
 }
 
 void Pc::setModel(CpuModel model) { cpu.setModel(model); keys.clear(); resetAt(); }
+
+void Pc::setCirrus(bool enabled) {
+    vga.enableCirrus(enabled); pciAddress = 0; pciCommand = 3;
+    pciFramebuffer = 0xe0000000; pciRegisters = 0xe2000000; pciRomAddress = 0xc0000;
+    if (!enabled) pciRom.clear();
+    mapPci();
+}
+
+void Pc::mapPci() {
+    cpu.pciWindows = {};
+    if (vga.cirrus() && (pciCommand & 2)) {
+        if (!(pciRomAddress & 1)) cpu.pciWindows[0] = {pciFramebuffer, uint64_t(pciFramebuffer) + 0x2000000};
+        cpu.pciWindows[1] = {pciRegisters, uint64_t(pciRegisters) + 4096};
+        if (pciRomAddress & 1) cpu.pciWindows[2] = {pciRomAddress & ~1u, uint64_t(pciRomAddress & ~1u) + PciRomBytes};
+    }
+}
+
+void Pc::installCirrusRom() {
+    // C000 的 PCIR 标识与 INT 10h 入口把启动 VGA 关联到 PCI 显卡，而不是另一个 ISA VGA 设备。
+    pciRom.assign(PciRomBytes, 0xff);
+    pciRom[0] = 0x55; pciRom[1] = 0xaa; pciRom[2] = uint8_t(PciRomBytes / 512);
+    pciRom[3] = 0xeb; pciRom[4] = 0x2b; // JMP SHORT 0030h：跳过 ROM 头进入初始化程序。
+    pciRom[0x18] = 0; pciRom[0x19] = 1; // PCIR 数据结构位于 ROM 内 0100h。
+    pciRom[0x1a] = pciRom[0x1b] = 0; // 不声明尚未实现的 PnP 扩展结构。
+    auto offset = cpu.rw(0, 0x40), segment = cpu.rw(0, 0x42);
+    const uint8_t forward[] = {
+        0x9c, // PUSHF：给原处理器的 IRET 构造内层中断帧。
+        0x9a, uint8_t(offset), uint8_t(offset >> 8), uint8_t(segment), uint8_t(segment >> 8), // CALL FAR 原 INT 10h。
+        0xcf  // IRET：内层返回 C000 后，恢复原调用者的中断帧；真正入口仍属于 PCI 视频 ROM。
+    };
+    std::copy(std::begin(forward), std::end(forward), pciRom.begin() + 0x20);
+    const uint8_t initialize[] = {
+        0x9c, 0x60, 0x06,                // PUSHF / PUSHA / PUSH ES：保存初始化调用者状态。
+        0x31,0xc0, 0x8e,0xc0,            // XOR AX,AX / MOV ES,AX：访问实模式 IVT。
+        0x26,0xc7,0x06,0x40,0,0x20,0,    // MOV WORD ES:[0040h],0020h：INT 10h 偏移。
+        0x26,0xc7,0x06,0x42,0,0,0xc0,    // MOV WORD ES:[0042h],C000h：INT 10h 段地址。
+        0xb8,3,0, 0xcd,0x10,             // MOV AX,0003h / INT 10h：用客体 I/O 初始化文本模式。
+        0x07,0x61,0x9d,0xcb              // POP ES / POPA / POPF / RETF：返回 BIOS 的远调用。
+    };
+    std::copy(std::begin(initialize), std::end(initialize), pciRom.begin() + 0x30);
+    // PCIR 是数据：签名、vendor/device、结构长度、VGA 类别、映像长度、接口版本和最后映像标志。
+    const uint8_t identity[] = {'P','C','I','R',0x13,0x10,0xb8,0,0,0,0x18,0,0,0,0,3,0x40,0,0,1,0,0x80,0,0};
+    std::copy(std::begin(identity), std::end(identity), pciRom.begin() + 0x100);
+    pciRom[cirrusFixupOffset] = 0xcb; // RETF：固定模式配置不需要参数修正，OEM A0h 的回调直接返回。
+    std::fill(pciRom.end() - 4, pciRom.end(), 0); // 与 PCI2C 中未指定的 subsystem ID 一致。
+    unsigned sum = 0; for (auto byte : pciRom) sum += byte;
+    pciRom[PciRomBytes - 5] = uint8_t(pciRom[PciRomBytes - 5] - sum);
+    std::copy(pciRom.begin(), pciRom.end(), cpu.mem.begin() + 0xc0000);
+    cpu.ww(0, 0x40, 0x20); cpu.ww(0, 0x42, 0xc000);
+}
+
+uint8_t Pc::pciRead(unsigned offset) const {
+    uint32_t value = 0;
+    switch (offset & ~3u) {
+    case 0: value = 0x00b81013; break;
+    case 4: value = 0x02000000 | pciCommand; break;
+    case 8: value = 0x03000047; break;
+    case 12: value = unsigned(pciLatency) << 8; break;
+    case 16: value = pciFramebuffer; break;
+    case 20: value = pciRegisters; break;
+    case 48: value = pciRomAddress; break;
+    }
+    return uint8_t(value >> ((offset & 3) * 8));
+}
+
+void Pc::pciWrite(unsigned offset, uint8_t value) {
+    if (offset == 4) pciCommand = value & 0x23;
+    else if (offset == 13) pciLatency = value;
+    else if ((offset >= 16 && offset < 24) || (offset >= 48 && offset < 52)) {
+        auto& bar = offset < 20 ? pciFramebuffer : offset < 24 ? pciRegisters : pciRomAddress;
+        unsigned shift = (offset & 3) * 8;
+        bar = (bar & ~(255u << shift)) | (uint32_t(value) << shift);
+        bar &= offset < 20 ? 0xfe000000 : offset < 24 ? 0xfffff000 : ~(PciRomBytes - 1) | 1u;
+    }
+    mapPci();
+}
+
+bool Pc::pciBios(bool protectedCall) {
+    auto& c = cpu; auto& r = c.r;
+    auto result = [&](uint8_t error) {
+        c.reg8(4, error);
+        if (protectedCall) c.setFlags(uint16_t(error ? c.flags | CF : c.flags & ~CF));
+        else c.stackedFlag(CF, error != 0);
+        return true;
+    };
+    if (!vga.cirrus()) return result(0x81);
+    switch (c.reg8(0)) {
+    case 1: c.reg8(0, 1); r[BX] = 0x0210; r[CX] = 0; c.r32(DX, 0x20494350); c.r32(DI, 0xfb040); return result(0);
+    case 2: case 3:
+        if (r[SI] || (c.reg8(0) == 2 ? r[DX] != 0x1013 || r[CX] != 0x00b8 : (c.r32(CX) & 0xffffff) != 0x030000)) return result(0x86);
+        r[BX] = 0x10; return result(0);
+    case 8: case 9: case 10: case 11: case 12: case 13: {
+        unsigned function = c.reg8(0), size = function == 8 || function == 11 ? 1 : function == 9 || function == 12 ? 2 : 4;
+        if (r[BX] != 0x10) return result(0x86);
+        if (r[DI] >= 256 || (r[DI] & (size - 1)) || unsigned(r[DI]) + size > 256) return result(0x87);
+        uint32_t value = c.r32(CX);
+        if (function <= 10) {
+            value = 0; for (unsigned i = 0; i < size; ++i) value |= uint32_t(pciRead(r[DI] + i)) << (i * 8);
+            if (size == 1) c.reg8(1, uint8_t(value));
+            else if (size == 2) r[CX] = uint16_t(value);
+            else c.r32(CX, value);
+        } else for (unsigned i = 0; i < size; ++i) pciWrite(r[DI] + i, uint8_t(value >> (i * 8)));
+        return result(0);
+    }
+    default: return result(0x81);
+    }
+}
 
 unsigned Pc::columns() const { return cpu.rw(0x40, 0x4a); }
 
@@ -475,7 +912,19 @@ void Pc::boot(uint8_t drive) {
 
     // INT 4Fh 非零会让 Windows 探测驻留 CAM SCSI 提供者，因此明确置空。
     cpu.ww(0, 0x4f * 4, 0); cpu.ww(0, 0x4f * 4 + 2, 0);
-    installVideoFirmware(cpu);
+    pciAddress = 0; pciCommand = 3; pciFramebuffer = 0xe0000000; pciRegisters = 0xe2000000; pciRomAddress = 0xc0000; mapPci();
+    installVideoFirmware(cpu, vga.cirrus());
+    if (vga.cirrus()) {
+        installCirrusRom();
+        // BIOS32 服务目录：_32_、32 位入口物理地址、修订、16 字节长度和校验和。
+        const uint8_t directory[] = {'_','3','2','_',0x20,0xb0,0x0f,0,0,1,0,0,0,0,0,0};
+        std::copy(std::begin(directory), std::end(directory), cpu.mem.begin() + 0xfb000);
+        unsigned sum = 0; for (auto byte : directory) sum += byte;
+        cpu.mem[0xfb00a] = uint8_t(-sum);
+        // F1 E0 / RETF：查询 BIOS32 的 $PCI 服务；F1 E1 / RETF：保护模式 PCI BIOS。
+        cpu.mem[0xfb020] = 0xf1; cpu.mem[0xfb021] = 0xe0; cpu.mem[0xfb022] = 0xcb;
+        cpu.mem[0xfb040] = 0xf1; cpu.mem[0xfb041] = 0xe1; cpu.mem[0xfb042] = 0xcb;
+    }
     cpu.ww(0, 0x1c * 4, 0x0700); cpu.ww(0, 0x1c * 4 + 2, 0xf000); cpu.wb(0xf000, 0x700, 0xcf);
 
     // INT 1Ch/68h 都指向 CF（IRET）空处理器；Windows 无调试器时也可能调用 68h。
@@ -527,6 +976,7 @@ void Pc::boot(uint8_t drive) {
         0xf1,0x13, 0xcf};                 // BIOS_TRAP 13h / IRET：执行磁盘服务并返回。
     std::copy(std::begin(disk), std::end(disk), cpu.mem.begin() + 0xf0860);
     cpu.ww(0, 0x13 * 4, 0x860);
+    if (at()) installDiskFirmware(cpu);
     cpu.ww(0x40, 0, 0x3f8); cpu.wb(0x40, 0x7c, 1);
     cpu.ww(0x40, 0x10, uint16_t(0x221 | (floppy ? 1 : 0) | (cpu.hasFpu() ? 2 : 0)));
     cpu.ww(0x40, 0x13, 640); cpu.ww(0x40, 0x1a, 0x1e); cpu.ww(0x40, 0x1c, 0x1e);
@@ -620,6 +1070,10 @@ uint16_t Pc::pitCounter(unsigned channel) const {
 }
 
 uint8_t Pc::input(uint16_t p) {
+    if (vga.cirrus() && p >= 0xcf8 && p <= 0xcfb) return uint8_t(pciAddress >> ((p - 0xcf8) * 8));
+    if (vga.cirrus() && p >= 0xcfc && p <= 0xcff)
+        return (pciAddress & 0x80ffff00) == 0x80001000 ? pciRead((pciAddress & 0xfc) + p - 0xcfc) : 255;
+    if (vga.cirrus() && !(pciCommand & 1) && p >= 0x3b0 && p <= 0x3df) return 255;
     if (FloppyController::owns(p)) return fdc.input(p, clock);
     if ((at() || p < 0xc0) && DmaController::owns(p)) return dma.input(p);
     if (at() && IdeChannel::owns(p)) return ide.input(p, clock);
@@ -659,6 +1113,14 @@ uint8_t Pc::input(uint16_t p) {
 }
 
 void Pc::output(uint16_t p, uint8_t v) {
+    if (vga.cirrus() && p >= 0xcf8 && p <= 0xcfb) {
+        unsigned shift = (p - 0xcf8) * 8; pciAddress = (pciAddress & ~(255u << shift)) | (uint32_t(v) << shift); return;
+    }
+    if (vga.cirrus() && p >= 0xcfc && p <= 0xcff) {
+        if ((pciAddress & 0x80ffff00) == 0x80001000) pciWrite((pciAddress & 0xfc) + p - 0xcfc, v);
+        return;
+    }
+    if (vga.cirrus() && !(pciCommand & 1) && p >= 0x3b0 && p <= 0x3df) return;
     if (FloppyController::owns(p)) { fdc.output(p, v, clock); return; }
     if ((at() || p < 0xc0) && DmaController::owns(p)) { dma.output(p, v); return; }
     if (at() && IdeChannel::owns(p)) { ide.output(p, v, clock); return; }
@@ -893,6 +1355,20 @@ bool Pc::video() {
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4), al = c.reg8(0), bh = c.reg8(7), bl = c.reg8(3);
     unsigned page = bh & 7, cols = biosColumns();
     bool graphics = biosGraphics();
+    if (vga.cirrus() && ah == 0x12) {
+        switch (bl) {
+        case 0x80: r[AX] = 0x39; c.reg8(3, 0x47); return true;
+        case 0x81: r[AX] = 0x0100; return true;
+        case 0x82: c.reg8(0, 0x47); return true;
+        case 0x85: c.reg8(0, uint8_t(Vga::VramBytes / 65536)); return true;
+        case 0xa0:
+            c.reg8(4, al < 0x80 && c.rwF(0xf000, uint16_t(0x2000 + al * 2)) ? 1 : 0);
+            // 固定端口配置不是 OEM 标准/补充参数表；按协议返回未定义指针，不能让驱动误读配置字节。
+            c.loadSegment(DS, 0xffff); c.loadSegment(ES, 0xffff);
+            r[SI] = r[DI] = 0xffff; r[BX] = cirrusFixupOffset;
+            return true;
+        }
+    }
     if (graphics && bh && (ah == 8 || ah == 9 || ah == 10 || ah == 0x0e || ah == 0x13))
         throw std::runtime_error("Graphics BIOS pages other than page 0 are not implemented yet");
     switch (ah) {
@@ -900,7 +1376,11 @@ bool Pc::video() {
         bool virtualized = c.supports386() && (c.eflags() & 0x20000);
         std::unique_ptr<Vga> virtualDisplay;
         auto* display = &vga;
-        if (virtualized) { virtualDisplay = std::make_unique<Vga>(); display = virtualDisplay.get(); }
+        if (virtualized) {
+            virtualDisplay = std::make_unique<Vga>();
+            if (vga.cirrus()) virtualDisplay->enableCirrus(true);
+            display = virtualDisplay.get();
+        }
         display->setMode(al & 0x7f, !(al & 0x80));
         c.wbF(0x40, 0x49, al & 0x7f);
         c.wwF(0x40, 0x4a, display->graphics() ? uint16_t(display->width() / 8) : (al & 0x7f) < 2 ? 40 : 80);
@@ -1203,6 +1683,11 @@ bool Pc::apm() {
 bool Pc::bios(uint8_t n) {
     // n 是私有 ROM 陷阱传来的 BIOS 中断号；CF/ZF 返回值写调用者栈帧，最终由 IRET 恢复。
     auto& c = cpu; auto& r = c.r; auto ah = c.reg8(4);
+    if (n == 0xe0 && vga.cirrus()) {
+        if (c.r32(AX) != 0x49435024 || c.reg8(3)) { c.reg8(0, 0x80); return true; }
+        c.reg8(0, 0); c.r32(BX, 0xf0000); c.r32(CX, 0x10000); c.r32(DX, 0xb040); return true;
+    }
+    if (n == 0xe1 && vga.cirrus()) return pciBios(true);
 
     // 标准 PC/AT 未装 HP-HIL 接口，探测必须保留 BX 而不能误宣告设备存在。
     if (r[AX] == 0x6f00 && (n == 0x14 || n == 0x16 || n == 0x17)) return true;
@@ -1307,6 +1792,7 @@ bool Pc::bios(uint8_t n) {
     case 0x17: c.reg8(4, 1); return true;
     case 0x19: rebootRequested = true; return true;
     case 0x1a: {
+        if (ah == 0xb1) return pciBios(false);
         // AH=0/1 读写 BDA tick；AH=2/4 取宿主本地时间/日期并编码成 BIOS BCD 字段。
         auto bcd = [](int v) { return uint8_t((v / 10) * 16 + v % 10); };
         auto now = std::time(nullptr); std::tm t{}; localtime_s(&t, &now);

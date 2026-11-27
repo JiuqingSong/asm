@@ -76,6 +76,116 @@ void graphicsFrameTests() {
     std::cout << "Bulk VGA frames / all pixels / CRTC wrap-stride / live palette / plane-PEL masks / blanking checks passed\n";
 }
 
+void cirrusTests() {
+    Pc p; p.setModel(CpuModel::I486); p.setCirrus(true);
+    auto& c = p.cpu; auto& v = p.vga;
+    auto config = [&](unsigned offset) { c.outputPort(0xcf8, 0x80001000 | offset, 4); return c.inputPort(0xcfc, 4); };
+    check(config(0) == 0x00b81013 && (config(8) >> 8) == 0x030000,
+        "PCI GD5446 must enumerate with the documented vendor, device and VGA class");
+    c.outputPort(0x3c4, 0x1206, 2);
+    check(c.in(0x3c5) == 0x12, "Cirrus SR6 must acknowledge the driver's extension key");
+    c.out(0x3c5, uint8_t(~c.in(0x3c5)));
+    check(c.in(0x3c5) == 0x0f, "Cirrus SR6 must pass the Windows 98 miniVDD inverted-key detection probe");
+    c.out(0x3c5, 0x9a);
+    check(c.in(0x3c5) == 0x12, "Cirrus SR6 must ignore the documented don't-care key bits");
+    c.outputPort(0xcf8, 0x80001800, 4);
+    check(c.inputPort(0xcfc, 4) == 0xffffffff, "Absent PCI functions must not alias the VGA device");
+    config(16); c.outputPort(0xcfc, 0xffffffff, 4);
+    check(config(16) == 0xfe000000, "GD5446 Revision B framebuffer BAR must claim 32 MiB");
+    c.outputPort(0xcfc, 0xe0000000, 4);
+    config(20); c.outputPort(0xcfc, 0xffffffff, 4);
+    check(config(20) == 0xfffff000, "GD5446 register BAR must claim 4 KiB");
+    c.outputPort(0xcfc, 0xe2000000, 4);
+    v.setMode(0x5c);
+    check(v.width() == 800 && v.height() == 600 && v.bitsPerPixel() == 8, "Cirrus 5Ch must display 800x600x256");
+    c.writeBus(0xe0000000 + 599 * 800 + 799, 15);
+    check(v.pixel(799, 599) == 15, "The framebuffer must cover pixels beyond the VGA 64 KiB bank");
+    v.output(0x3ce, 9); v.output(0x3cf, 16);
+    v.write(0xa0000, 7);
+    check(c.readBus(0xe0010000) == 7, "Banked and linear windows must address the same VRAM");
+    c.writeBus(0xe0400000, 11);
+    check(c.readBus(0xe0000001) == 11, "Word-swapping aperture must swap the byte address");
+    c.writeBus(0xe0800000, 12);
+    check(c.readBus(0xe0000003) == 12, "Dword-swapping aperture must swap the byte address");
+    auto gr = [&](uint8_t index, uint8_t value) { v.output(0x3ce, index); v.output(0x3cf, value); };
+    auto word = [&](uint8_t index, unsigned value) { gr(index, uint8_t(value)); gr(index + 1, uint8_t(value >> 8)); };
+    auto blt = [&](unsigned src, unsigned dst, unsigned width, unsigned height, unsigned pitch, uint8_t mode) {
+        word(0x20, width - 1); word(0x22, height - 1); word(0x24, pitch); word(0x26, pitch);
+        word(0x28, dst); gr(0x2a, uint8_t(dst >> 16)); word(0x2c, src); gr(0x2e, uint8_t(src >> 16));
+        gr(0x30, mode); gr(0x32, 0x0d); gr(0x31, 2);
+    };
+    for (unsigned i = 0; i < 12; ++i) c.writeBus(0xe0001000 + i, uint8_t(i + 1));
+    blt(0x100b, 0x100d, 12, 1, 12, 1);
+    for (unsigned i = 0; i < 12; ++i)
+        check(c.readBus(0xe0001002 + i) == i + 1, "Backward BitBLT must preserve overlapping source data");
+    blt(0, 0x2000, 3, 2, 8, 4);
+    check(v.gc[0x31] & 1, "System-source BitBLT must remain busy until the host supplies data");
+    for (unsigned i = 0; i < 8; ++i) c.writeBus(0xe0000000, uint8_t(i + 20));
+    check(!(v.gc[0x31] & 1) && c.readBus(0xe0002000) == 20 && c.readBus(0xe0002008) == 24 && c.readBus(0xe000200a) == 26,
+        "System-source BitBLT must discard each scanline's dword padding");
+    gr(0, 2); gr(1, 15);
+    c.writeDword(0xe0000000, 0x41424344);
+    blt(0, 0x3000, 8, 1, 8, 0x84);
+    c.writeDword(0xe0000000, 0x123456a0);
+    check(!(v.gc[0x31] & 1) && c.readBus(0xe0003000) == 15 && c.readBus(0xe0003001) == 2 && c.readBus(0xe0003002) == 15,
+        "Color expansion must use MSB-first source bits and foreground/background colors");
+    check(c.readDword(0xe0000000) == 0x41424344, "The final system-source dword padding must not overwrite live framebuffer pixels");
+    for (unsigned y = 0; y < 8; ++y) for (unsigned x = 0; x < 8; ++x)
+        c.writeBus(0xe0004000 + y * 8 + x, uint8_t(y * 8 + x));
+    gr(0x2f, 2); blt(0x4003, 0x5000, 16, 2, 16, 0x40);
+    check(c.readBus(0xe0005000) == 0 && c.readBus(0xe0005002) == 26 && c.readBus(0xe000500a) == 26 && c.readBus(0xe0005012) == 34,
+        "Pattern fills must use the source's low three bits for vertical phase and clip destination pixels");
+    gr(0x2f, 0x20); blt(0, 0x5100, 3, 1, 8, 4);
+    for (auto value : {99,20,21,22}) c.writeBus(0xe0000000, uint8_t(value));
+    check(!(v.gc[0x31] & 1) && c.readBus(0xe0005100) == 20 && c.readBus(0xe0005102) == 22,
+        "Unaligned system-source BitBLT must discard leading bytes, not render them");
+    gr(0x2f, 0);
+    v.crtc[0x5e] = 0; gr(0x31, 0); gr(0x33, 4);
+    blt(0x6000, 0x5200, 8, 2, 8, 0xc0);
+    check(c.readBus(0xe0005200) == 2, "Locked GR33 must leave a zero monochrome pattern as background pixels");
+    gr(0x31, 0x80); gr(0x33, 4); gr(0x31, 0x82);
+    for (unsigned i = 0; i < 16; ++i)
+        check(c.readBus(0xe0005200 + i) == 15, "GR31 alone must enable the Windows driver's solid-color rectangle fill");
+    gr(0x31, 0); v.crtc[0x5e] = 0x20; gr(0x33, 1);
+    blt(0, 0x5300, 8, 2, 8, 0x84);
+    c.writeDword(0xe0000000, 0x00000080); c.writeDword(0xe0000000, 0x00000040);
+    check(!(v.gc[0x31] & 1) && c.readBus(0xe0005300) == 15 && c.readBus(0xe0005301) == 2 &&
+        c.readBus(0xe0005308) == 2 && c.readBus(0xe0005309) == 15,
+        "CR5E alone must enable dword-aligned color expansion without interpreting scanline padding as pixels");
+    gr(0x33, 0); v.crtc[0x5e] = 0;
+    std::vector<uint32_t> pixels;
+    v.renderGraphics(pixels);
+    check(pixels.size() == 800 * 600 && pixels.back() == v.color(15), "Packed rendering must cover every row and column");
+    v.output(0x3c8, 15); v.output(0x3c9, 63); v.output(0x3c9, 0); v.output(0x3c9, 0);
+    v.renderGraphics(pixels);
+    check(pixels.back() == 0xff0000, "Packed frames must refresh the palette after guest DAC writes");
+    v.crtc[0x13] = 200; v.seq[7] = 0x17;
+    for (unsigned i = 0; i < 4; ++i) v.input(0x3c6);
+    v.output(0x3c6, 0xc1); c.writeBus(0xe0000000, 0); c.writeBus(0xe0000001, 0xf8);
+    v.renderGraphics(pixels);
+    check(v.bitsPerPixel() == 16 && pixels[0] == 0xff0000, "Hidden DAC 5:6:5 must render RGB16 rather than palette indices");
+    v.output(0x3c4, 0x12); v.output(0x3c5, 3);
+    v.output(0x3c8, 0); v.output(0x3c9, 0); v.output(0x3c9, 63); v.output(0x3c9, 0);
+    v.output(0x3c8, 15); v.output(0x3c9, 63); v.output(0x3c9, 0); v.output(0x3c9, 0);
+    v.output(0x3c4, 0x10 | 2 << 5); v.output(0x3c5, 0);
+    v.output(0x3c4, 0x11 | 3 << 5); v.output(0x3c5, 0);
+    c.writeBus(0xe0000000 + Vga::VramBytes - 16384, 0x50);
+    c.writeBus(0xe0000000 + Vga::VramBytes - 16384 + 128, 0x30);
+    v.renderGraphics(pixels);
+    check(pixels[3 * 800 + 3] == 0xffffff && pixels[3 * 800 + 4] == 0x00ff00 && pixels[3 * 800 + 5] == 0xff0000,
+        "Hardware cursor must use indexed low position bits, two bitplanes and its separate DAC colors");
+    config(4); c.outputPort(0xcfc, 0, 2);
+    check(c.readBus(0xe0000000) == 255 && c.in(0x3c4) == 255, "PCI command bits must disable memory and I/O decoding");
+    c.outputPort(0xcfc, 3, 2);
+    config(20); c.outputPort(0xcfc, 0x30000, 4);
+    c.writeWord(0x30108, 7);
+    check(v.gc[0x20] == 7 && v.gc[0x21] == 0, "Relocated MMIO inside RAM must bypass the CPU fast RAM path");
+    p.setCirrus(false);
+    check(c.readBus(0x30108) == c.mem[0x30108] && c.inputPort(0xcfc, 4) == 0xffffffff,
+        "Disabling optional Cirrus must restore RAM and absent PCI behavior");
+    std::cout << "PCI GD5446 / BAR sizing-relocation / bank-linear coherence / packed RGB / BitBLT checks passed\n";
+}
+
 void videoBenchmarks() {
     constexpr unsigned frames = 30;
     for (uint8_t mode : {0x0d, 0x0e, 0x10, 0x12, 0x13}) {
@@ -1935,6 +2045,128 @@ void apmTests(const std::filesystem::path& disk) {
     std::cout << "APM real-mode discovery / connection / errors / Windows 95 power-off / explicit reboot checks passed\n";
 }
 
+void cirrusFirmwareTests(const std::filesystem::path& disk) {
+    Pc p; p.setModel(CpuModel::I486); p.setCirrus(true);
+    p.hard = std::make_unique<Disk>(disk, false, false); p.boot(0x80);
+    auto& c = p.cpu;
+    unsigned checksum = 0; for (unsigned i = 0; i < 16; ++i) checksum += c.readBus(0xfb000 + i);
+    check((checksum & 255) == 0 && c.readDword(0xfb000) == 0x5f32335f, "BIOS32 directory must have a valid signature and checksum");
+    auto interrupt = [&](uint8_t vector, uint16_t ax) {
+        c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.ip = 0x500; c.r[SP] = 0x9000;
+        c.mem[0x500] = 0xcd; c.mem[0x501] = vector; c.mem[0x502] = 0xf4;
+        c.r[AX] = ax; c.halted = false; c.setFlags(CF | DF | 2); p.runCpu(3000000);
+        check(c.halted, "Cirrus BIOS call must return to its caller");
+    };
+    unsigned romBytes = unsigned(c.readBus(0xc0002)) * 512, romSum = 0;
+    for (unsigned i = 0; i < romBytes; ++i) romSum += c.readBus(0xc0000 + i);
+    auto identity = c.rw(0xc000, 0x18);
+    check(romBytes == 0x8000 && !(romSum & 255) && c.rw(0xc000, 0) == 0xaa55 &&
+        c.readDword(0xc0000 + identity) == 0x52494350 && c.rw(0xc000, identity + 4) == 0x1013 &&
+        c.rw(0xc000, identity + 6) == 0xb8 && c.rw(0, 0x42) == 0xc000,
+        "The boot video ROM must identify the actual PCI VGA owner with a valid PCIR header and checksum");
+    c.loadSegment(CS, 0); c.loadSegment(SS, 0); c.loadSegment(DS, 0x2345); c.loadSegment(ES, 0x3456);
+    c.ip = 0x500; c.r[SP] = 0x9000; c.r[AX] = 0xa55a; c.setFlags(CF | DF | 2); c.halted = false;
+    const uint8_t post[] = {0x9a,3,0,0,0xc0,0xf4}; // CALL FAR C000:0003 / HLT：真正执行扩展 ROM 初始化。
+    std::copy(std::begin(post), std::end(post), c.mem.begin() + 0x500);
+    auto registers = c.r; auto segments = c.s; auto flags = c.flags;
+    unsigned postWrites = 0; auto postOutput = c.out;
+    c.out = [&](uint16_t port, uint8_t value) { ++postWrites; postOutput(port, value); };
+    p.runCpu(300000); c.out = postOutput;
+    check(c.halted && c.r == registers && c.s == segments && c.flags == flags && postWrites && p.vga.mode == 3,
+        "PCI video ROM initialization must execute guest I/O and preserve the BIOS far-call caller state");
+    interrupt(0x1a, 0xb101);
+    check(c.r[AX] == 1 && c.r[BX] == 0x0210 && c.r32(DX) == 0x20494350 && !(c.flags & CF),
+        "PCI BIOS discovery must advertise method 1 and preserve correct carry status");
+    c.r[CX] = 0xb8; c.r[DX] = 0x1013; c.r[SI] = 0;
+    interrupt(0x1a, 0xb102);
+    check(c.r[BX] == 0x10 && !(c.flags & CF), "PCI BIOS must find the real optional GD5446 function");
+    c.r[DI] = 0; interrupt(0x1a, 0xb10a);
+    check(c.r32(CX) == 0x00b81013 && !(c.flags & CF), "PCI BIOS dword reads must return full-width configuration data");
+    c.r[DI] = 1; interrupt(0x1a, 0xb10a);
+    check(c.reg8(4) == 0x87 && (c.flags & CF), "PCI BIOS must reject misaligned configuration accesses");
+    c.r[DI] = 0x30; c.r32(CX, 0xffffffff); interrupt(0x1a, 0xb10d); interrupt(0x1a, 0xb10a);
+    check(c.r32(CX) == 0xffff8001, "PCI expansion ROM BAR sizing must report a 32 KiB aligned read-only ROM aperture");
+    c.r32(CX, 0xc0000); interrupt(0x1a, 0xb10d);
+    c.writeBus(0xb8000, 0x55);
+    c.r32(CX, 0xe3000001); interrupt(0x1a, 0xb10d);
+    check(c.readBus(0xe3000000) == 0x55 && c.readBus(0xb8000) == 0xff,
+        "Enabled PCI ROM decoding must relocate firmware reads and disable the shared display-memory pins");
+    c.writeBus(0xe3000000, 0); c.writeBus(0xb8000, 0x66);
+    check(c.readBus(0xe3000000) == 0x55, "Writes to an enabled PCI ROM aperture must not change firmware bytes");
+    c.r[DI] = 4; c.r32(CX, 1); interrupt(0x1a, 0xb10d);
+    check(c.readBus(0xe3000000) == 0xff && c.rw(0xc000, 0) == 0xaa55,
+        "PCI memory-disable must gate device ROM decoding without deleting the BIOS shadow copy");
+    c.r32(CX, 3); interrupt(0x1a, 0xb10d);
+    c.r[DI] = 0x30; c.r32(CX, 0xc0000); interrupt(0x1a, 0xb10d);
+    check(c.readBus(0xb8000) == 0x55, "Disabling PCI ROM decoding must restore the unchanged display memory");
+    bool returnsThroughVideoRom = false; auto biosTrap = c.trap;
+    c.trap = [&](uint8_t vector) {
+        if (vector == 0x10) returnsThroughVideoRom = c.rw(c.s[SS], uint16_t(c.r[SP] + 2)) == 0xc000;
+        return biosTrap(vector);
+    };
+    c.r[BX] = 0x80; interrupt(0x10, 0x1200); c.trap = biosTrap;
+    check(c.r[AX] == 0x39 && c.reg8(3) == 0x47 && returnsThroughVideoRom && c.r[SP] == 0x9000 && (c.flags & (CF | DF)) == (CF | DF),
+        "Cirrus BIOS must report GD5446 and return through its PCI video ROM without losing the original interrupt frame");
+    c.r[BX] = 0x85; interrupt(0x10, 0x1200);
+    check(c.reg8(0) == 64, "Cirrus BIOS installed memory must match the accessible four MiB framebuffer");
+    for (uint16_t mode : {3, 0x13, 0x5c, 0x60, 0x72, 0xdc}) {
+        c.r[BX] = 0xa0; auto previousMode = p.vga.mode;
+        interrupt(0x10, uint16_t(0x1200 | mode));
+        bool supported = mode != 0x72 && mode != 0xdc;
+        check(c.r[AX] == uint16_t((supported ? 0x100 : 0) | mode) && p.vga.mode == previousMode && (c.flags & (CF | DF)) == (CF | DF),
+            "Cirrus mode availability must enable implemented modes, reject unsupported modes and leave display and caller flags unchanged");
+        check(c.s[DS] == 0xffff && c.r[SI] == 0xffff && c.s[ES] == 0xffff && c.r[DI] == 0xffff,
+            "Cirrus mode queries must explicitly mark unavailable OEM parameter tables, not expose private port sequences");
+    }
+    const uint8_t fixup[] = {0x9a,uint8_t(c.r[BX]),uint8_t(c.r[BX] >> 8),0,0xc0,0xf4}; // CALL FAR C000:BX / HLT。
+    std::copy(std::begin(fixup), std::end(fixup), c.mem.begin() + 0x500);
+    c.ip = 0x500; c.halted = false; registers = c.r; segments = c.s; flags = c.flags;
+    p.runCpu(100);
+    check(c.halted && c.r == registers && c.s == segments && c.flags == flags,
+        "The returned Cirrus fixed-mode fixup callback must preserve the far-call caller state");
+    c.loadSegment(DS, 0); c.loadSegment(ES, 0);
+    auto observed = std::make_unique<Vga>(); observed->enableCirrus(true);
+    observed->setMode(0x5c); observed->linearWrite(Vga::VramBytes - 1, 0x55);
+    auto output = c.out;
+    c.out = [&](uint16_t port, uint8_t value) { observed->output(port, value); output(port, value); };
+    auto write = c.mmioWrite;
+    c.mmioWrite = [&](uint32_t address, uint8_t value) { observed->write(address, value); write(address, value); };
+    interrupt(0x10, 0x005c);
+    check(p.vga.width() == 800 && p.vga.height() == 600 && observed->width() == 800 && observed->height() == 600 && observed->packed(),
+        "Cirrus BIOS modes must execute guest register I/O so VM86 monitors can observe the mode");
+    check(observed->linearRead(Vga::VramBytes - 1) == 0, "Guest mode programming must clear the entire SVGA framebuffer, not just its first 64 KiB");
+    observed->linearWrite(Vga::VramBytes - 1, 0x55); interrupt(0x10, 0x00dc);
+    check(observed->linearRead(Vga::VramBytes - 1) == 0x55, "Cirrus BIOS no-clear mode must preserve even the last VRAM bank");
+    const uint8_t gdt[] = {0,0,0,0,0,0,0,0, 0xff,0xff,0,0,0,0x9a,0xcf,0, 0xff,0xff,0,0,0,0x92,0xcf,0};
+    std::copy(std::begin(gdt), std::end(gdt), c.mem.begin() + 0x1000);
+    c.gdtr = {0x1000, 23}; c.msw |= 1;
+    c.loadSegment(SS, 16); c.loadSegment(DS, 16);
+    // JMP FAR 0008:00000600：用远跳转装载保护模式 CS 隐藏缓存。
+    const uint8_t enter[] = {0x66,0xea,0,6,0,0,8,0};
+    std::copy(std::begin(enter), std::end(enter), c.mem.begin() + 0x700);
+    c.mem[0x600] = 0xf4; c.ip = 0x700; c.halted = false; p.runCpu(10);
+    check(c.halted && c.s[CS] == 8, "PCI BIOS fixture must enter a 32-bit protected code segment");
+    auto call32 = [&](uint32_t entry, uint32_t ax) {
+        // CALL FAR 0008:entry / HLT：使用真实 32 位远调用和 ROM RETF，不能绕过取指直接调用 trap。
+        const uint8_t code[] = {0x9a,uint8_t(entry),uint8_t(entry >> 8),uint8_t(entry >> 16),uint8_t(entry >> 24),8,0,0xf4};
+        std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x600);
+        c.ip = 0x600; c.r32(SP, 0x9000); c.r32(AX, ax); c.halted = false; c.setFlags(CF | DF | 2);
+        p.runCpu(1000);
+        check(c.halted && c.ip == 0x608 && c.r32(SP) == 0x9000, "BIOS32 service must return through its 32-bit far-call frame");
+    };
+    c.r32(BX, 0); call32(0xfb020, 0x49435024);
+    check(c.reg8(0) == 0 && c.r32(BX) == 0xf0000 && c.r32(CX) == 0x10000 && c.r32(DX) == 0xb040,
+        "BIOS32 must return an executable protected-mode PCI service range");
+    call32(0xfb040, 0xb101);
+    check(c.r32(DX) == 0x20494350 && !(c.flags & CF), "Protected-mode PCI installation must return directly, not modify an interrupt frame");
+    c.cr3 = 0x3000; c.writeDword(0x3000, 0x4003);
+    for (unsigned page = 0; page < 1024; ++page) c.writeDword(0x4000 + page * 4, page * 4096 | 3);
+    c.writeDword(0x4000 + 0x2b0 * 4, 0xfb003); c.msw |= 0x80000000;
+    c.r32(BX, 0); call32(0x2b0020, 0x49435024);
+    check(c.reg8(0) == 0 && c.r32(DX) == 0xb040, "BIOS32 traps must work when the OS maps ROM at another linear address");
+    std::cout << "Cirrus PCI option ROM / BIOS discovery / PCI configuration errors / observed guest SVGA mode programming checks passed\n";
+}
+
 void videoFirmwareTests(const std::filesystem::path& disk) {
     // 用第二个 Vga 观察每次 guest IN/OUT；仅改变宿主 VGA 内部状态不能满足 BIOS 虚拟化约束。
     Pc p; auto& c = p.cpu;
@@ -2572,6 +2804,102 @@ void ideTests(const std::filesystem::path& path) {
     std::cout << "ATA PIO / CHS-LBA / IRQ14 / word-dword I/O / multi-sector / reset / disk-persistence checks passed\n";
 }
 
+void diskFirmwareTests(const std::filesystem::path& path) {
+    std::array<uint8_t, 1024> expected{};
+    for (unsigned i = 0; i < expected.size(); ++i) expected[i] = uint8_t(i * 29 + i / 512);
+    for (auto model : {CpuModel::I8088, CpuModel::I286, CpuModel::I386, CpuModel::I486}) {
+        Pc p; p.setModel(model); auto& c = p.cpu;
+        p.hard = std::make_unique<Disk>(path, false, false);
+        std::array<uint8_t, 512> boot{}; boot[510] = 0x55; boot[511] = 0xaa;
+        check(p.hard->write(0, boot.data()) && p.hard->write(1, expected.data()) &&
+            p.hard->write(2, expected.data() + 512), "Cannot prepare BIOS PIO firmware sectors");
+        p.boot(0x80);
+        const bool atHardware = model != CpuModel::I8088;
+        if (atHardware) { c.out(0x21, 0xfb); c.out(0xa1, 0xbf); }
+        std::vector<uint8_t> commands;
+        unsigned slaveEoi = 0, masterEoi = 0;
+        auto output = c.out;
+        c.out = [&](uint16_t port, uint8_t value) {
+            if (port == 0x1f7) commands.push_back(value);
+            if (port == 0xa0 && value == 0x20) ++slaveEoi;
+            if (port == 0x20 && value == 0x20) ++masterEoi;
+            output(port, value);
+        };
+        auto call = [&](uint16_t ax, uint16_t cx, uint16_t dx, uint16_t offset) {
+            commands.clear();
+            for (auto seg : {CS, SS, DS}) c.loadSegment(seg, 0);
+            c.loadSegment(ES, 0x1000);
+            c.r[AX] = ax; c.r[CX] = cx; c.r[DX] = dx; c.r[BX] = offset;
+            c.r[SP] = 0x8000; c.r[BP] = 0x2345; c.r[SI] = 0x3456; c.r[DI] = 0x4567;
+            c.setFlags(2 | DF); c.ip = 0x500; c.halted = false;
+            c.mem[0x500] = 0xcd; c.mem[0x501] = 0x13; c.mem[0x502] = 0xf4; // INT 13h / HLT。
+            for (unsigned i = 0; i < 500000 && !c.halted; ++i) p.run(1);
+            check(c.halted && c.r[SP] == 0x8000 && c.r[BP] == 0x2345 && c.r[SI] == 0x3456 &&
+                c.r[DI] == 0x4567 && c.r[CX] == cx && c.r[DX] == dx && c.r[BX] == offset &&
+                c.s[ES] == 0x1000 && (c.flags & (IF | DF)) == DF,
+                "Disk firmware must terminate, preserve the caller's registers and restore IF/DF");
+        };
+        call(0x0202, 2, 0x80, 0x100);
+        check(!(c.flags & CF) && c.r[AX] == 2 && std::equal(expected.begin(), expected.end(), c.mem.begin() + 0x10100),
+            "Guest INT 13h must read complete sectors through the BIOS mapping");
+        check(commands == (atHardware ? std::vector<uint8_t>{0x20} : std::vector<uint8_t>{}),
+            "AT BIOS reads must execute a guest ATA command; 8088 must keep its existing disk path");
+        if (atHardware)
+            check(slaveEoi && masterEoi == slaveEoi, "BIOS IRQ14 must acknowledge both PICs using guest OUT instructions");
+        for (auto& value : expected) value ^= 0x5a;
+        std::copy(expected.begin(), expected.end(), c.mem.begin() + 0x10100);
+        call(0x0302, 4, 0x80, 0x100);
+        std::array<uint8_t, 1024> actual{};
+        check(!(c.flags & CF) && c.r[AX] == 2 && p.hard->read(3, actual.data()) &&
+            p.hard->read(4, actual.data() + 512) && actual == expected,
+            "Guest BIOS PIO writes must preserve every data word");
+        check(commands == (atHardware ? std::vector<uint8_t>{0x30, 0xe7} : std::vector<uint8_t>{}),
+            "AT BIOS writes must issue WRITE SECTORS followed by FLUSH CACHE");
+        call(0x0402, 4, 0x80, 0x100);
+        check(!(c.flags & CF) && commands == (atHardware ? std::vector<uint8_t>{0x40} : std::vector<uint8_t>{}),
+            "BIOS verify must execute READ VERIFY without transferring a data buffer");
+        call(0x0201, 0, 0x80, 0x100);
+        check((c.flags & CF) && c.r[AX] == 0x0400 && commands.empty(),
+            "Invalid CHS must fail before issuing an ATA command");
+        call(0x0202, 4, 0x80, 0xff80);
+        check(!(c.flags & CF) && commands.empty() &&
+            std::equal(expected.begin(), expected.end(), c.mem.begin() + 0x1ff80),
+            "Cross-segment BIOS buffers must preserve the existing linear-buffer behavior");
+        if (atHardware) {
+            c.out(0x3f6, 4);
+            call(0x0201, 2, 0x80, 0x100);
+            check((c.flags & CF) && c.r[AX] == 0x8000, "A stuck ATA busy state must return BIOS timeout, not hang forever");
+            c.out(0x3f6, 0); p.advanceClock(p.clock + 120);
+            p.hard.reset(); p.hard = std::make_unique<Disk>(path, false, true);
+            call(0x0301, 4, 0x80, 0x100);
+            check((c.flags & CF) && c.r[AX] == 0x0300,
+                "BIOS PIO must report write protection when the actual ATA backend rejects a write");
+        }
+    }
+    auto large = std::filesystem::path(path.native() + L".disk-firmware");
+    Disk::createBytes(large, uint64_t(8) << 30);
+    try {
+        Pc p; p.setModel(CpuModel::I486); auto& c = p.cpu;
+        p.hard = std::make_unique<Disk>(large, false, false);
+        std::array<uint8_t, 512> boot{}; boot[510] = 0x55; boot[511] = 0xaa;
+        check(p.hard->write(0, boot.data()), "Cannot prepare translated-CHS firmware boot sector");
+        const uint32_t lba = (257 * unsigned(p.hard->biosHeads()) + 1) * unsigned(p.hard->spt);
+        check(p.hard->biosHeads() == 255 && p.hard->write(lba, expected.data()),
+            "Translated-CHS test must cross the first multiplication's sixteen-bit carry");
+        p.boot(0x80);
+        for (auto seg : {CS, SS, DS}) c.loadSegment(seg, 0);
+        c.loadSegment(ES, 0x1000); c.setFlags(2); c.r[SP] = 0x8000;
+        c.r[AX] = 0x0201; c.r[CX] = 0x0141; c.r[DX] = 0x0180; c.r[BX] = 0x100;
+        c.mem[0x500] = 0xcd; c.mem[0x501] = 0x13; c.mem[0x502] = 0xf4; c.ip = 0x500; c.halted = false;
+        for (unsigned i = 0; i < 50000 && !c.halted; ++i) p.run(1);
+        check(c.halted && !(c.flags & CF) &&
+            std::equal(expected.begin(), expected.begin() + 512, c.mem.begin() + 0x10100),
+            "Guest PIO must preserve all CHS-to-LBA carries for an 8 GiB disk with 255 translated heads");
+    } catch (...) { std::filesystem::remove(large); throw; }
+    std::filesystem::remove(large);
+    std::cout << "Guest BIOS disk PIO / IRQ14 EOI / caller state / errors-timeouts / translated CHS checks passed\n";
+}
+
 void atapiTests(const std::filesystem::path& path) {
     // ATAPI 包/数据相位、IRQ15、传输上限、sense/TOC/锁盘与介质更换均通过设备端口验证。
     std::vector<uint8_t> expected(4096);
@@ -3205,7 +3533,7 @@ void unit() {
             p.cpu.halted = false; p.cpu.s[CS] = 0xffff; p.cpu.ip = 0;
             p.run(2); check(p.rebootRequested, "Firmware reset vector requests reboot");
         }
-        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
+        overlayTests(path); softfloatTests(); dmaTests(); fdcTests(path); diskSizingTests(path); extendedDiskTests(path); mbrBootstrapTests(path); ideTests(path); diskFirmwareTests(path); atapiTests(path); x87IrqTests(path); apmTests(path); cirrusFirmwareTests(path); videoFirmwareTests(path); virtualVideoFirmwareTests(path); pagedBiosTests(path);
         bool rejected = false; try { Disk::create(path); } catch (const std::exception&) { rejected = true; }
         check(rejected, "Existing disk must never be overwritten");
     } catch (...) { std::filesystem::remove(path); throw; }
@@ -3216,8 +3544,9 @@ void unit() {
 
 int main(int argc, char** argv) {
     try { if (argc == 2 && std::string(argv[1]) == "--benchmark-video") { videoBenchmarks(); return 0; }
+        if (argc == 2 && std::string(argv[1]) == "--test-cirrus") { cirrusTests(); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--benchmark") { benchmarks(); return 0; }
-        if (argc == 2) return corpus(argv[1]); graphicsFrameTests(); physicalReadTests(); operandPagingTests(); preferenceTests(); timingTests(); cpu386Tests(CpuModel::I386); cpu386Tests(CpuModel::I486);
+        if (argc == 2) return corpus(argv[1]); cirrusTests(); graphicsFrameTests(); physicalReadTests(); operandPagingTests(); preferenceTests(); timingTests(); cpu386Tests(CpuModel::I386); cpu386Tests(CpuModel::I486);
         protectedTests(); atTests(CpuModel::I286); atTests(CpuModel::I386); atTests(CpuModel::I486); unit(); return 0; }
     catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

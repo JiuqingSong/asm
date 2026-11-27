@@ -20,8 +20,15 @@ const uint8_t* Cpu::physicalRam(uint32_t address, unsigned size) const {
 
     // 快速 RAM 访问不能跨页：边界两侧可能因地址回绕、A20 或复位 ROM 别名而不连续。
     if ((a & 4095) > 4096 - size || a >= mem.size() || size > mem.size() - a) return nullptr;
-    if (mmioRead && a < mmioEnd && uint64_t(a) + size > mmioStart) return nullptr;
+    if (mmioRead && mmioAddress(a, size)) return nullptr;
     return mem.data() + a;
+}
+
+bool Cpu::mmioAddress(uint32_t a, unsigned size) const {
+    if (a < mmioEnd && uint64_t(a) + size > mmioStart) return true;
+    for (const auto& window : pciWindows)
+        if (a < window.second && uint64_t(a) + size > window.first) return true;
+    return false;
 }
 
 uint8_t Cpu::readPhysical(uint32_t address) const {
@@ -30,7 +37,7 @@ uint8_t Cpu::readPhysical(uint32_t address) const {
 
 uint8_t Cpu::readBus(uint32_t a) const {
     // 外设总线访问不经过 CPU 的 A20/分页处理，但仍必须路由 VGA MMIO。
-    return a >= mmioStart && a < mmioEnd && mmioRead ? mmioRead(a) : a < mem.size() ? mem[a] : 0xff;
+    return mmioRead && mmioAddress(a) ? mmioRead(a) : a < mem.size() ? mem[a] : 0xff;
 }
 
 uint16_t Cpu::rw(uint16_t seg, uint16_t off) const { return rb(seg, off) | (uint16_t(rb(seg, uint16_t(off + 1))) << 8); }
@@ -60,7 +67,7 @@ void Cpu::writePhysical(uint32_t address, uint8_t v) {
 
 void Cpu::writeBus(uint32_t a, uint8_t v) {
     if (onWrite) onWrite(a);
-    if (a >= mmioStart && a < mmioEnd && mmioWrite) mmioWrite(a, v);
+    if (mmioWrite && mmioAddress(a)) mmioWrite(a, v);
     else if (a < mem.size()) mem[a] = v;
 }
 
@@ -440,9 +447,14 @@ void Cpu::stepInstruction() {
         if (op == 0xf0 || op == 0xf1) {
             // F0 为 LOCK；BIOS ROM 中的 F1 nn 是本解释器私有服务陷阱，不是标准 INT nn。
             if (op == 0xf0) lockPrefix = true;
-            if (op == 0xf1 && (segmentBase(CS) + startIp) >= 0xf0000 && (segmentBase(CS) + startIp) < 0xf2000 && trap) {
-                auto n = fetch8(); waiting = !trap(n); if (waiting) ip = startIp;
-                return;
+            if (op == 0xf1 && trap) {
+                auto linear = segmentBase(CS) + startIp;
+                auto physical = busAddress(translate(linear, false, false));
+                // BIOS32 可被保护模式操作系统映射到其它线性地址，只接受两个真实 ROM 服务入口。
+                if ((linear >= 0xf0000 && linear < 0xf2000) || physical == 0xfb020 || physical == 0xfb040) {
+                    auto n = fetch8(); waiting = !trap(n); if (waiting) ip = startIp;
+                    return;
+                }
             }
             continue;
         }

@@ -36,6 +36,7 @@ double measuredMips = 0;
 bool rightCtrlDown = false;
 bool fullSpeed = false;
 bool stableTiming = false;
+bool defaultVideo = true;
 bool mouseCaptured = false;
 std::array<bool, 128> pressedKeys{};
 double mouseFractionX = 0, mouseFractionY = 0;
@@ -64,6 +65,7 @@ void title(HWND hwnd) {
     value += L" | C: " + (pc->hard ? pc->hard->path.filename().wstring() : L"(empty)");
     if (pc->hard && pc->hard->hasOverlay()) value += L" | Overlay: " + pc->hard->overlayPath().filename().wstring();
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
+    if (pc->vga.cirrus()) value += L" | PCI Cirrus GD5446";
     value += fullSpeed ? L" | Full speed" : pc->cpu.model == CpuModel::I486 && stableTiming ? L" | Normal speed (486 ~32 MIPS virtual)"
         : pc->cpu.model == CpuModel::I486 ? L" | Normal speed (486 ~8 MIPS)"
         : pc->cpu.model == CpuModel::I386 ? L" | Normal speed (386 ~4 MIPS)"
@@ -330,6 +332,7 @@ void command(HWND hwnd, int id) {
     case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
         if (poweredOn || running) { MessageBoxW(hwnd, L"Power off the machine before changing the CPU (Machine > Power off).", L"CPU", MB_OK); break; }
         pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088);
+        if (defaultVideo) pc->setCirrus(pc->cpu.supports386());
         poweredOn = false;
         if (!CheckMenuRadioItem(GetMenu(hwnd), Cpu8088, Cpu486, id, MF_BYCOMMAND))
             throw std::runtime_error("Cannot update CPU menu");
@@ -626,6 +629,13 @@ int headless(const std::filesystem::path& script) {
             bool valid = arg == "powered-off" ? pc->powerOffRequested : arg == "graphics" ? !pc->powerOffRequested && pc->vga.graphics()
                 : arg == "text" ? !pc->powerOffRequested && !pc->vga.graphics() : false;
             if (!valid) throw std::runtime_error("Script line " + std::to_string(lineNumber) + ": state assertion failed: " + arg);
+        } else if (op == "expect-video") {
+            std::istringstream input(arg); unsigned width, height, bpp; std::string extra;
+            if (!(input >> width >> height >> bpp) || (input >> extra))
+                throw std::runtime_error("Expected expect-video <width> <height> <bits per pixel>");
+            if (pc->powerOffRequested || !pc->vga.graphics() || pc->vga.width() != width || pc->vga.height() != height || pc->vga.bitsPerPixel() != bpp)
+                throw std::runtime_error("Video geometry/pixel format assertion failed: " + arg);
+            std::cout << "Video verified: " << width << 'x' << height << 'x' << bpp << '\n';
         } else if (op == "reject-fault") {
             std::istringstream input(arg); unsigned vector; std::string address, extra;
             if (!(input >> vector >> address) || vector > 31 || (input >> extra))
@@ -697,8 +707,10 @@ void headlessRegressionTests() {
         auto folder = std::filesystem::temp_directory_path();
         if (!GetTempFileNameW(folder.c_str(), L"ash", 0, name)) throw std::runtime_error("Cannot create headless-test script");
         path = name;
-        auto run = [&](const std::string& commands, const std::vector<uint8_t>& code, const std::string& expectedError) {
+        auto run = [&](const std::string& commands, const std::vector<uint8_t>& code, const std::string& expectedError, uint8_t mode = 3) {
             pc = std::make_unique<Pc>(); pc->setModel(CpuModel::I486);
+            if (mode == 0x5c) pc->setCirrus(true);
+            pc->vga.setMode(mode);
             pc->cpu.loadSegment(CS, 0); pc->cpu.ip = 0x500; pc->cpu.setFlags(2);
             std::copy(code.begin(), code.end(), pc->cpu.mem.begin() + 0x500);
             std::ofstream out(path); out << commands; out.close();
@@ -706,6 +718,7 @@ void headlessRegressionTests() {
             try { headless(path); }
             catch (const std::runtime_error& e) {
                 if (expectedError.empty() || std::string(e.what()).find(expectedError) == std::string::npos) throw;
+                std::filesystem::remove(std::filesystem::path(path.wstring() + L".failure.bmp"));
                 return;
             }
             if (!expectedError.empty()) throw std::runtime_error("Headless script should have rejected: " + expectedError);
@@ -717,6 +730,10 @@ void headlessRegressionTests() {
         run("boot-normal 0 full\n", {0xeb, 0xfe}, "timeout waiting for Windows graphics startup");
         run("realtime 0 normal\ntype-paced a\n", {0xeb, 0xfe}, "");
         if (pc->instructions > 1000000) throw std::runtime_error("Normal-speed paced typing exceeded its 100 ms instruction budget");
+        run("expect-video 800 600 8\n", {}, "", 0x5c);
+        run("expect-video 640 480 8\n", {}, "Video geometry/pixel format assertion failed", 0x5c);
+        run("expect-video 800 600 16\n", {}, "Video geometry/pixel format assertion failed", 0x5c);
+        run("expect-video 640 400 4\n", {}, "Video geometry/pixel format assertion failed");
         std::filesystem::remove(path);
     } catch (...) {
         pc = std::move(savedPc); stableTiming = savedTiming;
@@ -772,6 +789,11 @@ int application(int argc, wchar_t** argv) {
                 throw std::runtime_error("--cpu must be 8088, 286, 386 or 486");
             pc->setModel(value == L"486" ? CpuModel::I486 : value == L"386" ? CpuModel::I386 : value == L"286" ? CpuModel::I286 : CpuModel::I8088);
             cpuSpecified = true;
+        }
+        else if (option == L"--video") {
+            if (value != L"vga" && value != L"cirrus") throw std::runtime_error("--video must be vga or cirrus");
+            pc->setCirrus(value == L"cirrus");
+            defaultVideo = false;
         }
         else if (option == L"--boot") {
             if (value != L"a" && value != L"c") throw std::runtime_error("--boot must be a or c");
@@ -848,11 +870,14 @@ int application(int argc, wchar_t** argv) {
         if (hardSpecified) preferences->hard(pc->hard->path);
         if ((hardSpecified || overlaySpecified) && pc->hard) preferences->overlay(pc->hard->overlayPath());
     }
+    if (defaultVideo) pc->setCirrus(pc->cpu.supports386());
     if (!script.empty()) {
+        if (pc->vga.cirrus() && !pc->cpu.supports386()) throw std::runtime_error("PCI Cirrus requires a 386 or 486 CPU");
         if (start) pc->boot(pc->bootDrive);
         return headless(script);
     }
     if (uiTest) headlessRegressionTests();
+    if (pc->vga.cirrus() && !pc->cpu.supports386()) throw std::runtime_error("PCI Cirrus requires a 386 or 486 CPU");
     auto instance = GetModuleHandleW(nullptr);
     SetProcessDPIAware();
     WNDCLASSW cls{}; cls.hInstance = instance; cls.lpfnWndProc = windowProc; cls.lpszClassName = L"Asm86Native";

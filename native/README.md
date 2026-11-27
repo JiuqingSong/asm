@@ -221,7 +221,7 @@ GUI 启动时恢复上次的软盘、CPU 和速度设置，机器保持关机、
   图形/文本状态、图形尺寸及 256 色选择按硬件寄存器决定，不依赖最后一次 BIOS 模式号；
   Windows 从全屏 DOS 直接恢复 VGA 寄存器时也能正确恢复画面。
 - 支持 BIOS 切换模式、页 0 像素读写、16 色 XOR 绘图，以及调色板/DAC 读写。
-  不提供 VBE/SVGA 扩展和显示器 DDC/EDID；`INT 10h / AH=4Fh` 返回失败状态 `AX=014Fh`，
+  默认 VGA 不提供 SVGA 扩展；两种适配器均不提供 VBE 和显示器 DDC/EDID，`INT 10h / AH=4Fh` 返回失败状态 `AX=014Fh`，
   不填充虚假的显示器数据，也不会因 Windows 95 OSR2 的可选探测而停机。
   图形页 0 支持字符/字符串绘制、字符识别、光标及双向窗口滚屏，使用客体 INT 43h
   字体指针和 BIOS 字符高度；16 色字符支持 XOR，256 色保留完整颜色索引。
@@ -256,6 +256,57 @@ PIT 重新装载后，计数器端口读值、锁存值与 IRQ0 使用同一装�
 正常/全速模式均在窗口失焦、被遮挡或最小化后继续运行；失焦只释放鼠标和按键，
 不会自动停机。全速执行与有上限的消息处理交替进行，不再依赖消息队列完全空闲；
 最小化时省略定时重绘，保留执行。切换速度不重置客体时钟；重新启动客体时重新建立计时基准。
+
+## 实验性 PCI Cirrus GD5446
+
+```powershell
+.\native\run.ps1 -Cpu 486 -HardDisk 'D:\images\windows98.img' -Overlay 'D:\images\cirrus-test.cow' -FullSpeed
+.\native\build\native-tests.exe --test-cirrus
+```
+
+386/486 默认启用 Cirrus SVGA；8088/286 仍使用标准 VGA，不改变原有 CPU 默认值或已保存的 CPU 设置。
+可用 `-Video vga` / `--video vga` 显式选择标准 VGA，或用 `-Video cirrus` / `--video cirrus` 显式启用
+Cirrus（仍需 386 或 486）。未显式指定适配器时，GUI 切换 CPU 也按上述规则选择显卡；
+显式选择暂不保存到 GUI 设置。设备为 PCI `1013:00B8`（bus 0 / device 2 / function 0），
+提供配置机制 1、实模式 PCI BIOS、可重新映射的 BIOS32 保护模式入口、32 MiB framebuffer BAR
+及 4 KiB MMIO BAR、32 KiB 扩展 ROM BAR；C000 段中的自编 ROM 提供有效的 PCIR 标识、
+校验和与 INT 10h 入口，将启动 VGA 关联到同一 PCI 设备。实际显存为 4 MiB。实现 banked/linear 共享显存、8/15/16/24/32 位显示转换、
+基础 BitBLT ROP/复制/图案/颜色扩展、系统源 FIFO 和双色硬件光标。
+自编 BIOS 提供 5Fh（640×480×256）、5Ch（800×600×256）、60h（1024×768×256）模式，
+扩展清屏同样执行客体 I/O 并遍历全部显存 bank。类型、修订与显存查询遵循 Cirrus OEM 接口；
+固件版本为本项目接口版本，不包含或分发厂商 ROM。
+OEM A0h 模式可用性查询仅报告固件实际实现的模式；标准/补充参数表暂未提供，按协议返回 `FFFF:FFFF`。
+SR6 非解锁值回读采用 `0Fh`，并忽略钥匙的 don't-care 位，以通过 Windows 98 内置 miniVDD 的探测。
+这与手册正文的 `FFh` 不同；手册的位表复位值同样为 `0Fh`。
+GR33 写保护采用 CR5E 的寄存器说明：GR31[7] 或 CR5E[5] 任一置位即可写入。
+手册 GR33 段落要求两位同时置位，与 CR5E 段落矛盾；实际 Windows 98 驱动仅置 GR31[7]，
+必须接受其扩展控制位，才能正确执行窗口实色填充。
+
+Windows 98 SE 内置 Cirrus Logic 5446 PCI 驱动已实际验证 640×480×256 和 800×600×256。
+`real-full` 回归验证两次冷启动均保持 800×600×8、Welcome/Explorer/Notepad、
+文件保存与重开、DOS 文件复制、五分钟运行后继续操作及正常 APM 关机；
+另已检查窗口移动和串口鼠标输入。默认 VGA 的 DOS、Windows 3.1、Windows 95 回归仍通过。
+1024×768 和其它色深尚未做 Windows 实机验证。请先用差分盘实验，保留原系统映像。
+暂不实现 YUV/视频采集、BitBLT 忙时的新命令缓冲、VBE、DDC/EDID；
+未实现的加速操作明确报错，不返回伪造的成功状态。
+
+### 已安装 Windows 98 的迁移
+
+对于在尚无 PCI 支持的旧版本上安装的系统，已验证以下迁移流程：
+
+1. 建立差分盘，以 `-Video cirrus` 启动，并挂载自行提供的 Windows 98 安装光盘。
+2. 如果设备管理器中没有 PCI bus，在“添加新硬件”中选择手动安装：
+   **System devices → (Standard system devices) → PCI bus**。
+   Windows 随后识别 **Cirrus Logic 5446 PCI** 并安装内置驱动；解压安装文件可能需要数分钟。
+3. 如果显示适配器中同时保留旧 **Standard Display Adapter (VGA)**，仅移除这个旧节点，然后重启。
+   不要把旧 ROOT VGA 节点强制更新为不兼容的 Cirrus 驱动；应使用实际 PCI 设备的匹配驱动。
+4. 在“显示属性 → Settings”中选择 **256 Colors、800 by 600 pixels**，点击 Apply。
+   先确认调整桌面的提示，再在 **Monitor Settings** 中明确选择 **Yes**；
+   后一个对话框默认是 **No**，直接按 Enter 会回退到原分辨率。
+5. 正常关机后重新启动，确认设备仍为 Cirrus Logic 5446 PCI，分辨率和色深保持不变。
+
+`native-tests.exe --test-cirrus` 只运行设备级测试；PCI BIOS、扩展 ROM 和客体模式编程测试
+包含在无参数的完整 `native-tests.exe` 中。
 
 ## 安装 DOS 6.22
 
@@ -515,6 +566,7 @@ Windows 98 只在实际出现 `-Win98Warning` 指定的文本提示时按 Enter�
 
 新增脚本指令：`wait-realtime <毫秒> <文字>` 按 GUI 的实时调度等待文字、超时非零退出；
 `expect-state graphics/text/powered-off` 明确断言显示/关机状态，不能用脚本执行完代替关机成功。
+`expect-video <宽> <高> <每像素位数>` 精确断言图形硬件尺寸与像素格式，拒绝文本状态、关机及不匹配的显示模式。
 `key CTRL_DOWN/CTRL_UP` 支持控制键组合；`type-paced <文字>` 每字符推进约 100ms，
 适合 Windows GUI 输入；原有 `type` 保持原来的确定性快速输入行为。
 `type-paced` 和 `wait-realtime` 沿用最近一次 `realtime`/`boot-normal` 的正常或全速选择。
@@ -544,6 +596,17 @@ XT 提供第一片 8237 的寄存器，AT 另提供第二片和级联通道；�
 已实现 IDENTIFY、CHS/LBA28 PIO 读写、READ/WRITE MULTIPLE、逻辑几何初始化、
 PIO 传输模式、写缓存开关、FLUSH CACHE、软件复位、nIEN 及设备错误状态。
 未挂载的从盘不会冒充第二块硬盘；DMA、PACKET 等未实现命令返回 ABRT。
+
+主硬盘的常规 BIOS `INT 13h / AH=02h、03h、04h` 由客体 ROM 执行实际 IDE PIO，
+IRQ14 默认入口也由客体指令读取 ATA 状态并向两片 PIC 发送 EOI。
+Windows 的 ESDI_506/VPICD 依赖这些可截获的端口访问建立 BIOS 磁盘与控制器的对应关系；
+仅在宿主直接读写映像会导致 `IOS.LOG` 中的 `ESDI trap handler not called`、
+控制器 Code 10 和 MS-DOS 兼容模式。Windows 98 已实际确认文件系统、虚拟内存均为 **32-bit**，
+性能页显示 **Your system is configured for optimal performance**。
+主 IDE 控制器的叹号已消失，冷启动后仍保持 32 位磁盘访问；
+随后通过两次冷启动、文件保存/重开、五分钟运行后继续操作和正常关机回归。
+8088、EDD 及原有特殊缓冲区请求保留宿主 BIOS 路径；普通 CHS 请求使用完整 32 位换算，
+测试包含 8 GiB、255 个转换磁头下的进位，以及寄存器/标志保持、只读错误和设备超时。
 
 数据端口的 16/32 位 IN/OUT、INS/OUTS 使用完整的 ATA 字传输，
 不再将高字节误读写到相邻任务寄存器。命令完成按设备时钟延迟，再置 DRQ/IRQ；

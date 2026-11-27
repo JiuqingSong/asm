@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace asm86 {
@@ -48,6 +49,8 @@ public:
     std::function<void(CpuFault, uint32_t)> onFault;
     std::function<void(uint32_t)> onWrite;
     uint32_t mmioStart = 0, mmioEnd = 0;
+    std::array<std::pair<uint32_t, uint64_t>, 3> pciWindows{};
+    bool mmioAddress(uint32_t address, unsigned size = 1) const;
     std::function<uint8_t(uint32_t)> mmioRead;
     std::function<void(uint32_t, uint8_t)> mmioWrite;
 

@@ -14,6 +14,7 @@
 #include <deque>
 #include <limits>
 #include <unordered_map>
+#include <vector>
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -75,6 +76,7 @@ public:
     std::string notice;
     Pc();
     void setModel(CpuModel model);
+    void setCirrus(bool enabled);
     bool at() const { return cpu.model != CpuModel::I8088; }
     void boot(uint8_t drive);
     void run(unsigned budget, double untilClock = std::numeric_limits<double>::infinity());
@@ -115,6 +117,17 @@ private:
     bool apmConnected = false, apmEnabled = true, apmEngaged = true;
     uint16_t apmVersion = 0x0100;
     bool video();
+    uint32_t pciAddress = 0, pciFramebuffer = 0xe0000000, pciRegisters = 0xe2000000;
+    static constexpr uint32_t PciRomBytes = 0x8000;
+    uint32_t pciRomAddress = 0xc0000;
+    std::vector<uint8_t> pciRom;
+    uint16_t pciCommand = 3;
+    uint8_t pciLatency = 0;
+    void mapPci();
+    void installCirrusRom();
+    uint8_t pciRead(unsigned offset) const;
+    void pciWrite(unsigned offset, uint8_t value);
+    bool pciBios(bool protectedCall);
     bool disk();
     unsigned biosColumns();
     unsigned biosPage();

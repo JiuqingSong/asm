@@ -7,7 +7,8 @@ param(
     [string]$Cdrom,
     [switch]$StableTiming,
     [switch]$RealTimeTiming,
-    [string]$Overlay
+    [string]$Overlay,
+    [ValidateSet('vga', 'cirrus')][string]$Video
 )
 $ErrorActionPreference = 'Stop'
 $exe = Join-Path $PSScriptRoot 'build\asm86-native.exe'
@@ -16,6 +17,7 @@ if ($FullSpeed -and $NormalSpeed) { throw 'Choose either -FullSpeed or -NormalSp
 if ($StableTiming -and $RealTimeTiming) { throw 'Choose either -StableTiming or -RealTimeTiming, not both' }
 $arguments = @()
 if ($Cpu) { $arguments += @('--cpu', $Cpu) }
+if ($Video) { $arguments += @('--video', $Video) }
 if ($HardDisk) {
     $arguments += @('--hard', ('"{0}"' -f (Resolve-Path -LiteralPath $HardDisk).Path))
 }

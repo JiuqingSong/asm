@@ -5,6 +5,8 @@ param(
     [string]$Win31Image = (Join-Path $PSScriptRoot 'win31-386.img'),
     [string]$Win95Image,
     [string]$Win98Image,
+    [string]$Win98Overlay,
+    [ValidateSet('vga', 'cirrus')][string]$Win98Video = 'vga',
     [string]$Win98Warning = 'vnetbios.vxd',
     [ValidateSet('real-full', 'real-normal', 'stable-full', 'stable-normal')]
     [ValidateCount(1, 4)]
@@ -15,6 +17,7 @@ param(
     [ValidateRange(60, 7200)][int]$TimeoutSeconds = 1200
 )
 $ErrorActionPreference = 'Stop'
+if (($Win98Overlay -or $Win98Video -eq 'cirrus') -and -not $Win98Image) { throw 'Win98Overlay/Win98Video cirrus require an installed Win98Image' }
 $Executable = (Resolve-Path -LiteralPath $Executable).Path
 if (-not $DiskChecker) { $DiskChecker = Join-Path (Split-Path -Parent $Executable) 'os-disk-check.exe' }
 $DiskChecker = (Resolve-Path -LiteralPath $DiskChecker).Path
@@ -36,13 +39,13 @@ function Invoke-TestProcess([string]$Program, [string[]]$Arguments, [string]$Pre
         $process.Dispose()
     }
 }
-function Invoke-Guest([string]$Name, [string]$Phase, [string]$Commands, [string]$Cpu, [string]$Base, [string]$Overlay, [string]$Mode) {
+function Invoke-Guest([string]$Name, [string]$Phase, [string]$Commands, [string]$Cpu, [string]$Base, [string]$Overlay, [string]$Mode, [string]$Video) {
     $prefix = Join-Path $root "$Name-$Phase"
     [IO.File]::WriteAllText("$prefix.txt", $Commands, $utf8)
     $timing = if ($Mode.StartsWith('stable-')) { '--stable-timing' } else { '--real-time-timing' }
     $speed = if ($Mode.EndsWith('-normal')) { '--normal-speed' } else { '--full-speed' }
     $arguments = @('--cpu', $Cpu, '--hard', ('"{0}"' -f $Base), '--overlay', ('"{0}"' -f $Overlay),
-        $timing, $speed, '--boot', 'c', '--headless', ('"{0}.txt"' -f $prefix))
+        $timing, $speed, '--video', $Video, '--boot', 'c', '--headless', ('"{0}.txt"' -f $prefix))
     Invoke-TestProcess $Executable $arguments $prefix
 }
 function Hotkey([string]$Modifier, [string]$Key) {
@@ -70,6 +73,8 @@ function Windows98-Workflow([string]$Prefix, [string]$Phase, [string]$Folder, [s
     $note = "NOTE-$Marker"; $dos = "DOS-$Marker"
     $guest = "C:\$Folder"
     $commands = "reject-fault 0 0x40524a`nboot-normal 600000 $speed $Win98Warning`nrealtime 30000 $speed`nkey ENTER`nrealtime 90000 $speed`nexpect-state graphics`n"
+    $displayCheck = if ($Win98Video -eq 'cirrus') { "expect-video 800 600 8`n" } else { '' }
+    $commands += $displayCheck
     $commands += (Hotkey 'ALT' 'F4') + "key ESC`nrealtime 1500 $speed`n"
     $commands += (Run-Dialog 'C:\WINDOWS\WELCOME.EXE' "$Prefix-welcome") + "realtime 15000 $speed`nframe $(Join-Path $root "$Prefix-welcome.bmp")`n"
     $commands += (Hotkey 'ALT' 'F4') + "key ESC`nrealtime 1500 $speed`n"
@@ -97,7 +102,7 @@ function Windows98-Workflow([string]$Prefix, [string]$Phase, [string]$Folder, [s
         $files += @{Guest="\$Folder\SOAK.TXT"; Expected=$dos}
     }
     if ($Phase -eq 'reopen') { $files += @{Guest="\$Folder\READ.TXT"; Expected=$dos} }
-    $commands += (Hotkey 'CTRL' 'ESC') + "key U`nrealtime 2000 $speed`n"
+    $commands += $displayCheck + (Hotkey 'CTRL' 'ESC') + "key U`nrealtime 2000 $speed`n"
     $commands += (Hotkey 'ALT' 'S') + "key ENTER`nrealtime 60000 $speed`nexpect-state powered-off`n"
     return @{Commands=$commands; Files=$files}
 }
@@ -113,9 +118,16 @@ foreach ($profile in @(
         $result.Error = 'No installed image supplied'; $results.Add([pscustomobject]$result); continue
     }
     $base = Join-Path $root "$name-base.img"
+    $initialOverlay = ''; $overlayHash = ''
+    $video = if ($name -eq 'win98') { $Win98Video } else { 'vga' }
     try {
         $source = (Resolve-Path -LiteralPath $source).Path
         $hash = Copy-InstalledImage $source $base
+        if ($name -eq 'win98' -and $Win98Overlay) {
+            $Win98Overlay = (Resolve-Path -LiteralPath $Win98Overlay).Path
+            $initialOverlay = Join-Path $root 'win98-start.cow'
+            $overlayHash = Copy-InstalledImage $Win98Overlay $initialOverlay
+        }
     } catch {
         $result.Status = 'Failed'; $result.Error = "Snapshot failed: $($_.Exception.Message)"
         $results.Add([pscustomobject]$result)
@@ -130,6 +142,7 @@ foreach ($profile in @(
         $result = [ordered]@{Profile=$name; Timing=$mode; Status='Failed'; Source=$source; SHA256=$hash; Seconds=0; Checks=@(); Error=''}
         $started = [Diagnostics.Stopwatch]::StartNew()
         try {
+            if ($initialOverlay) { Copy-Item -LiteralPath $initialOverlay -Destination $overlay }
             $token = [guid]::NewGuid().ToString('N').Substring(0, 8).ToUpperInvariant()
             $marker = "ASMREG-$token"; $folder = 'AR' + $token.Substring(0, 6)
             if ($name -eq 'win98') {
@@ -157,7 +170,8 @@ foreach ($profile in @(
                     }
                 }
                 $commands += "state`nscreen $(Join-Path $root "$caseName-$phase-screen.txt")`n"
-                Invoke-Guest $caseName $phase $commands $profile.Cpu $base $overlay $mode
+                Invoke-Guest $caseName $phase $commands $profile.Cpu $base $overlay $mode $video
+                if ($name -eq 'win98' -and $video -eq 'cirrus') { $result.Checks += "$phase-800x600x8" }
                 if ($name -eq 'win98' -or $name -eq 'win95') { $result.Checks += "$phase-apm-shutdown" }
                 foreach ($file in $files) {
                     $label = [IO.Path]::GetFileNameWithoutExtension($file.Guest)
@@ -173,6 +187,8 @@ foreach ($profile in @(
             try {
                 if ((Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash -ne $hash -or
                     (Get-FileHash -LiteralPath $base -Algorithm SHA256).Hash -ne $hash) { throw 'Source or read-only base SHA256 changed' }
+                if ($initialOverlay -and ((Get-FileHash -LiteralPath $Win98Overlay -Algorithm SHA256).Hash -ne $overlayHash -or
+                    (Get-FileHash -LiteralPath $initialOverlay -Algorithm SHA256).Hash -ne $overlayHash)) { throw 'Source or initial overlay SHA256 changed' }
             } catch {
                 $result.Status = 'Failed'; $result.Error += "; image integrity check failed: $($_.Exception.Message)"
                 Write-Warning "$caseName : $($result.Error)"
@@ -184,6 +200,7 @@ foreach ($profile in @(
         }
     }
     if (-not $KeepDisks -and -not @($results | Where-Object { $_.Profile -eq $name -and $_.Status -eq 'Failed' }).Count) { Remove-Item -LiteralPath $base -Force }
+    if ($initialOverlay -and -not $KeepDisks -and -not @($results | Where-Object { $_.Profile -eq $name -and $_.Status -eq 'Failed' }).Count) { Remove-Item -LiteralPath $initialOverlay -Force }
 }
 $results | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'results.json') -Encoding UTF8
 $results | Format-Table Profile, Timing, Status, Seconds, Error -AutoSize
