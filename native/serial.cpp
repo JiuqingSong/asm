@@ -3,7 +3,12 @@
 
 // COM1 的 8250 UART 与 Microsoft 三字节串口鼠标；字节按串行传输时间排队，而非瞬间送达。
 namespace asm86 {
-namespace { constexpr double MouseByteClocks = 1193182.0 * 9 / 1200; }
+namespace {
+constexpr double MouseByteClocks = 1193182.0 * 9 / 1200;
+// 'M' 之后是即插即用 COM 设备规范 1.00 的 6 位 ID：Begin 08h、修订 1.00（01h 24h）、"PNP0F01" 每字符减 20h、End 09h。
+// 6 位编码不置位 bit 6，旧驱动会把它当作非包头字节丢弃；Windows 2000 的 serenum 只凭此 ID 才安装串口鼠标驱动。
+constexpr uint8_t Identification[] = {0x4d, 0x08, 0x01, 0x24, 0x30, 0x2e, 0x30, 0x10, 0x26, 0x10, 0x11, 0x09};
+}
 
 unsigned SerialMouse::divisor() const {
     unsigned value = (unsigned(dlm) << 8) | dll; return value ? value : 65536;
@@ -99,7 +104,7 @@ uint8_t SerialMouse::input(unsigned offset, double now) {
 }
 
 void SerialMouse::output(unsigned offset, uint8_t value, double now) {
-    // MCR 的 DTR/RTS 电平变化触发鼠标识别字节 4Dh（'M'）；loopback 则走 UART 回环。
+    // MCR 的 DTR/RTS 电平变化触发鼠标识别：4Dh（'M'）加即插即用 ID；loopback 则走 UART 回环。
     advance(now);
     switch (offset) {
     case 0:
@@ -126,7 +131,9 @@ void SerialMouse::output(unsigned offset, uint8_t value, double now) {
         if ((previous ^ mcr) & 0x13) {
             queue.clear(); identified = false; pendingX = pendingY = 0; lastButtons = buttons;
             if ((mcr & 0x13) == 3) {
-                identified = true; queue.push_back({now + MouseByteClocks * 2, 0x4d});
+                identified = true;
+                for (unsigned i = 0; i < sizeof Identification; ++i)
+                    queue.push_back({now + MouseByteClocks * (i + 2), Identification[i]});
             }
         }
         break;

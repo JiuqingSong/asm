@@ -677,8 +677,8 @@ void timingTests() {
             c.out(0x70, 0);
             check(c.in(0x71) == (startSecond + 1) % 60, "RTC calendar must advance one second at every CPU speed");
         }
-        check(mouseBytes.size() == 13 && mouseBytes[0] == 'M'
-            && mouseBytes[1] == 0x60 && mouseBytes[4] == 0x40 && mouseBytes[7] == 0x60 && mouseBytes[10] == 0x40,
+        check(mouseBytes.size() == 24 && mouseBytes[0] == 'M' && mouseBytes[1] == 0x08 && mouseBytes[11] == 0x09
+            && mouseBytes[12] == 0x60 && mouseBytes[15] == 0x40 && mouseBytes[18] == 0x60 && mouseBytes[21] == 0x40,
             "Both human-paced clicks must traverse the real 1200-baud mouse transport");
         if (!full) check(std::abs(double(p.instructions) - ExecutionTiming::normalRate(model)) <= 1,
             "Normal-speed instruction budget must match the selected CPU model");
@@ -2822,6 +2822,12 @@ void serialTests() {
         check((c.in(0x3fd) & 1) && c.irq() == 12, "Each serial byte must produce IRQ4");
         auto value = c.in(0x3f8); c.out(0x20, 0x20); return value;
     };
+    auto pnpId = [&]() {
+        // 6 位即插即用 ID：Begin、修订 1.00、"PNP0F01"（ASCII-20h）、End；均不得置位 bit 6。
+        const uint8_t expected[] = {0x08, 0x01, 0x24, 0x30, 0x2e, 0x30, 0x10, 0x26, 0x10, 0x11, 0x09};
+        for (auto value : expected) check(byte() == value, "Mouse must follow 'M' with the serial PnP ID PNP0F01");
+    };
+    pnpId();
     auto packet = [&](int expectedX, int expectedY, uint8_t expectedButtons) {
         unsigned header = byte(), x = byte(), y = byte();
         int dx = int8_t(uint8_t(((header & 3) << 6) | x));
@@ -2836,6 +2842,7 @@ void serialTests() {
     check(p.serialMouse.nextEvent > 1e100, "Idle mouse must not schedule continuous input");
     c.out(0x3fc, 9); c.out(0x3fc, 11);
     check(byte() == 'M', "RTS power cycle must identify the mouse again");
+    pnpId();
     c.out(0x3fc, 31); check((c.in(0x3fe) & 0xf0) == 0xf0, "8250 modem loopback inputs");
     c.out(0x3f8, 0x35);
     check(!(c.in(0x3fd) & 1), "UART loopback transmit must take virtual time");
@@ -2856,7 +2863,7 @@ void serialTests() {
     c.ww(0, 12 * 4, 0x700); c.ww(0, 12 * 4 + 2, 0);
     c.s[SS] = 0; c.r[SP] = 0x8000; c.flags |= IF;
     c.out(0x3fc, 11); p.run(50000);
-    check(c.mem[0x600] == 'M' && c.r[SP] == 0x8000, "Guest IRQ4 handler must read COM1 and return through IRET");
+    check(c.mem[0x600] == 0x09 && c.r[SP] == 0x8000, "Guest IRQ4 handler must read COM1 and return through IRET");
 }
 
 void ideTests(const std::filesystem::path& path) {
