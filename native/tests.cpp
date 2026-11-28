@@ -3585,32 +3585,58 @@ void fdcTests(const std::filesystem::path& base) {
 void soundTests() {
     Pc p; p.setModel(CpuModel::I486); auto& c = p.cpu;
     c.out(0x226, 1); c.out(0x226, 0); p.advanceClock(100);
-    check(c.in(0x22a) == 255, "Sound hardware must be absent by default");
+    check(c.in(0x22a) == 255 && c.in(0x388) == 255, "Sound hardware must be absent by default");
     p.sound.enabled = true; p.sound.reset();
     c.out(0x226, 1); c.out(0x226, 0);
     check(!(c.in(0x22e) & 0x80), "DSP reset response must wait three microseconds");
     p.advanceClock(p.clock + 4);
     check((c.in(0x22e) & 0x80) && c.in(0x22a) == 0xaa && c.in(0x22a) == 255, "DSP reset AA FIFO");
     auto command = [&](std::initializer_list<uint8_t> bytes) { for (auto byte : bytes) c.out(0x22c, byte); };
+    auto mixer = [&](uint8_t index, int value = -1) {
+        c.out(0x224, index); if (value >= 0) c.out(0x225, uint8_t(value)); return c.in(0x225);
+    };
     command({0xe1});
     check(c.in(0x22c) & 0x80, "DSP command processing exposes write busy");
-    check(c.in(0x22a) == 2 && c.in(0x22a) == 1, "Bounded sound device must report SB2, not SB16");
+    check(c.in(0x22a) == 4 && c.in(0x22a) == 5, "SB16 must report DSP 4.05");
     command({0xe0, 0x55, 0xe4, 0x6a, 0xe8});
     check(c.in(0x22a) == 0xaa && c.in(0x22a) == 0x6a, "DSP identification and test register");
-    command({0x24, 0xd1, 0xe1, 0xd8});
-    check(c.in(0x22a) == 0 && p.sound.unsupportedCommands == 1, "Unsupported recording consumes parameters without executing them");
+    command({0xe3}); std::string copyright;
+    for (uint8_t ch; (ch = c.in(0x22a)) != 0;) copyright += char(ch);
+    check(copyright == "COPYRIGHT (C) CREATIVE TECHNOLOGY LTD, 1992.", "DSP copyright string");
+    command({0x16, 0xd1, 0xe1, 0xd8});
+    check(c.in(0x22a) == 0 && p.sound.unsupportedCommands == 1, "Unsupported ADPCM consumes parameters without executing them");
+
+    check(mixer(0x30) == 0xc0 && mixer(0x22) == 0xcc && mixer(0x80) == 0x02 && mixer(0x81) == 0x22 && mixer(0x3c) == 0x1f,
+        "CT1745 reset levels and fixed IRQ5 / DMA1+5 resources");
+    check(mixer(0x22, 0xf3) == 0xf3 && mixer(0x30) == 0xf8 && mixer(0x31) == 0x38, "SB Pro master volume maps to SB16 registers");
+    check(mixer(0x80, 0x04) == 0x02 && mixer(0x81, 0x01) == 0x22, "Resource registers stay at the fixed configuration");
+    mixer(0x00, 0); check(mixer(0x30) == 0xc0 && mixer(0x44) == 0x80, "Mixer reset");
+    for (uint8_t reg = 0x30; reg <= 0x33; ++reg) mixer(reg, 0xf8); // Unity master and voice gain.
+
     std::vector<int16_t> output;
-    p.sound.pcm = [&](const int16_t* data, unsigned size) { output.insert(output.end(), data, data + size); };
+    p.sound.pcm = [&](const int16_t* data, unsigned frames) { output.insert(output.end(), data, data + frames * 2); };
     auto program = [&](uint16_t address, uint16_t count, uint8_t mode = 0x49) {
         c.out(0x0a, 5); c.out(0x0c, 0);
         c.out(2, uint8_t(address)); c.out(2, uint8_t(address >> 8));
         c.out(3, uint8_t(count)); c.out(3, uint8_t(count >> 8));
         c.out(0x83, 0); c.out(0x0b, mode); c.out(0x0a, 1);
     };
+    auto program16 = [&](uint16_t word, uint16_t count, uint8_t mode = 0x49) {
+        c.out(0xd4, 5); c.out(0xd8, 0);
+        c.out(0xc4, uint8_t(word)); c.out(0xc4, uint8_t(word >> 8));
+        c.out(0xc6, uint8_t(count)); c.out(0xc6, uint8_t(count >> 8));
+        c.out(0x8b, 0); c.out(0xd6, mode); c.out(0xd4, 1);
+    };
     auto reset = [&] {
-        p.sound.reset(); output.clear();
+        c.out(0x226, 1); c.out(0x226, 0); p.advanceClock(p.clock + 4); c.in(0x22a);
+        output.clear();
         c.out(0x20, 0x13); c.out(0x21, 8); c.out(0x21, 1); c.out(0x21, 0xdf);
-        command({0x40, 156, 0xd1}); // Exact 10 kHz; 4 bytes become 20 output frames.
+        command({0x40, 156, 0xd1}); // Exact 10 kHz: each source byte spans 4.8 output frames.
+    };
+    auto minmax = [&](unsigned channel) {
+        int16_t low = 0, high = 0;
+        for (size_t i = channel; i < output.size(); i += 2) { low = std::min(low, output[i]); high = std::max(high, output[i]); }
+        return std::pair<int16_t, int16_t>{low, high};
     };
     reset(); program(0xfffe, 3);
     c.mem[0xfffe] = 0; c.mem[0xffff] = 128; c.mem[0] = 255; c.mem[1] = 64;
@@ -3620,14 +3646,28 @@ void soundTests() {
     auto start = p.clock; command({0});
     p.advanceClock(start + SoundBlaster::PitHz / 10000 * 3.5);
     check(c.irq() == -1, "DSP IRQ must not precede the last byte");
-    p.advanceClock(start + SoundBlaster::PitHz / 10000 * 5.1);
+    p.advanceClock(start + SoundBlaster::PitHz / 10000 * 6.1);
     check(c.irq() == 13 && c.irq() == -1, "Single-cycle PCM must raise exactly IRQ5");
     check((c.in(8) & 2) && (c.in(15) & 2), "SB playback must consume count+1 DMA bytes and mask at terminal count");
-    check(output.size() == 20 && output.front() == -32768
-        && std::find(output.begin(), output.end(), int16_t(32512)) != output.end() && output.back() == -16384,
-        "Unsigned PCM conversion, fixed 48k output and DMA page wrap");
+    auto range = minmax(0);
+    check(output.size() >= 40 && output.size() <= 56 && range.first < -25000 && range.second > 25000
+        && output[output.size() - 2] < -8000 && minmax(1) == range,
+        "Unsigned 8-bit PCM, interpolated 48 kHz stereo output and DMA page wrap");
+    check(p.sound.nextEvent() == std::numeric_limits<double>::infinity(), "Idle card stops its output clock");
+    check(mixer(0x82) & 1, "Mixer IRQ status shows the 8-bit interrupt");
     c.in(0x22e); c.out(0x20, 0x20);
-    check(c.irq() == -1, "DSP acknowledgement and PIC EOI must clear the interrupt");
+    check(c.irq() == -1 && !(mixer(0x82) & 1), "DSP acknowledgement and PIC EOI must clear the interrupt");
+
+    // DSP 4 16-bit signed stereo on DMA5, acknowledged through 22Fh.
+    reset(); program16(0x1800, 3); // Byte address 0x3000, four words.
+    const int words[] = {0x4000, -0x4000, 0x7fff, 0};
+    for (unsigned i = 0; i < 4; ++i) { c.mem[0x3000 + i * 2] = uint8_t(words[i]); c.mem[0x3001 + i * 2] = uint8_t(uint16_t(words[i]) >> 8); }
+    command({0x41, 0x27, 0x10, 0xb0, 0x30, 3, 0}); start = p.clock;
+    p.advanceClock(start + SoundBlaster::PitHz / 10000 * 3.1);
+    check(c.irq() == 13 && (mixer(0x82) & 3) == 2 && (c.in(0xd0) & 2), "16-bit transfer completes on DMA5 with a 16-bit IRQ");
+    check(minmax(0).second > 16000 && minmax(1).first < -8000 && minmax(1).second <= 0, "Signed 16-bit stereo channels");
+    c.in(0x22e); check((mixer(0x82) & 2) && c.irq() == -1, "8-bit acknowledgement leaves the 16-bit interrupt pending");
+    c.in(0x22f); c.out(0x20, 0x20); check(!(mixer(0x82) & 2), "22Fh acknowledges the 16-bit interrupt");
 
     reset(); program(0x3000, 0, 0x59); c.mem[0x3000] = 0x10;
     command({0x14, 0, 0}); start = p.clock;
@@ -3635,9 +3675,9 @@ void soundTests() {
     check(c.irq() == 13, "First rearmed single-cycle block IRQ");
     c.in(0x22e); c.out(0x20, 0x20); c.mem[0x3000] = 0xf0;
     command({0x14, 0, 0});
-    p.advanceClock(p.clock + SoundBlaster::PitHz / 10000 * 2.1);
-    check(c.irq() == 13 && output.size() == 10 && output.front() < 0 && output.back() > 0,
-        "IRQ-rearmed single-cycle playback must preserve the previous final sample, without resetting host audio");
+    p.advanceClock(p.clock + SoundBlaster::PitHz / 10000 * 3.1);
+    check(c.irq() == 13 && minmax(0).first < -20000 && minmax(0).second > 20000,
+        "IRQ-rearmed single-cycle playback must continue the same output stream");
 
     reset(); program(0x3000, 1, 0x59); c.mem[0x3000] = 0x10; c.mem[0x3001] = 0xf0;
     command({0x48, 1, 0, 0x1c}); start = p.clock;
@@ -3652,20 +3692,23 @@ void soundTests() {
     p.advanceClock(p.clock + SoundBlaster::PitHz / 10000 * 4);
     check(c.irq() == 13 && !(c.in(15) & 2) && p.sound.nextEvent() == std::numeric_limits<double>::infinity(),
         "Resume and exit-auto-init must finish only the current DSP block while DMA stays auto-initialized");
-    check(output.size() >= 10 && output.front() < 0 && output.back() > 0, "Auto-init output must repeat DMA source data");
 
     reset(); program(0x3000, 0); c.out(0x0a, 5);
     command({0x14, 0, 0}); start = p.clock;
     p.advanceClock(start + 1000);
-    check(c.irq() == -1 && output.empty(), "Masked DMA must not complete DSP playback");
-    c.out(0x0a, 1); command({0xd3});
-    p.advanceClock(p.clock + 1000);
-    check(c.irq() == 13 && !output.empty() && std::all_of(output.begin(), output.end(), [](int16_t n) { return n == 0; }),
-        "Speaker-off still consumes DMA and interrupts, but renders silence");
+    check(c.irq() == -1 && minmax(0) == std::pair<int16_t, int16_t>{0, 0}, "Masked DMA must not complete DSP playback");
+    c.out(0x0a, 1); p.advanceClock(p.clock + 1000);
+    check(c.irq() == 13, "Unmasked DMA completes the pending block");
+    c.in(0x22e); c.out(0x20, 0x20);
     reset(); program(0x3000, 0, 0x45); command({0x14, 0, 0});
     p.advanceClock(p.clock + 1000);
     check(c.irq() == -1 && !(c.in(15) & 2), "Wrong DMA direction must not consume memory or complete a block");
-    p.sound.reset(); check(!std::isfinite(p.sound.nextEvent()), "DSP reset cancels pending playback events");
+    // Recording writes silence through the device-to-memory DMA direction.
+    reset(); program(0x3000, 1, 0x45); c.mem[0x3000] = c.mem[0x3001] = 0x11;
+    command({0x24, 1, 0}); p.advanceClock(p.clock + 1000);
+    check(c.irq() == 13 && c.mem[0x3000] == 0x80 && c.mem[0x3001] == 0x80 && minmax(0) == std::pair<int16_t, int16_t>{0, 0}, "8-bit recording returns unsigned silence");
+    c.in(0x22e); c.out(0x20, 0x20);
+    p.sound.reset(); check(!std::isfinite(p.sound.nextEvent()), "Card reset cancels pending playback events");
     reset(); program(0x3000, 0); command({0x14, 1, 0});
     p.advanceClock(p.clock + 1000);
     check(c.irq() == -1 && (c.in(15) & 2), "DMA terminal count alone must not finish a longer DSP block");
@@ -3674,9 +3717,45 @@ void soundTests() {
     c.in(0x22e); c.out(0x20, 0x20);
     command({0xf2}); c.in(0x22e);
     check(c.irq() == -1, "DSP acknowledgement before PIC acceptance must lower pending IRQ5");
-    command({0xf2}); check(c.irq() == 13, "Software DSP IRQ probe");
-    c.in(0x22e); c.out(0x20, 0x20); check(c.irq() == -1, "Software IRQ acknowledgement");
-    std::cout << "Native SB2 DSP / DMA1 / IRQ5 / PCM tests passed\n";
+    command({0xf3}); check(c.irq() == 13 && (mixer(0x82) & 2), "Software 16-bit DSP IRQ probe");
+    c.in(0x22f); c.out(0x20, 0x20); check(c.irq() == -1, "Software IRQ acknowledgement");
+
+    // MPU-401 UART.
+    std::vector<uint8_t> midi;
+    p.sound.midiOut = [&](uint8_t value) { midi.push_back(value); };
+    check(c.in(0x331) & 0x80, "MPU-401 has no data after reset");
+    c.out(0x331, 0xff); check(!(c.in(0x331) & 0xc0) && c.in(0x330) == 0xfe && (c.in(0x331) & 0x80), "MPU-401 reset acknowledgement");
+    c.out(0x331, 0x3f); check(c.in(0x330) == 0xfe, "MPU-401 UART mode acknowledgement");
+    c.out(0x331, 0x3f); check(c.in(0x331) & 0x80, "UART mode ignores commands other than reset");
+    for (uint8_t b : {0x90, 60, 100}) c.out(0x330, b);
+    check(midi == std::vector<uint8_t>{0x90, 60, 100}, "MPU-401 UART bytes reach the host MIDI output");
+
+    // OPL3: timer detection as AdLib/OPL3 probes do it, then an audible FM tone.
+    auto fm = [&](unsigned reg, uint8_t value) {
+        c.out(reg & 0x100 ? 0x38a : 0x388, uint8_t(reg)); c.out(reg & 0x100 ? 0x38b : 0x389, value);
+    };
+    fm(4, 0x60); fm(4, 0x80);
+    check((c.in(0x388) & 0xe0) == 0 && (c.in(0x388) & 0x06) == 0, "OPL3 status after reset (low bits clear on OPL3)");
+    fm(2, 0xff); fm(4, 0x21); p.advanceClock(p.clock + SoundBlaster::PitHz / 1000000 * 79);
+    check((c.in(0x388) & 0xe0) == 0, "Timer 1 must not expire before 80 us");
+    p.advanceClock(p.clock + SoundBlaster::PitHz / 1000000 * 3);
+    check((c.in(0x228) & 0xe0) == 0xc0, "Timer 1 overflow sets IRQ and T1 flags");
+    fm(4, 0x60); fm(4, 0x80); check((c.in(0x220) & 0xe0) == 0, "Timer flags reset");
+    output.clear();
+    for (uint8_t reg : {0x30, 0x31, 0x34, 0x35}) mixer(reg, 0xf8);
+    const std::pair<unsigned, uint8_t> voice[] = {{0x105, 1}, {0x20, 0x01}, {0x23, 0x01}, {0x40, 0x3f}, {0x43, 0x00},
+        {0x60, 0xf0}, {0x63, 0xf0}, {0x80, 0x77}, {0x83, 0x77}, {0xc0, 0x11}, {0xa0, 0x98}, {0xb0, 0x31}};
+    for (auto [reg, value] : voice) fm(reg, value);
+    check(std::isfinite(p.sound.nextEvent()), "Key-on starts the output clock");
+    p.advanceClock(p.clock + SoundBlaster::PitHz / 10);
+    unsigned crossings = 0;
+    for (size_t i = 2; i < output.size(); i += 2) if ((output[i - 2] < 0) != (output[i] < 0)) ++crossings;
+    // F-number 0x198, block 4: 408 * 49716 / 2^16 = 309.5 Hz, so about 62 sign changes in 0.1 s.
+    check(output.size() >= 9000 && crossings >= 56 && crossings <= 68 && minmax(0).second > 3900 && minmax(0).second <= 4200
+        && minmax(1) == std::pair<int16_t, int16_t>{0, 0}, "OPL3 sine tone at the programmed pitch on the left output only");
+    fm(0xb0, 0x11); p.advanceClock(p.clock + SoundBlaster::PitHz);
+    check(!std::isfinite(p.sound.nextEvent()), "Released FM voice decays and stops the output clock");
+    std::cout << "Native SB16 DSP / mixer / DMA1+5 / IRQ5 / MPU-401 / OPL3 tests passed\n";
 }
 
 void audioSmokeTest() {
@@ -3705,10 +3784,10 @@ void audioSmokeTest() {
     check(c.halted && p.sound.unsupportedCommands == 0, "Guest sound program must run to HLT");
     for (unsigned i = 0; i < 80; ++i) {
         p.advanceClock(p.clock + SoundBlaster::PitHz / 100);
-        Sleep(10);
+        audio.service(); Sleep(10);
     }
     check(c.irq() == 13 && (c.in(8) & 2), "Guest-programmed sound must complete DMA and deliver IRQ5");
-    for (unsigned i = 0; audio.queued() && i < 100; ++i) Sleep(10);
+    for (unsigned i = 0; audio.queued() && i < 100; ++i) { audio.service(); Sleep(10); }
     check(audio.submitted > 35000 && audio.nonzero > 30000 && audio.dropped == 0 && audio.queued() == 0,
         "Windows waveOut must accept and finish real guest PCM without queue overflow");
     std::cout << "Guest 8088 PCM -> Windows waveOut passed: " << audio.submitted

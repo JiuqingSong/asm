@@ -180,7 +180,7 @@ void snapshotTests() {
     std::filesystem::copy_file(first, broken);
     patch(broken, 100, 0xa5); rejected(broken, "CRC corruption must be rejected");
     std::filesystem::copy_file(first, broken, std::filesystem::copy_options::overwrite_existing);
-    patch(broken, 8, 2); rejected(broken, "Future snapshot version must be rejected");
+    patch(broken, 8, 3); rejected(broken, "Future snapshot version must be rejected");
     std::filesystem::copy_file(first, broken, std::filesystem::copy_options::overwrite_existing);
     for (unsigned i = 36; i < 40; ++i) patch(broken, i, 255);
     checksum(broken); rejected(broken, "CRC-valid oversized allocation request must be rejected before allocation");

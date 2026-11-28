@@ -119,41 +119,46 @@ For an isolated build using the already built numerical library:
 Then run `.\native\build\snapshots\native-tests.exe` and
 `.\native\build\snapshots\asm86-native.exe --ui-test`.
 
-## 可选 ISA Sound Blaster PCM（首版）
+## Sound Blaster 16 + OPL3 声卡
 
-默认**关闭**，不改变现有 Windows/NT 客体的硬件探测。启动时用
-`.\native\run.ps1 -Sound sb2 -NormalSpeed`，或
-`.\native\build\asm86-native.exe --sound sb2 --normal-speed` 启用；
-`--sound off` 关闭。此选项不保存到用户设置。DOS 软件选择 **Sound Blaster / 8-bit mono**，
-固定资源 **220h、IRQ5、DMA1**，可在 DOS 中设置 `SET BLASTER=A220 I5 D1 T3`。
-`T3` 表示 Sound Blaster 2.0，**不是** SB Pro/SB16。
+默认**关闭**。图形界面在 **Machine → Sound Blaster 16 + OPL3** 中勾选（需先关机），
+设置会保存；也可用 `--sound sb16` / `--sound off`（`run.ps1 -Sound sb16`）。
+模拟的是非即插即用的 **Sound Blaster 16**（DSP 4.05、CT1745 混音器），固定资源
+**220h、IRQ5、DMA1（8 位）、DMA5（16 位）、MPU-401 在 330h、OPL3 在 388h**，
+DOS 下可设 `SET BLASTER=A220 I5 D1 H5 P330 T6`。
 
-`sound.cpp` 实现 DSP 2.01 复位/识别、`40h` 时间常数、`14h` 单周期、
-`48h` + `1Ch` 自动初始化 PCM、`D0h/D4h` 暂停/继续、
-`DAh` 当前块结束退出自动初始化、扬声器开关、IRQ 测试及 `22Eh` 确认。
-播放使用真实 8237 DMA1 内存总线、地址/计数/屏蔽及自动重载，不绕过 DMA 直接读取缓冲。
-DSP 块长度与 DMA 长度各自独立；屏蔽或方向错误的 DMA 等待，不伪造完成中断。
-支持无符号 **8 位单声道 PCM**，时间常数采样率约 **4–22 kHz**
-（允许量化后的实际速率至 23 kHz）。客体 PIT 时钟驱动采样和 IRQ，
-重采样为 48 kHz / 16 位单声道，通过 Windows `waveOut` 真正输出。
-宿主输出采用最多 16 个 10ms 缓冲；队列满则丢弃新音频、不阻塞客体，
-标题栏显示丢帧数。请使用正常速度；全速/无界面快速执行可能溢出，
-暂停、复位、关机清除宿主队列。宿主音频 API 失败会明确报错，不静默成功；
-不支持的 DSP 命令计数也显示在标题栏。
+**在 Windows 中启用：** 勾选声卡后启动，运行 控制面板 →“添加新硬件”/“添加/删除硬件”，
+让 Windows **自动搜索**非即插即用硬件。Windows 98 会找到
+“Sound Blaster 16 or AWE-32 or compatible”（需要 Windows 98 光盘，装完重启）；
+Windows 2000 会找到“Sound Blaster 16 or AWE32 or compatible (WDM)”（驱动在系统自带
+的驱动缓存里，无需光盘和重启）。两者同时列出声卡的游戏端口，一并安装即可。
 
-**限制：** 不支持 OPL/FM、MIDI/MPU、录音、ADPCM、直接 DAC、
-高速度 `90h/91h`、SB Pro 立体声、SB16 16 位 DMA、混音器、PnP 或可配置资源。
-不宣称 Windows 音频驱动兼容；未用已安装的 DOS/Windows 声卡驱动验证。
-本次验证包括 CPU 真正执行 8088 `OUT` 指令，编程 DMA/DSP 后 `HLT`，
-产生约 0.75 秒的 440 Hz PCM 并完成 Windows 输出；不需要任何 OS 磁盘。
-这是提交到音频驱动并完成缓冲的验证，不是麦克风回录或人工听感证明。
+已在已安装的 Windows 98 SE 和 Windows 2000 映像副本上验证：自动检测、安装、启动声音、
+`tada.wav` 播放（录下的输出与原文件相关系数 0.9997，采样率和声道正确）、
+`canyon.mid` 经 OPL3 FM 播放。两个系统的 MIDI 默认都走 FM 合成器。
+
+实现要点：
+- `sound.cpp`：DSP 复位/版本/版权串、`40h/41h/42h` 采样率、8 位 `14h/1Ch/90h/91h`、
+  DSP4 `Bxh/Cxh`（8/16 位、有/无符号、单/立体声、单周期/自动初始化）、暂停/继续/退出自动初始化、
+  `80h` 静音块、`10h` 直接 DAC、录音（写入数字静音）、`E2h` DMA 识别、`F2h/F3h` 中断，
+  `22Eh/22Fh` 分别确认 8/16 位中断，混音器 `82h` 报告中断来源。
+  Windows 9x 驱动会探测 ASP 寄存器（`0Eh/0Fh`）、内部 RAM（`F9h`）及 CT1745 没有的混音器寄存器
+  （读回 0Ah），这些值必须与真卡一致，否则驱动拒绝加载（设备管理器黄色感叹号）。
+- 播放走真实 8237 DMA（通道 1/5），被屏蔽或方向错误的 DMA 不会伪造完成中断。
+  输出按客体时钟线性插值到 48 kHz 立体声，经混音器主音量/声音/FM 音量后送 Windows `waveOut`；
+  宿主队列先积累约 40 ms 再开始播放，吸收执行抖动；空闲时停止 48 kHz 时钟。
+- `opl3.cpp`：YMF262 行为模型（两组寄存器、OPL2 兼容、2/4 算子、节奏模式、8 种波形、
+  颤音/震音、两个状态定时器——AdLib/OPL3 检测靠它们）。音色与包络一致，但不是逐位精确。
+- MPU-401 仅 UART 模式，MIDI 字节转发到主机的 MIDI 合成器（通常是 Microsoft GS Wavetable）。
+
+**限制：** 无 AWE32 波表（EMU8000）、无 ASP/CSP、无 ADPCM、无即插即用、资源不可改；
+录音只有静音；系统独占（SysEx）MIDI 消息被丢弃。无界面脚本没有宿主音频，
+可用 `record-audio FILE.wav` / `audio-stats` 把声卡输出录成 WAV 检查。
 
 ```powershell
 .\native\build\native-tests.exe --test-sound # 无宿主音频设备要求，亦纳入完整测试
 .\native\build\native-tests.exe --test-audio # 需要 Windows 音频设备，会播放短音
 ```
-
-`sound.h/.cpp` 是独立 DSP/PCM 状态机，`audio.h/.cpp` 是有界 Windows 输出队列。
 
 ## 源码阅读
 
@@ -1027,14 +1032,14 @@ SHA256 与优化前逐字节相同：
 
 ## 后续工作（暂缓）
 
-- **音频**：后续增加客体音频设备和宿主声音输出；具体兼容设备与范围届时确定，本轮不实现。
+- **音频**：已有 Sound Blaster 16 + OPL3（见上文）；AWE32 波表和即插即用资源尚未实现。
 - **SVGA 真彩色**：后续补齐并验证 16 位及 24/32 位模式、Windows 驱动模式查询和相应绘图操作。
   目前继续使用已验证的 800×600×256 色，不只为显示 16M 色选项而报告未实现的模式。
 
 ## 边界
 
 - 不是周期精确的 XT：不模拟预取队列、总线争用或 8086/8088 总线宽度差异。
-- 暂不包含 CGA/单色模式、Mode X、完整 CRTC 时序/平滑卷动、可编程字形、声音、调试或整机状态存档。
+- 暂不包含 CGA/单色模式、Mode X、完整 CRTC 时序/平滑卷动、可编程字形、调试。
 - COM1 目前专用于鼠标，不是宿主串口转发；COM2 未连接设备。
 - 硬盘同时提供 BIOS INT 13h 与 AT IDE PIO，另提供 ATAPI PIO 光驱和 FDC/DMA 软驱；
   IDE DMA 和第二块硬盘尚未接入。

@@ -9,7 +9,7 @@ param(
     [switch]$RealTimeTiming,
     [string]$Overlay,
     [ValidateSet('vga', 'cirrus')][string]$Video,
-    [ValidateSet('off', 'sb2')][string]$Sound,
+    [ValidateSet('off', 'sb16')][string]$Sound,
     [ValidateSet(16, 32, 64, 128, 256)][int]$Memory,
     [string]$LoadSnapshot
 )

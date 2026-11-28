@@ -761,7 +761,9 @@ void Disk::flush() {
 }
 
 Pc::Pc() {
-    sound.dma = [this](uint8_t* data, unsigned length) { return dma.transfer(1, data, length, DmaDirection::FromMemory); };
+    sound.dma = [this](unsigned channel, uint8_t* data, unsigned length, DmaDirection direction) {
+        return dma.transfer(channel, data, length, direction);
+    };
     sound.interrupt = [this](bool raised) {
         if (raised) pic[0].raise(5);
         else pic[0].pending &= uint8_t(~0x20);
@@ -1045,6 +1047,7 @@ void Pc::boot(uint8_t drive) {
     cpu.reset(); std::fill(cpu.mem.begin(), cpu.mem.end(), 0);
     vga.setMode(3);
     serialMouse.reset();
+    sound.reset();
     bootDrive = drive; rebootRequested = powerOffRequested = false;
     apmConnected = false; apmEnabled = apmEngaged = true; apmVersion = 0x0100;
     instructions = 0; clock = 0; notice.clear(); keys.clear();

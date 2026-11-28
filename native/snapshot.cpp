@@ -11,7 +11,8 @@ namespace asm86 {
 namespace {
 constexpr uint64_t MaxSnapshotBytes = 1ULL << 30;
 constexpr uint32_t MaxCowSectors = 1u << 20;
-constexpr uint32_t Version = 1;
+// Version 2 replaced the SB 2.0 state with the SB16/OPL3 state; version 1 still loads when its sound card was off.
+constexpr uint32_t Version = 2;
 [[noreturn]] void bad(const char* message) { throw std::runtime_error(std::string("Snapshot: ") + message); }
 void require(bool value, const char* message) { if (!value) bad(message); }
 struct Handle {
@@ -105,7 +106,7 @@ public:
     HANDLE file;
     bool reading;
     uint64_t limit, position = 0;
-    uint32_t crc = 0xffffffffu;
+    uint32_t crc = 0xffffffffu, version = Version;
     std::filesystem::path source;
     SnapshotArchive(HANDLE file, bool reading, uint64_t limit, const std::filesystem::path& source)
         : file(file), reading(reading), limit(limit), source(source) {}
@@ -324,11 +325,35 @@ void Snapshot::state(SnapshotArchive& a, Pc& p) {
     a.fields(seenMedia, activeMedia, fd.changed, fd.irqPending, fd.locked, fd.writing, fd.dirty, fd.due, fd.nextEvent);
     require(seenMedia <= 3 && activeMedia <= 3, "invalid FDC media reference");
     auto& sb = p.sound;
-    a.fields(sb.enabled, sb.unsupportedCommands);
-    a.sequence(sb.fifo, 65536);
-    a.fields(sb.params, sb.buffer, sb.position, sb.parameter, sb.block, sb.left, sb.command, sb.test, sb.resetHigh,
-        sb.speaker, sb.irq, sb.active, sb.autoInit, sb.paused, sb.resetNext, sb.sourceNext, sb.renderNext,
-        sb.tailEnd, sb.period, sb.pauseRemaining, sb.busyUntil, sb.sample);
+    if (a.version == 1) {
+        // Legacy SB 2.0 layout: only an absent card can be carried over.
+        std::deque<uint8_t> fifo; std::array<uint8_t, 2> params{}; std::array<int16_t, 480> buffer{};
+        unsigned position = 0, parameter = 0, block = 0, left = 0; int command = 0; uint8_t test = 0;
+        bool flags[6]{}; double times[7]{}; int16_t sample = 0;
+        a.fields(sb.enabled, sb.unsupportedCommands);
+        a.sequence(fifo, 65536);
+        a.fields(params, buffer, position, parameter, block, left, command, test);
+        for (auto& flag : flags) a.value(flag);
+        for (auto& time : times) a.value(time);
+        a.value(sample);
+        require(!sb.enabled, "version 1 snapshot with the old SB 2.0 card enabled cannot be restored");
+        sb.reset();
+    } else {
+        a.fields(sb.enabled, sb.unsupportedCommands);
+        a.sequence(sb.fifo, 65536);
+        a.fields(sb.params, sb.parameter, sb.command, sb.test, sb.lastCommand, sb.e2Value, sb.e2Count, sb.asp,
+            sb.resetHigh, sb.speaker, sb.irq8, sb.irq16, sb.line, sb.resetNext, sb.busyUntil,
+            sb.active, sb.autoInit, sb.paused, sb.wide, sb.stereo, sb.signedData, sb.recording, sb.silence, sb.timeConstant,
+            sb.block, sb.reload, sb.left, sb.rate, sb.period, sb.sourceNext, sb.pauseRemaining,
+            sb.previous, sb.current, sb.currentTime, sb.renderNext, sb.holdUntil, sb.buffer, sb.position,
+            sb.mixer, sb.mixerIndex);
+        a.sequence(sb.midi, 65536);
+        a.fields(sb.uart, sb.fmIndex);
+        auto& fm = sb.fm;
+        a.value(fm.regs);
+        for (auto& op : fm.ops) { a.fields(op.phase, op.envelope, op.out, op.previous); a.enumeration(op.stage, 4); a.value(op.key); }
+        a.fields(fm.lfoAm, fm.lfoVib, fm.noise, fm.noiseClock, fm.flags, fm.timerStart, fm.timerPeriod, fm.timerRunning);
+    }
     a.fields(p.instructions, p.clock, p.bootDrive, p.rebootRequested, p.powerOffRequested);
     a.text(p.notice);
     for (auto& pic : p.pic) a.fields(pic.mask, pic.pending, pic.service, pic.base, pic.init, pic.priority,
@@ -417,18 +442,26 @@ void Snapshot::validate(const Pc& p) {
             (fd.buffer.empty() || fd.buffer.size() == 512), "invalid scheduled FDC transfer");
     }
     require(!fd.dirty || fd.active.size() >= 2, "missing dirty FDC command");
-    require(p.sound.position < p.sound.buffer.size() && p.sound.parameter <= 2 && p.sound.block >= 1 &&
-        p.sound.block <= 65536 && p.sound.left <= 65536 && p.sound.command >= -1 && p.sound.command <= 255 &&
-        std::isfinite(p.sound.period) && p.sound.period >= SoundBlaster::PitHz / 23000 &&
-        p.sound.period <= SoundBlaster::PitHz / 4000 && std::isfinite(p.sound.pauseRemaining) &&
-        p.sound.pauseRemaining >= 0 && p.sound.pauseRemaining <= p.sound.period, "invalid SoundBlaster transfer");
-    require(!p.sound.active || p.sound.left >= 1, "empty active SoundBlaster block");
+    const auto& sb = p.sound;
+    require(sb.position < sb.buffer.size() && sb.position % 2 == 0 && sb.parameter <= 3 && sb.block >= 1 &&
+        sb.block <= 65536 && sb.reload >= 1 && sb.reload <= 65536 && sb.left <= 65536 &&
+        sb.command >= -1 && sb.command <= 255 && sb.rate >= 1 && sb.rate <= 1000000 &&
+        std::isfinite(sb.period) && sb.period >= SoundBlaster::PitHz / 48000 &&
+        sb.period <= SoundBlaster::PitHz / 4000 && std::isfinite(sb.pauseRemaining) &&
+        sb.pauseRemaining >= 0 && sb.pauseRemaining <= sb.period && std::isfinite(sb.currentTime) &&
+        sb.line == (sb.irq8 || sb.irq16), "invalid SoundBlaster transfer");
+    require(!sb.active || sb.left >= 1, "empty active SoundBlaster block");
+    for (const auto& op : sb.fm.ops)
+        require(std::isfinite(op.phase) && op.phase >= 0 && op.phase < 1 && std::isfinite(op.envelope) &&
+            op.envelope >= 0 && op.envelope <= 96 && std::isfinite(op.out) && std::isfinite(op.previous), "invalid OPL3 operator");
+    require(std::isfinite(sb.fm.lfoAm) && std::isfinite(sb.fm.lfoVib) && std::isfinite(sb.fm.noiseClock) &&
+        sb.fm.noise < (1u << 23), "invalid OPL3 state");
     if (p.sound.command >= 0) require(p.sound.parameter < SoundBlaster::parameters(uint8_t(p.sound.command)), "invalid DSP partial command");
     for (auto time : p.pitStart) require(std::isfinite(time) && time >= 0 && time <= p.clock, "invalid PIT origin");
     auto deadline = [&](double time) { require(time >= p.clock, "scheduled event precedes guest clock"); };
     deadline(p.nextTimer); deadline(p.nextRtc); deadline(p.serialMouse.nextEvent); deadline(fd.nextEvent);
     if (p.at()) { deadline(p.ide.nextEvent); deadline(p.cdrom.nextEvent); }
-    if (p.sound.enabled) { deadline(p.sound.resetNext); deadline(p.sound.sourceNext); deadline(p.sound.renderNext); deadline(p.sound.tailEnd); }
+    if (p.sound.enabled) { deadline(p.sound.resetNext); deadline(p.sound.sourceNext); deadline(p.sound.renderNext); }
     for (auto time : fd.seekTime) deadline(time);
     double serialTime = p.clock;
     for (const auto& byte : p.serialMouse.queue) { require(byte.at >= serialTime, "invalid serial event ordering"); serialTime = byte.at; }
@@ -479,7 +512,8 @@ std::unique_ptr<Pc> Snapshot::load(const std::filesystem::path& value) {
     auto get = [&](unsigned offset, unsigned width) {
         uint64_t n = 0; for (unsigned i = 0; i < width; ++i) n |= uint64_t(header[offset + i]) << (i * 8); return n;
     };
-    require(get(8, 4) == Version, "unsupported format version");
+    auto version = uint32_t(get(8, 4));
+    require(version == 1 || version == Version, "unsupported format version");
     require(get(12, 4) == 0 && get(28, 4) == 0, "invalid reserved header");
     require(get(16, 8) == size - 32, "truncated snapshot or trailing bytes");
     uint32_t crc = 0xffffffffu; std::array<uint8_t, 65536> buffer{};
@@ -490,7 +524,7 @@ std::unique_ptr<Pc> Snapshot::load(const std::filesystem::path& value) {
     require(uint64_t(~crc) == get(24, 4), "payload CRC32 mismatch");
     seek(file.value, 32);
     auto pc = std::make_unique<Pc>();
-    SnapshotArchive archive(file.value, true, size - 32, path); state(archive, *pc);
+    SnapshotArchive archive(file.value, true, size - 32, path); archive.version = version; state(archive, *pc);
     require(archive.position == archive.limit && uint64_t(~archive.crc) == get(24, 4), "payload layout mismatch");
     pc->cpu.flushTlb(); // 恢复的内存与 PCI 窗口不同于构造时，TLB 从空开始。
     return pc;

@@ -17,7 +17,7 @@ if ($softfloat) {
 } else {
     $softfloat = & "$root\build-softfloat.ps1" -Zig $Zig -Debug:$Debug
 }
-$core = @("$root\cpu.cpp", "$root\386.cpp", "$root\protected.cpp", "$root\video.cpp", "$root\serial.cpp", "$root\at.cpp", "$root\ide.cpp", "$root\atapi.cpp", "$root\dma.cpp", "$root\fdc.cpp", "$root\sound.cpp", "$root\softfloat.cpp", "$root\fpu.cpp", "$root\pc.cpp", "$root\snapshot.cpp")
+$core = @("$root\cpu.cpp", "$root\386.cpp", "$root\protected.cpp", "$root\video.cpp", "$root\serial.cpp", "$root\at.cpp", "$root\ide.cpp", "$root\atapi.cpp", "$root\dma.cpp", "$root\fdc.cpp", "$root\sound.cpp", "$root\opl3.cpp", "$root\softfloat.cpp", "$root\fpu.cpp", "$root\pc.cpp", "$root\snapshot.cpp")
 & $Zig @common @core "$root\audio.cpp" "$root\main.cpp" $softfloat -o "$output\asm86-native.exe" '-Wl,--subsystem,windows' -luser32 -lgdi32 -lcomdlg32 -lshell32 -ladvapi32 -lwinmm
 if ($LASTEXITCODE -ne 0) { throw 'Native application build failed' }
 & $Zig @common @core "$root\audio.cpp" "$root\image.cpp" "$root\snapshot-tests.cpp" "$root\tests.cpp" $softfloat -o "$output\native-tests.exe" -luser32 -ladvapi32 -lwinmm

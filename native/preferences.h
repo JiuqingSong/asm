@@ -79,6 +79,12 @@ public:
         return value != 0;
     }
     void stableTiming(bool value) { number(L"StableTiming", value ? 1 : 0); }
+    bool sound() const {
+        auto value = number(L"SoundBlaster16", 0);
+        if (value > 1) throw std::runtime_error("Invalid sound card in native preferences");
+        return value != 0;
+    }
+    void sound(bool value) { number(L"SoundBlaster16", value ? 1 : 0); }
     std::filesystem::path floppy() const { return imagePath(L"Floppy"); }
     void floppy(const std::filesystem::path& path) { imagePath(L"Floppy", path); }
     std::filesystem::path hard() const { return imagePath(L"HardDisk"); }

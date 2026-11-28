@@ -21,9 +21,18 @@
 // Win32 前端与无界面脚本共用 Pc；模拟执行、输入、绘图由同一消息线程协调。
 using namespace asm86;
 namespace {
-enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768, BootCd, SaveSnapshot, LoadSnapshot };
+enum { LoadFloppy=101, EjectFloppy, LoadHard, NewHard, BootA, BootC, Reset, Original, Maximize, Quit, FullSpeed, Cpu8088, Cpu286, Cpu386, Cpu486, CtrlAltDel, LoadCdrom, EjectCdrom, NewHard126, NewHard504, StableTiming, LoadOverlay, DiscardOverlay, PauseResume, NewHard2048, NewHard8192, NewHard32768, BootCd, SaveSnapshot, LoadSnapshot, SoundCard };
 std::unique_ptr<Pc> pc;
 AudioOutput audioOutput;
+MidiOutput midiOutput;
+// Host sinks for the guest SB16; headless scripts never call this, so they stay silent and deterministic.
+void stopAudio() { audioOutput.clear(); midiOutput.clear(); }
+void attachAudio(Pc& machine) {
+    if (machine.sound.enabled) { audioOutput.open(); midiOutput.open(); }
+    machine.sound.pcm = [](const int16_t* samples, unsigned frames) { audioOutput.write(samples, frames); };
+    machine.sound.midiOut = [](uint8_t value) { midiOutput.write(value); };
+    machine.sound.clearOutput = [] { stopAudio(); };
+}
 std::unique_ptr<Preferences> preferences;
 ExecutionTiming executionTiming;
 bool running = false;
@@ -82,7 +91,7 @@ void title(HWND hwnd) {
     if (pc->hard && pc->hard->hasOverlay()) value += L" | Overlay: " + pc->hard->overlayPath().filename().wstring();
     if (pc->at()) value += L" | CD: " + (pc->cdrom.medium() ? pc->cdrom.medium()->path.filename().wstring() : L"(empty)");
     if (pc->vga.cirrus()) value += L" | PCI Cirrus GD5446";
-    if (pc->sound.enabled) value += L" | SB2 PCM A220 I5 D1";
+    if (pc->sound.enabled) value += L" | SB16 A220 I5 D1 H5 P330";
     if (pc->sound.enabled && audioOutput.dropped) value += L" | Audio dropped: " + std::to_wstring(audioOutput.dropped);
     if (pc->sound.enabled && pc->sound.unsupportedCommands)
         value += L" | Unsupported SB commands: " + std::to_wstring(pc->sound.unsupportedCommands);
@@ -166,8 +175,9 @@ bool confirmChange(HWND hwnd, const wchar_t* text) {
 void centerMouse(HWND hwnd) {
     RECT rect{}; GetClientRect(hwnd, &rect);
     POINT center{rect.right / 2, rect.bottom / 2};
-    if (!ClientToScreen(hwnd, &center) || !SetCursorPos(center.x, center.y))
-        throw std::runtime_error("Cannot center captured mouse pointer");
+    // SetCursorPos fails while another desktop has the input (lock screen, Ctrl+Alt+Del, UAC prompt).
+    // That is temporary and must not stop the guest: give the pointer back; a click recaptures it.
+    if (!ClientToScreen(hwnd, &center) || !SetCursorPos(center.x, center.y)) { releaseMouse(hwnd); title(hwnd); }
 }
 
 std::filesystem::path choose(HWND hwnd, bool save, bool optical = false, bool overlay = false, bool snapshot = false) {
@@ -263,8 +273,9 @@ void execute(HWND hwnd) {
     // 单次最多运行约 8 ms；APM 关机/客体复位在片段结束后回到前端统一处理。
     bool hadDisc = pc->cdrom.medium() != nullptr;
     executionTiming.run(*pc, fullSpeed, std::chrono::milliseconds(8), stableTiming);
+    audioOutput.service();
     if (pc->powerOffRequested) {
-        audioOutput.clear();
+        stopAudio();
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
         if (pc->hard) pc->hard->flush();
         poweredOn = running = paused = false; resetStats();
@@ -294,17 +305,16 @@ void command(HWND hwnd, int id) {
         bool wasRunning = running;
         running = false;
         try {
-            audioOutput.clear();
+            stopAudio();
             auto path = choose(hwnd, id == SaveSnapshot, false, false, true);
             if (!path.empty()) {
                 if (id == SaveSnapshot) Snapshot::save(*pc, path);
                 else {
                     auto restored = Snapshot::load(path);
-                    if (restored->sound.enabled) audioOutput.open();
-                    restored->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
-                    restored->sound.clearOutput = [] { audioOutput.clear(); };
-                    audioOutput.clear();
+                    attachAudio(*restored);
+                    stopAudio();
                     pc = std::move(restored);
+                    CheckMenuItem(GetMenu(hwnd), SoundCard, MF_BYCOMMAND | (pc->sound.enabled ? MF_CHECKED : MF_UNCHECKED));
                     poweredOn = !pc->powerOffRequested; paused = poweredOn;
                     wasRunning = false;
                     pressedKeys.fill(false); mouseFractionX = mouseFractionY = 0;
@@ -377,7 +387,7 @@ void command(HWND hwnd, int id) {
         // 暂停不丢 RAM；恢复重置宿主计时基准，避免把暂停时间变成一大段客体补跑。
         if (!poweredOn || (!running && !paused)) break;
         if (running) {
-            audioOutput.clear();
+            stopAudio();
             releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
             running = false; paused = true;
         } else {
@@ -386,9 +396,17 @@ void command(HWND hwnd, int id) {
         resetStats(); break;
     case Reset:
         if (poweredOn && !confirmChange(hwnd, L"Force power off?\nUnsaved guest data may be lost. Prefer shutting down within Windows.")) break;
-        audioOutput.clear();
+        stopAudio();
         releaseMouse(hwnd); releaseKeyboard(); rightCtrlDown = false;
         poweredOn = running = paused = false; resetStats(); if (pc->hard) pc->hard->flush(); break;
+    case SoundCard:
+        if (poweredOn || running) { MessageBoxW(hwnd, L"Power off the machine before adding or removing the sound card (Machine > Power off).", L"Sound card", MB_OK); break; }
+        pc->sound.enabled = !pc->sound.enabled; pc->sound.reset();
+        attachAudio(*pc);
+        if (CheckMenuItem(GetMenu(hwnd), SoundCard, MF_BYCOMMAND | (pc->sound.enabled ? MF_CHECKED : MF_UNCHECKED)) == DWORD(-1))
+            throw std::runtime_error("Cannot update sound card menu");
+        if (preferences) preferences->sound(pc->sound.enabled);
+        break;
     case Cpu8088: case Cpu286: case Cpu386: case Cpu486:
         if (poweredOn || running) { MessageBoxW(hwnd, L"Power off the machine before changing the CPU (Machine > Power off).", L"CPU", MB_OK); break; }
         pc->setModel(id == Cpu486 ? CpuModel::I486 : id == Cpu386 ? CpuModel::I386 : id == Cpu286 ? CpuModel::I286 : CpuModel::I8088,
@@ -504,13 +522,13 @@ LRESULT CALLBACK windowProc(HWND hwnd, UINT message, WPARAM w, LPARAM l) {
         }
         case WM_CLOSE:
             if (poweredOn && !confirmChange(hwnd, L"Close while the machine is powered on?\nThis forces power off and may lose guest data.")) return 0;
-            audioOutput.clear();
+            stopAudio();
             releaseMouse(hwnd); releaseKeyboard(); poweredOn = running = paused = false;
             if (pc->hard) pc->hard->flush(); DestroyWindow(hwnd); return 0;
         case WM_DESTROY: KillTimer(hwnd, 1); PostQuitMessage(0); return 0;
         }
     } catch (const std::exception& e) {
-        try { audioOutput.clear(); }
+        try { stopAudio(); }
         catch (const std::exception& audioError) { std::cerr << audioError.what() << '\n'; }
         releaseMouse(hwnd); running = paused = false; resetStats(); title(hwnd);
         MessageBoxW(hwnd, wide(e.what()).c_str(), L"Asm86 - machine stopped", MB_OK | MB_ICONERROR); return 0;
@@ -592,6 +610,31 @@ void saveFrame(const std::filesystem::path& path) {
     if (!out) throw std::runtime_error("Cannot save graphics frame");
 }
 
+// Headless "record-audio": captures the guest card's 48 kHz stereo output (and counts MIDI bytes) for diagnosis.
+struct AudioRecorder {
+    std::ofstream file;
+    uint64_t frames = 0, nonzero = 0, midiBytes = 0;
+    int peak = 0;
+    explicit AudioRecorder(const std::filesystem::path& path) : file(path, std::ios::binary) {
+        if (!file) throw std::runtime_error("Cannot create audio recording");
+        header();
+    }
+    void header() {
+        auto put = [&](uint32_t value, unsigned bytes) { for (unsigned i = 0; i < bytes; ++i) file.put(char(value >> (i * 8))); };
+        uint32_t data = uint32_t(frames * 4);
+        file.seekp(0); file.write("RIFF", 4); put(36 + data, 4); file.write("WAVEfmt ", 8);
+        put(16, 4); put(1, 2); put(2, 2); put(SoundBlaster::OutputRate, 4); put(SoundBlaster::OutputRate * 4, 4); put(4, 2); put(16, 2);
+        file.write("data", 4); put(data, 4); file.seekp(0, std::ios::end);
+    }
+    void write(const int16_t* samples, unsigned count) {
+        file.write(reinterpret_cast<const char*>(samples), std::streamsize(count * 4));
+        for (unsigned i = 0; i < count * 2; ++i) { nonzero += samples[i] != 0; peak = std::max(peak, std::abs(int(samples[i]))); }
+        frames += count;
+    }
+    ~AudioRecorder() { header(); }
+};
+std::unique_ptr<AudioRecorder> recorder;
+
 int headless(const std::filesystem::path& script) {
     // run/wait 使用确定性指令预算；realtime/wait-realtime 使用与 GUI 相同的宿主计时。
     // expect-state powered-off 必须看到 APM 请求，不能因超时/CPU 停止就判成功。
@@ -610,7 +653,7 @@ int headless(const std::filesystem::path& script) {
             if (arg.empty()) throw std::runtime_error("load-snapshot needs a path");
             auto restored = Snapshot::load(std::filesystem::u8path(arg));
             // Headless execution intentionally has no host audio sink.
-            audioOutput.clear(); pc = std::move(restored);
+            stopAudio(); pc = std::move(restored);
             std::cout << "Loaded snapshot at instruction " << pc->instructions << '\n';
         } else if (op == "run") {
             uint64_t count = std::stoull(arg);
@@ -794,6 +837,16 @@ int headless(const std::filesystem::path& script) {
             std::ofstream out(std::filesystem::u8path(arg)); out << pc->text();
             if (!out) throw std::runtime_error("Cannot save screen text");
         } else if (op == "frame") saveFrame(std::filesystem::u8path(arg));
+        else if (op == "record-audio") {
+            recorder = std::make_unique<AudioRecorder>(std::filesystem::u8path(arg));
+            pc->sound.pcm = [](const int16_t* samples, unsigned count) { recorder->write(samples, count); };
+            pc->sound.midiOut = [](uint8_t) { ++recorder->midiBytes; };
+        } else if (op == "audio-stats") {
+            if (!recorder) throw std::runtime_error("audio-stats needs record-audio first");
+            std::cout << "Audio frames=" << recorder->frames << " nonzero=" << recorder->nonzero << " peak=" << recorder->peak
+                << " midi-bytes=" << recorder->midiBytes << " unsupported-dsp=" << pc->sound.unsupportedCommands
+                << " last=" << std::hex << unsigned(pc->sound.lastUnsupported) << std::dec << '\n';
+        }
         else throw std::runtime_error("Unknown script operation: " + op);
     } } catch (...) {
         if (pc->vga.graphics()) {
@@ -878,7 +931,7 @@ int application(int argc, wchar_t** argv) {
         }
     }
     std::filesystem::path script, hardPath, overlayPath, loadSnapshot, saveSnapshot; bool start = false, uiTest = false, discardOverlay = false, overlaySpecified = false;
-    bool cpuSpecified = false, speedSpecified = false, timingSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
+    bool soundSpecified = false, cpuSpecified = false, speedSpecified = false, timingSpecified = false, floppySpecified = false, hardSpecified = false, experimental386 = false;
     for (int i = 1; i < argc; ++i) {
         std::wstring option = argv[i];
         if (option == L"--ui-test") { uiTest = true; continue; }
@@ -924,8 +977,8 @@ int application(int argc, wchar_t** argv) {
             defaultVideo = false;
         }
         else if (option == L"--sound") {
-            if (value != L"off" && value != L"sb2") throw std::runtime_error("--sound must be off or sb2");
-            pc->sound.enabled = value == L"sb2";
+            if (value != L"off" && value != L"sb16") throw std::runtime_error("--sound must be off or sb16");
+            pc->sound.enabled = value == L"sb16"; soundSpecified = true;
         }
         else if (option == L"--memory") {
             if (value != L"16" && value != L"32" && value != L"64" && value != L"128" && value != L"256")
@@ -944,11 +997,6 @@ int application(int argc, wchar_t** argv) {
         throw std::runtime_error("--load-snapshot supplies machine/media state; do not combine it with CPU, memory, video, sound, disk, boot or UI-test options");
     if (!saveSnapshot.empty() && script.empty())
         throw std::runtime_error("--save-snapshot requires --headless (saved after successful script completion)");
-    if (pc->sound.enabled && script.empty()) {
-        audioOutput.open();
-        pc->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
-        pc->sound.clearOutput = [] { audioOutput.clear(); };
-    }
     if (hardSpecified) pc->hard = std::make_unique<Disk>(hardPath, false, false, overlayPath);
     if (discardOverlay) {
         if (start || uiTest || !script.empty() || !pc->hard || !pc->hard->hasOverlay())
@@ -989,6 +1037,8 @@ int application(int argc, wchar_t** argv) {
         if (configuredMemory) pc->setModel(pc->cpu.model, configuredMemory);
         if (!speedSpecified) fullSpeed = preferences->fullSpeed();
         if (!timingSpecified) stableTiming = preferences->stableTiming();
+        if (!soundSpecified) pc->sound.enabled = preferences->sound();
+        else preferences->sound(pc->sound.enabled);
         if (!hardSpecified) {
             auto path = preferences->hard();
             if (!path.empty()) {
@@ -1026,9 +1076,6 @@ int application(int argc, wchar_t** argv) {
         if (script.empty()) {
             configuredMemory = pc->cpu.supports386() ? unsigned(pc->cpu.mem.size() >> 20) : 0;
             defaultVideo = false;
-            if (pc->sound.enabled) audioOutput.open();
-            pc->sound.pcm = [](const int16_t* samples, unsigned count) { audioOutput.write(samples, count); };
-            pc->sound.clearOutput = [] { audioOutput.clear(); };
             poweredOn = !pc->powerOffRequested; paused = poweredOn;
         }
     }
@@ -1039,6 +1086,7 @@ int application(int argc, wchar_t** argv) {
         if (!saveSnapshot.empty()) Snapshot::save(*pc, saveSnapshot);
         return result;
     }
+    if (script.empty() && !uiTest) attachAudio(*pc);
     if (uiTest) headlessRegressionTests();
     if (pc->vga.cirrus() && !pc->cpu.supports386()) throw std::runtime_error("PCI Cirrus requires a 386 or 486 CPU");
     auto instance = GetModuleHandleW(nullptr);
@@ -1074,6 +1122,7 @@ int application(int argc, wchar_t** argv) {
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (fullSpeed ? MF_CHECKED : MF_UNCHECKED), FullSpeed, L"Full speed (real-time timers)");
     AppendMenuW(machine, MF_STRING | (stableTiming ? MF_CHECKED : MF_UNCHECKED), StableTiming, L"Stable CPU timing (Windows 98)");
+    AppendMenuW(machine, MF_STRING | (pc->sound.enabled ? MF_CHECKED : MF_UNCHECKED), SoundCard, L"Sound Blaster 16 + OPL3 (A220 I5 D1 H5 P330)");
     AppendMenuW(machine, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I8088 ? MF_CHECKED : MF_UNCHECKED), Cpu8088, L"CPU: 8088");
     AppendMenuW(machine, MF_STRING | (pc->cpu.model == CpuModel::I286 ? MF_CHECKED : MF_UNCHECKED), Cpu286, L"CPU: 80286 / AT");
@@ -1441,6 +1490,17 @@ int application(int argc, wchar_t** argv) {
             throw std::runtime_error("Restoring real-time CPU timing introduced a guest clock jump");
         SendMessageW(hwnd, WM_COMMAND, Reset, 0);
         std::cout << "Stable CPU timing menu / execution / live-toggle / real-time restoration checks passed\n";
+        // The sound card is a powered-off hardware change; the title names its fixed resources.
+        bool soundBefore = pc->sound.enabled;
+        SendMessageW(hwnd, WM_COMMAND, SoundCard, 0);
+        GetWindowTextW(hwnd, caption, int(std::size(caption)));
+        if (pc->sound.enabled == soundBefore || !(GetMenuState(menu, SoundCard, MF_BYCOMMAND) & MF_CHECKED) != soundBefore
+            || (std::wcsstr(caption, L"SB16 A220 I5 D1 H5 P330") != nullptr) == soundBefore)
+            throw std::runtime_error("Sound Blaster 16 menu did not toggle the powered-off machine, menu and title");
+        SendMessageW(hwnd, WM_COMMAND, SoundCard, 0);
+        if (pc->sound.enabled != soundBefore || ((GetMenuState(menu, SoundCard, MF_BYCOMMAND) & MF_CHECKED) != 0) != soundBefore)
+            throw std::runtime_error("Sound Blaster 16 menu did not restore the previous setting");
+        std::cout << "Sound Blaster 16 menu / title / powered-off toggle checks passed\n";
         SendMessageW(hwnd, WM_COMMAND, Cpu8088, 0);
         if (pc->at() || !(GetMenuState(menu, Cpu8088, MF_BYCOMMAND) & MF_CHECKED))
             throw std::runtime_error("8088 CPU selection was not restored");
