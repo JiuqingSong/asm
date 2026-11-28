@@ -125,7 +125,7 @@ private:
     void output(uint16_t port, uint8_t value);
     int acknowledge();
     bool bios(uint8_t number);
-    bool apm();
+    bool apm(bool protectedCall);
     bool apmConnected = false, apmEnabled = true, apmEngaged = true;
     uint16_t apmVersion = 0x0100;
     bool video();

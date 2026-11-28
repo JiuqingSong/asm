@@ -41,7 +41,8 @@ unsigned Vga::charHeight() const { return mode == 0x10 ? 14 : mode == 0x12 || !g
 void Vga::setMode(uint8_t value, bool clear) {
     // 0..3 文本；0D 320×200、0E 640×200、10 640×350、12 640×480 四平面 16 色；
     // 13 为 320×200×256 色。以下数组是 VGA 寄存器/颜色数据，不是 x86 机器码。
-    bool extended = cirrus() && (value == 0x5f || value == 0x5c || value == 0x60);
+    const CirrusMode* extendedMode = cirrus() ? findCirrusMode(value) : nullptr;
+    bool extended = extendedMode != nullptr;
     if (value > 3 && value != 0x0d && value != 0x0e && value != 0x10 && value != 0x12 && value != 0x13 && !extended)
         throw std::runtime_error("Unsupported native VGA mode " + std::to_string(value));
     mode = value;
@@ -119,16 +120,21 @@ void Vga::setMode(uint8_t value, bool clear) {
         }
     }
     if (cirrus()) {
-        seq[6] = 0x12; seq[0x0f] = 0x98; seq[0x1f] = 0x22;
+        // SR15 是 GD5436/46 的显存容量（4 = 4 MiB），Windows 2000 cirrus.sys 依此决定可用模式；
+        // 为 0 时只剩 640×480×16 色。SR17 总线类型为 PCI。
+        seq[6] = 0x12; seq[0x0f] = 0x98; seq[0x15] = 4; seq[0x17] = 0x20; seq[0x1f] = 0x22;
         crtc[0x27] = 0xb8;
         if (extended) {
-            unsigned columns = value == 0x5f ? 640 : value == 0x5c ? 800 : 1024;
-            unsigned rows = value == 0x5f ? 480 : value == 0x5c ? 600 : 768;
-            seq[7] = 0x11; seq[4] = 14; gc[5] = 0x40; gc[6] = 5;
+            // SR7[3:1]：0 为 8 位、3 为 16 位时钟（15/16 位由隐藏 DAC 区分）、2 为 24 位；
+            // CR13 加 CR1B[4] 是以 8 字节为单位的行跨度。
+            unsigned columns = extendedMode->width, rows = extendedMode->height;
+            unsigned bytes = (extendedMode->bpp + 7) / 8, pitch = columns * bytes / 8;
+            seq[7] = bytes == 1 ? 0x11 : bytes == 2 ? 0x17 : 0x15; seq[4] = 14; gc[5] = 0x40; gc[6] = 5;
+            hiddenDac = extendedMode->hiddenDac;
             crtc[1] = uint8_t(columns / 8 - 1); crtc[9] = 0;
             crtc[0x12] = uint8_t(rows - 1);
             crtc[7] = uint8_t(((rows - 1) & 0x100 ? 2 : 0) | ((rows - 1) & 0x200 ? 0x40 : 0));
-            crtc[0x13] = uint8_t(columns / 8); crtc[0x1b] = 2; crtc[0x17] = 0xe3;
+            crtc[0x13] = uint8_t(pitch); crtc[0x1b] = uint8_t(2 | (pitch & 0x100 ? 0x10 : 0)); crtc[0x17] = 0xe3;
         }
     }
 }
@@ -542,6 +548,8 @@ bool Vga::output(uint16_t port, uint8_t value) {
         if (cirrus() && index == 6) value = (value & 0x17) == 0x12 ? 0x12 : 0x0f;
         if (cirrus() && index == 0x10) cursorX = (unsigned(value) << 3) | (seqIndex >> 5);
         if (cirrus() && index == 0x11) cursorY = (unsigned(value) << 3) | (seqIndex >> 5);
+        // SR17[5:3] 是只读的总线类型配置脚（100b = PCI），写入只改变其余控制位。
+        if (cirrus() && index == 0x17) value = uint8_t((seq[0x17] & 0x38) | (value & ~0x38));
         seq[index] = value; return true;
     }
     case 0x3c6:

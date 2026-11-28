@@ -2167,12 +2167,17 @@ void apmTests(const std::filesystem::path& disk) {
             check(call(0, 0) == 0x86 && !p.powerOffRequested, "XT must not advertise AT APM support");
             continue;
         }
-        check(call(0, 0) == 0 && c.r[AX] == 0x0102 && c.r[BX] == 0x504d && c.r[CX] == 0,
-            "APM discovery must identify a real-mode-only BIOS without claiming protected-mode or idle throttling");
+        check(call(0, 0) == 0 && c.r[AX] == 0x0102 && c.r[BX] == 0x504d && c.r[CX] == 3,
+            "APM discovery must advertise the 16- and 32-bit protected-mode interfaces without claiming idle throttling");
         check(call(0x10, 0) == 0 && c.reg8(3) == 0 && c.r[CX] == 0,
             "APM capabilities must be queryable before connection and advertise no batteries, standby or suspend");
         check(call(7, 1, 3) == 3 && !p.powerOffRequested, "Disconnected APM calls cannot power off");
-        check(call(2, 0) == 6 && call(3, 0) == 8, "Unimplemented protected-mode APM interfaces must report unsupported");
+        check(call(2, 0) == 0 && c.r[AX] == 0xf000 && c.r[BX] == 0xb064 && c.r[CX] == 0xf000 && c.r[SI] == 0xffff && c.r[DI] == 0xffff
+            && call(2, 0) == 2 && call(4, 0) == 0,
+            "The 16-bit protected-mode APM connection (used by Windows 2000 NTDETECT/ntapm) must describe the F000 segments and entry");
+        check(call(3, 0) == 0 && c.r[AX] == 0xf000 && c.r32(BX) == 0xb060 && c.r[CX] == 0xf000 && c.r[DX] == 0xf000
+            && c.r32(SI) == 0xffffffff && c.r[DI] == 0xffff && call(3, 0) == 2 && call(4, 0) == 0,
+            "The 32-bit protected-mode APM connection must describe the F000 code/data segments and entry offset");
         check(call(1, 0) == 0 && call(1, 0) == 2, "APM connection must reject duplicate connections");
         check(call(7, 1, 3) == 0x0a && !p.powerOffRequested, "APM 1.0 connections cannot request global power off");
         check(call(0x0e, 0, 0x0101) == 0 && c.r[AX] == 0x0101, "APM must negotiate the Windows 95 driver version");
@@ -2199,8 +2204,37 @@ void apmTests(const std::filesystem::path& disk) {
             "A powered-off core must not run guest instructions or advance scheduled device time");
         p.boot(0x80);
         check(!p.powerOffRequested && call(7, 1, 3) == 3, "Boot must clear both power-off and APM connection state");
+        if (model == CpuModel::I286) continue;
+        // Windows 2000 的 APM 驱动：32 位连接后经 32 位远调用进入 F000:B060，CF 直接在返回 FLAGS 中。
+        check(call(3, 0) == 0 && call(0x0e, 0, 0x0102) == 0, "32-bit APM connection and version negotiation");
+        const uint8_t gdt[] = {0,0,0,0,0,0,0,0, 0xff,0xff,0,0,0,0x9a,0xcf,0, 0xff,0xff,0,0,0,0x92,0xcf,0,
+            0xff,0xff,0,0,0x0f,0x9a,0x40,0, 0xff,0xff,0,0,0x0f,0x9a,0,0};
+        std::copy(std::begin(gdt), std::end(gdt), c.mem.begin() + 0x1000);
+        c.gdtr = {0x1000, 39}; c.msw |= 1;
+        c.loadSegment(SS, 16); c.loadSegment(DS, 16);
+        const uint8_t enter[] = {0x66,0xea,0,6,0,0,8,0}; // JMP FAR 0008:00000600（16 位代码中的 32 位远跳转）。
+        std::copy(std::begin(enter), std::end(enter), c.mem.begin() + 0x700);
+        c.mem[0x600] = 0xf4; c.ip = 0x700; c.halted = false; p.runCpu(10);
+        check(c.halted && c.s[CS] == 8, "APM fixture must enter a 32-bit protected code segment");
+        auto pmCall = [&](uint16_t ax, uint16_t bx, uint16_t cx) {
+            const uint8_t code[] = {0x9a,0x60,0xb0,0,0,0x18,0,0xf4}; // CALL FAR 0018:0000B060 / HLT。
+            std::copy(std::begin(code), std::end(code), c.mem.begin() + 0x600);
+            c.ip = 0x600; c.r32(SP, 0x9000); c.r[AX] = ax; c.r[BX] = bx; c.r[CX] = cx;
+            c.halted = false; c.setFlags(DF | 2); p.runCpu(100);
+            return c.flags & CF ? c.reg8(4) : uint8_t(0);
+        };
+        check(pmCall(0x53ff, 0, 0) == 0x0c && c.halted && c.ip == 0x608 && c.r32(SP) == 0x9000 && (c.flags & DF),
+            "32-bit APM errors must set CF in FLAGS and return through the 32-bit far-call frame");
+        check(pmCall(0x530a, 1, 0) == 0 && c.r[BX] == 0x01ff && c.ip == 0x608, "32-bit APM power status query");
+        // 16 位入口：O16 CALL FAR 0020:B064 / HLT，16 位代码段中的 RETF 只弹出 16 位 IP 和 CS。
+        const uint8_t code16[] = {0x66,0x9a,0x64,0xb0,0x20,0,0xf4};
+        std::copy(std::begin(code16), std::end(code16), c.mem.begin() + 0x600);
+        c.ip = 0x600; c.r32(SP, 0x9000); c.r[AX] = 0x530a; c.r[BX] = 1; c.halted = false; c.setFlags(DF | 2); p.runCpu(100);
+        check(!(c.flags & CF) && c.r[BX] == 0x01ff && c.halted && c.ip == 0x607 && c.r32(SP) == 0x9000,
+            "16-bit protected-mode APM calls must return through a 16-bit far-call frame");
+        check(pmCall(0x5307, 1, 3) == 0 && p.powerOffRequested, "32-bit APM must request whole-machine power off");
     }
-    std::cout << "APM real-mode discovery / connection / errors / Windows 95 power-off / explicit reboot checks passed\n";
+    std::cout << "APM real-mode and 32-bit protected-mode discovery / connection / errors / Windows 95 and 2000 power-off / explicit reboot checks passed\n";
 }
 
 void cirrusFirmwareTests(const std::filesystem::path& disk) {
@@ -2287,6 +2321,8 @@ void cirrusFirmwareTests(const std::filesystem::path& disk) {
     observed->setMode(0x5c); observed->linearWrite(Vga::VramBytes - 1, 0x55);
     auto output = c.out;
     c.out = [&](uint16_t port, uint8_t value) { observed->output(port, value); output(port, value); };
+    auto input = c.in;
+    c.in = [&](uint16_t port) { observed->input(port); return input(port); };
     auto write = c.mmioWrite;
     c.mmioWrite = [&](uint32_t address, uint8_t value) { observed->write(address, value); write(address, value); };
     interrupt(0x10, 0x005c);
@@ -2295,6 +2331,33 @@ void cirrusFirmwareTests(const std::filesystem::path& disk) {
     check(observed->linearRead(Vga::VramBytes - 1) == 0, "Guest mode programming must clear the entire SVGA framebuffer, not just its first 64 KiB");
     observed->linearWrite(Vga::VramBytes - 1, 0x55); interrupt(0x10, 0x00dc);
     check(observed->linearRead(Vga::VramBytes - 1) == 0x55, "Cirrus BIOS no-clear mode must preserve even the last VRAM bank");
+    // Windows 2000 的 cirrus.sys 依据 12h/9A、A1、A2、AE 的显示器应答筛选模式。
+    c.r[BX] = 0x9a; c.r[CX] = 0; interrupt(0x10, 0x1200);
+    check(c.r[AX] == 0x4060 && c.r[CX] == 0x1132, "Cirrus BIOS must answer the user-options query");
+    c.r[BX] = 0xa1; interrupt(0x10, 0x1200);
+    check(c.r[BX] == 0x0e00, "Cirrus BIOS must report a colour multisync monitor");
+    c.r[BX] = 0xa2; interrupt(0x10, 0x1200);
+    check(c.reg8(0) == 7, "Cirrus BIOS must report a 31.5-64 kHz horizontal sync range");
+    c.r[BX] = 0xae; interrupt(0x10, 0x1200);
+    check(c.reg8(0) == 1, "Cirrus BIOS must report high refresh support");
+    for (const auto& entry : CirrusModes) {
+        c.r[BX] = 0xa0; interrupt(0x10, uint16_t(0x1200 | entry.mode));
+        check(c.reg8(4) == 1, "Every implemented Cirrus BIOS mode must be reported as available");
+        interrupt(0x10, entry.mode);
+        auto reference = std::make_unique<Vga>(); reference->enableCirrus(true); reference->setMode(entry.mode);
+        check(observed->packed() && observed->width() == entry.width && observed->height() == entry.height
+            && observed->bitsPerPixel() == (entry.bpp == 15 ? 16u : entry.bpp) && observed->hiddenDacValue() == entry.hiddenDac
+            && observed->crtc == reference->crtc && observed->seq[7] == reference->seq[7]
+            && (entry.bpp != 8 || observed->dac == reference->dac)
+            && p.vga.width() == entry.width && p.vga.bitsPerPixel() == observed->bitsPerPixel(),
+            "Cirrus BIOS direct-colour modes must program geometry, pitch, pixel clocking and the hidden DAC through guest I/O");
+    }
+    c.r[BX] = 0xa0; interrupt(0x10, 0x127b);
+    check(c.reg8(4) == 0, "Unimplemented 1600x1200 must not be reported as available");
+    interrupt(0x10, 0x0003);
+    auto text = std::make_unique<Vga>(); text->enableCirrus(true); text->setMode(3);
+    check(!observed->packed() && observed->hiddenDacValue() == 0 && observed->dac == text->dac,
+        "Returning to text mode must clear the hidden DAC and restore the shared text palette");
     const uint8_t gdt[] = {0,0,0,0,0,0,0,0, 0xff,0xff,0,0,0,0x9a,0xcf,0, 0xff,0xff,0,0,0,0x92,0xcf,0};
     std::copy(std::begin(gdt), std::end(gdt), c.mem.begin() + 0x1000);
     c.gdtr = {0x1000, 23}; c.msw |= 1;

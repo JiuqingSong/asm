@@ -472,8 +472,8 @@ void Cpu::stepInstruction() {
             if (op == 0xf1 && trap) {
                 auto linear = segmentBase(CS) + startIp;
                 auto physical = busAddress(translate(linear, false, false));
-                // BIOS32 可被保护模式操作系统映射到其它线性地址，只接受两个真实 ROM 服务入口。
-                if ((linear >= 0xf0000 && linear < 0xf2000) || physical == 0xfb020 || physical == 0xfb040) {
+                // BIOS32 与 APM 32 位入口可被保护模式操作系统映射到其它线性地址，只接受这四个真实 ROM 服务入口。
+                if ((linear >= 0xf0000 && linear < 0xf2000) || physical == 0xfb020 || physical == 0xfb040 || physical == 0xfb060 || physical == 0xfb064) {
                     auto n = fetch8(); waiting = !trap(n); if (waiting) ip = startIp;
                     return;
                 }

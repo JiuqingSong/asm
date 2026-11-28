@@ -426,6 +426,30 @@ static void installVideoFirmware(Cpu& cpu, bool cirrus) {
             0xb8,0x0b,0,0xef,0xc3     // MOV AX,000Bh / OUT DX,AX / RET：恢复普通 4 KiB bank 粒度。
         };
         std::copy(std::begin(clear), std::end(clear), cpu.mem.begin() + 0xf0b00);
+        // 原 0024h 的 MOV DX,03DAh / IN AL,DX 换成 CALL 0B80h / NOP：先写隐藏 DAC，再复位属性触发器。
+        // 隐藏 DAC 需连续读 3C6h 四次后写入，纯 OUT 端口表无法表达；其值存于模式表条目数之前一字节。
+        const uint8_t callHidden[] = {0xe8,0x59,0x02,0x90};
+        std::copy(std::begin(callHidden), std::end(callHidden), cpu.mem.begin() + 0xf0924);
+        const uint8_t hidden[] = {
+            0xba,0xc6,0x03,           // MOV DX,03C6h：像素掩码/隐藏 DAC 端口。
+            0xec,0xec,0xec,0xec,      // IN AL,DX ×4：打开隐藏 DAC 访问。
+            0x8a,0x44,0xfd,           // MOV AL,[SI-3]：LODSW 读条目数后，SI-3 即表头前的隐藏 DAC 字节。
+            0xee,                     // OUT DX,AL：写隐藏 DAC。
+            0xba,0xda,0x03,0xec,      // MOV DX,03DAh / IN AL,DX：原被替换的属性触发器复位。
+            0xc3                      // RET。
+        };
+        std::copy(std::begin(hidden), std::end(hidden), cpu.mem.begin() + 0xf0b80);
+        // 原 0028h 的 LODSW/XCHG/LODSB/OUT/LOOP 换成 CALL 0B90h / LOOP 0028h / NOP：
+        // 条目端口为 FFFFh 时改为跳到后随地址，使多个模式共用同一段 768 项 DAC 表（总放在表尾）。
+        const uint8_t callEntry[] = {0xe8,0x65,0x02,0xe2,0xfb,0x90};
+        std::copy(std::begin(callEntry), std::end(callEntry), cpu.mem.begin() + 0xf0928);
+        const uint8_t entry[] = {
+            0xad,                     // LODSW：端口号或跳转标记。
+            0x3d,0xff,0xff,0x75,0x03, // CMP AX,FFFFh / JNE port：普通端口条目。
+            0xad,0x96,0xc3,           // LODSW / XCHG AX,SI / RET：SI 改为共享 DAC 段地址。
+            0x92,0xac,0xee,0xc3       // port：XCHG AX,DX / LODSB / OUT DX,AL / RET。
+        };
+        std::copy(std::begin(entry), std::end(entry), cpu.mem.begin() + 0xf0b90);
     }
     cpu.ww(0, 0x10 * 4, 0x900);
     auto profile = std::make_unique<Vga>();
@@ -433,10 +457,16 @@ static void installVideoFirmware(Cpu& cpu, bool cirrus) {
     uint16_t address = 0x2100;
 
     // 每个模式存放：条目数 WORD，随后重复 {port WORD,value BYTE}；上面的 LODS/OUT 循环消费它。
-    for (uint8_t mode : {0, 1, 2, 3, 0x0d, 0x0e, 0x10, 0x12, 0x13, 0x5f, 0x5c, 0x60}) {
-        if (mode > 0x13 && !cirrus) continue;
+    std::vector<uint8_t> modes = {0, 1, 2, 3, 0x0d, 0x0e, 0x10, 0x12, 0x13};
+    std::vector<std::pair<std::array<uint8_t, 768>, uint16_t>> palettes;
+    if (cirrus) for (const auto& entry : CirrusModes) modes.push_back(entry.mode);
+    for (uint8_t mode : modes) {
+        // 直接色模式不经调色板，省去 768 字节 DAC 表；每个模式表前留一字节隐藏 DAC 值。
+        const auto* extended = cirrus ? findCirrusMode(mode) : nullptr;
+        bool palette = !extended || extended->bpp == 8;
         if (address < font16Offset && unsigned(address) + 3000 > font16Offset) address = 0xc000;
         profile->setMode(mode);
+        cpu.wb(0xf000, address++, profile->hiddenDacValue());
         cpu.ww(0xf000, uint16_t(0x2000 + mode * 2), address);
         auto start = address; address += 2;
         auto port = [&](uint16_t number, uint8_t value) {
@@ -460,9 +490,21 @@ static void installVideoFirmware(Cpu& cpu, bool cirrus) {
         if (cirrus) { indexed(0x3ce, 9, 0); indexed(0x3ce, 10, 0); indexed(0x3ce, 11, 0); }
         for (uint8_t i = 0; i < 21; ++i) { port(0x3c0, i); port(0x3c0, profile->attr[i]); }
         port(0x3c0, 0x20); port(0x3c6, 255); port(0x3c8, 0);
-        for (auto component : profile->dac) port(0x3c9, component);
-        cpu.ww(0xf000, start, uint16_t((address - start - 2) / 3));
-        if ((start < font16Offset && address > font16Offset) || address > 0xef00)
+        unsigned entries = (address - start - 2) / 3;
+        if (palette) {
+            auto shared = std::find_if(palettes.begin(), palettes.end(), [&](const auto& item) { return item.first == profile->dac; });
+            if (cirrus && shared != palettes.end()) {
+                cpu.ww(0xf000, address, 0xffff); cpu.ww(0xf000, uint16_t(address + 2), shared->second); address += 4;
+                entries += 1 + 768;
+            } else {
+                if (cirrus) palettes.push_back({profile->dac, address});
+                for (auto component : profile->dac) port(0x3c9, component);
+                entries += 768;
+            }
+        }
+        cpu.ww(0xf000, start, uint16_t(entries));
+        // E401h 起是硬盘参数表，之后写入；模式表必须在其之前结束。
+        if ((start < font16Offset && address > font16Offset) || address > 0xe400)
             throw std::runtime_error("Video firmware tables overlap reserved BIOS data");
     }
     for (unsigned ch = 0; ch < 256; ++ch)
@@ -1023,6 +1065,12 @@ void Pc::boot(uint8_t drive) {
 
     // INT 4Fh 非零会让 Windows 探测驻留 CAM SCSI 提供者，因此明确置空。
     cpu.ww(0, 0x4f * 4, 0); cpu.ww(0, 0x4f * 4 + 2, 0);
+    // APM 32 位保护模式入口：F000:B060 = BIOS_TRAP E2h / RETF（32 位代码段中 CB 即 32 位远返回）。
+    // 16 位保护模式入口 F000:B064 同为 BIOS_TRAP E2h / RETF（16 位代码段中 CB 是 16 位远返回）。
+    if (at()) {
+        cpu.mem[0xfb060] = 0xf1; cpu.mem[0xfb061] = 0xe2; cpu.mem[0xfb062] = 0xcb;
+        cpu.mem[0xfb064] = 0xf1; cpu.mem[0xfb065] = 0xe2; cpu.mem[0xfb066] = 0xcb;
+    }
     pciAddress = 0; pciCommand = 3; pciFramebuffer = 0xe0000000; pciRegisters = 0xe2000000; pciRomAddress = 0xc0000; mapPci();
     installVideoFirmware(cpu, vga.cirrus());
     if (vga.cirrus()) {
@@ -1486,6 +1534,12 @@ bool Pc::video() {
         case 0x81: r[AX] = 0x0100; return true;
         case 0x82: c.reg8(0, 0x47); return true;
         case 0x85: c.reg8(0, uint8_t(Vga::VramBytes / 65536)); return true;
+        // 用户选项 / 显示器类型 / 行频范围 / 高刷新：与开源 Cirrus VGABIOS 的固定应答一致。
+        // Windows 2000 的 cirrus.sys 依据这些值筛选模式；不应答时只剩 640×480×16 色。
+        case 0x9a: r[AX] = 0x4060; r[CX] = 0x1132; return true;
+        case 0xa1: r[BX] = 0x0e00; return true;
+        case 0xa2: c.reg8(0, 0x07); return true;
+        case 0xae: c.reg8(0, 0x01); return true;
         case 0xa0:
             c.reg8(4, al < 0x80 && c.rwF(0xf000, uint16_t(0x2000 + al * 2)) ? 1 : 0);
             // 固定端口配置不是 OEM 标准/补充参数表；按协议返回未定义指针，不能让驱动误读配置字节。
@@ -1787,23 +1841,36 @@ bool Pc::disk() {
     status(0); c.reg8(0, uint8_t(count)); return true;
 }
 
-bool Pc::apm() {
+bool Pc::apm(bool protectedCall) {
+    // INT 15h 经 IRET 返回，CF 写调用者栈帧；32 位保护模式入口经 RETF 返回，CF 直接写 FLAGS。
     auto& c = cpu; auto& r = c.r;
-    auto result = [&](uint8_t error) {
-        c.stackedFlag(CF, error != 0); c.reg8(4, error); return true;
+    auto carry = [&](bool value) {
+        if (protectedCall) c.setFlags(uint16_t(value ? c.flags | CF : c.flags & ~CF));
+        else c.stackedFlag(CF, value);
     };
+    auto result = [&](uint8_t error) { carry(error != 0); c.reg8(4, error); return true; };
     auto function = c.reg8(0);
     if (!at()) return result(0x86);
     if (function == 0) {
         if (r[BX]) return result(9);
-        r[AX] = 0x0102; r[BX] = 0x504d; r[CX] = (!apmEnabled ? 8 : 0) | (!apmEngaged ? 16 : 0);
-        c.stackedFlag(CF, false); return true;
+        // CX bit 0/1：支持 16/32 位保护模式接口；Windows 2000 的 NTDETECT 据此记录保护模式连接信息。
+        r[AX] = 0x0102; r[BX] = 0x504d; r[CX] = 3 | (!apmEnabled ? 8 : 0) | (!apmEngaged ? 16 : 0);
+        carry(false); return true;
     }
     if (function >= 1 && function <= 3) {
         if (r[BX]) return result(9);
         if (apmConnected) return result(2);
-        if (function != 1) return result(function == 2 ? 6 : 8);
-        apmConnected = true; apmVersion = 0x0100; return result(0);
+        apmConnected = true; apmVersion = 0x0100;
+        if (function == 1) return result(0);
+        if (function == 2) {
+            // 16 位接口：AX 代码段、BX 入口偏移、CX 数据段（实模式段值），SI/DI 为代码/数据段长度。
+            r[AX] = 0xf000; r[BX] = 0xb064; r[CX] = 0xf000; r[SI] = 0xffff; r[DI] = 0xffff;
+            carry(false); return true;
+        }
+        // 32 位接口：代码段 F000（入口 F000:B060 为 BIOS_TRAP E2h / RETF），16 位代码段与数据段同为 F000，
+        // ESI 低/高 16 位为 32/16 位代码段长度，DI 为数据段长度；成功时 AX 是段值，不能再写 AH 错误码。
+        r[AX] = 0xf000; c.r32(BX, 0xb060); r[CX] = 0xf000; r[DX] = 0xf000; c.r32(SI, 0xffffffff); r[DI] = 0xffff;
+        carry(false); return true;
     }
     if (function == 0x10) {
         if (r[BX]) return result(9);
@@ -1839,7 +1906,7 @@ bool Pc::apm() {
         if (r[BX]) return result(9);
         if (r[CX] < 0x0100) return result(0x0a);
         apmVersion = std::min(r[CX], uint16_t(0x0102));
-        r[AX] = apmVersion; c.stackedFlag(CF, false); return true;
+        r[AX] = apmVersion; carry(false); return true;
     case 0x0f:
         if (r[BX] != 1) return result(9);
         if (!apmEnabled) return result(1);
@@ -1857,6 +1924,7 @@ bool Pc::bios(uint8_t n) {
         c.reg8(0, 0); c.r32(BX, 0xf0000); c.r32(CX, 0x10000); c.r32(DX, 0xb040); return true;
     }
     if (n == 0xe1 && vga.cirrus()) return pciBios(true);
+    if (n == 0xe2 && at()) return apm(true);
 
     // 标准 PC/AT 未装 HP-HIL 接口，探测必须保留 BX 而不能误宣告设备存在。
     if (r[AX] == 0x6f00 && (n == 0x14 || n == 0x16 || n == 0x17)) return true;
@@ -1903,7 +1971,7 @@ bool Pc::bios(uint8_t n) {
     case 0x15:
 
         // VGA/扩展 ROM 窗口不列为 RAM，也不占用为固件资源；E820 只保留实际 BIOS ROM。
-        if (ah == 0x53) return apm();
+        if (ah == 0x53) return apm(false);
         if (at() && ah == 0xc0) {
             c.loadSegment(ES, 0xf000); r[BX] = 0xe6f5; c.reg8(4, 0); c.stackedFlag(CF, false); return true;
         }

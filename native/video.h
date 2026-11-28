@@ -4,6 +4,18 @@
 #include <vector>
 
 namespace asm86 {
+// Cirrus 扩展 BIOS 模式：编号与 Cirrus/VGABIOS 惯例一致；hiddenDac 选择 15（F0h）/16（E1h）/24（E5h）位像素格式。
+struct CirrusMode { uint8_t mode; uint16_t width, height; uint8_t bpp, hiddenDac; };
+inline constexpr CirrusMode CirrusModes[] = {
+    {0x5f, 640, 480, 8, 0}, {0x66, 640, 480, 15, 0xf0}, {0x64, 640, 480, 16, 0xe1}, {0x71, 640, 480, 24, 0xe5},
+    {0x5c, 800, 600, 8, 0}, {0x67, 800, 600, 15, 0xf0}, {0x65, 800, 600, 16, 0xe1}, {0x78, 800, 600, 24, 0xe5},
+    {0x60, 1024, 768, 8, 0}, {0x68, 1024, 768, 15, 0xf0}, {0x74, 1024, 768, 16, 0xe1}, {0x79, 1024, 768, 24, 0xe5},
+    {0x6d, 1280, 1024, 8, 0}, {0x69, 1280, 1024, 15, 0xf0}, {0x75, 1280, 1024, 16, 0xe1}};
+inline const CirrusMode* findCirrusMode(uint8_t mode) {
+    for (const auto& entry : CirrusModes) if (entry.mode == mode) return &entry;
+    return nullptr;
+}
+
 // 端口状态公开给 BIOS 生成配置表，显存平面/锁存器保留在设备内部。
 class Vga {
     friend class Snapshot;
@@ -35,6 +47,7 @@ public:
     uint32_t color(uint8_t index) const;
     void renderGraphics(std::vector<uint32_t>& pixels) const;
     bool blanked() const { return (seq[1] & 0x20) || !(attrAddress & 0x20); }
+    uint8_t hiddenDacValue() const { return hiddenDac; }
     uint8_t mode = 3;
     std::array<uint8_t, 32> seq{};
     std::array<uint8_t, 64> gc{};
